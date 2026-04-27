@@ -1,0 +1,76 @@
+# Instructions
+Your task is to determine whether the compromised claim can be meaningfully rectified and, if so, produce a rectified version.
+
+## 1. Assess Rectification Feasibility (1 Paragraph)
+Assess critically whether a meaningful corrected version of the claim can be produced so that _any reasonable person/organization would ever publicly share the rectified claim as a standalone statement on social media._
+Additionally, the rectified version needs to:
+* keep the original claim’s topic,
+* be a non-trivial statement, unlike “XY did not happen,” “this story is false,” and
+* disclose manipulation/AI generation for fabricated media.
+If feasibility is low or uncertain, stop after this paragraph.
+
+## 2. Rectify the Claim
+If clearly feasible, correct the claim into one single, intact, fact-checkable, standalone assertion that resolves the Compromised Reason. State the corrected fact directly; do not phrase it as a denial or negation and do not refer to (elements of) the original claim. Enclose the rectified claim in backticks, like `this`. Avoid any other Markdown. Formulate it not in the tone of everyday language.
+
+## 3. Check the Rectification
+For each rule below, critically determine if the rectification meets the stated requirements.
+
+## 4. Regeneration of Rectification
+If any requirement is violated, regenerate the rectification by providing a corrected version that meets all requirements. Again, enclose the rectified claim in backticks.
+
+# Rules
+a) Formulate the rectified claim as _one single, naked, and self-contained_ assertion that someone could fact-check. Avoid referring to "reports," "social media posts," "claims," "evidence," etc. Do not include any justifications.
+b) Avoid composing multiple assertions. Output _only one single assertion_ in the rectification (even if there are multiple assertions to be corrected).
+c) Make sure the rectified claim is clear by providing the necessary context. The claim _must stand on its own_ so that an average reader can understand it without further reading.
+d) Keep the rectification concise and under {{ max_words }} words. Ideally, keep it even shorter.
+e) Remove any details that are not necessary to understand.
+f) Avoid negations and formulations implying falsehood ("not," "is false," etc.). Don't say what is wrong. Just state the truth itself.
+g) Do NOT refer back to (elements of) the compromised version, e.g., do NOT write “[correct thing] rather than [wrong thing].”
+h) If the Reason reveals fabrication of media (manipulation, deepfake...), state this explicitly.
+i) If media were incorrectly contextualized, do NOT state that. Instead, state the correct context itself.
+j) Keep the original language ({{ claim.language_name }}) of the claim.
+k) Omit time specifications in the rectification, except for specifications long before, i.e., months or years before {{ claim.date_str }}.
+l) If visuals are contained, refer to them in the claim.
+
+# The Compromised Claim to Rectify
+{% if claim.language_name %}
+Language: {{ claim.language_name }}
+{% endif %}
+Claim: {{ claim }}
+
+# Compromised Reason
+{{ reason }}
+
+# Examples
+**Compromised Claim**: Ninety-two percent of Americans agree on DACA.
+**Rectified Claim**: Most Americans agree on DACA.
+
+**Compromised Claim**: Travis County Sheriff Sally Hernandez refuses to enforce 8 U.S.C. § 1373.
+**Rectified Claim**: Travis County Sheriff Sally Hernandez is enforcing 8 U.S.C. § 1373.
+
+**Compromised Claim**: The image is the world's first (oldest) photograph of a cat.
+**Rectified Claim**: There exist photographs of cats that are older than this image.
+
+**Compromised Claim**: Nearly 13,000 criminal aliens were released from federal custody into U.S. communities during Hillary Clinton’s tenure as secretary of state.
+**Rectified Claim**: Nearly 13,000 criminal aliens were released from federal custody into U.S. communities from 2008 to early 2014 due to a 2001 Supreme Court ruling.
+
+**Compromised Claim**: The video shows an elephant hugging a Lord Shiva statue amid floodwaters.
+**Rectified Claim**: An elephant hugging a Lord Shiva statue amid floodwaters is a deepfake video.
+
+**Compromised Claim**: Black people in Birmingham, Alabama were caught voting multiple times using fake IDs and fake voter registrations.
+**Rectified Claim**: Black people in Birmingham, Alabama voting multiple times using fake documents is a satire story.
+
+**Compromised Claim**: Bill Gates wrote an open letter on COVID-19 calling the coronavirus a “great corrector.”
+**Rectified Claim**: (Rectification not feasible as the story is completely made up and the rectification would result in a mere denial of the story.)
+
+**Compromised Claim**: A 3,000-year-old manuscript of Thiruvalluvar’s Thirukkural was discovered in Antarctica.
+**Rectified Claim**: (Rectification not feasible as the story is completely made up and the rectification would result in a mere denial of the story.)
+
+**Compromised Claim**: U.S. Navy SEALs rescued more than 1,000 trafficked children and recovered dead bodies from shipping containers on Evergreen’s Ever Given after it was stuck in the Suez Canal.
+**Rectified Claim**: (Rectification not feasible as the story is completely made up and the rectification would result in a mere denial of the story.)
+
+**Compromised Claim**: The photos show a distraught Himanshi Narwal mourning beside the body of her husband, Indian Navy officer Lieutenant Vinay Narwal, after he was killed by terrorists in the Pahalgam attack at Baisaran meadow in Jammu and Kashmir’s Anantnag district.
+**Rectified Claim**: The AI-generated photos show Himanshi Narwal mourning beside the dead body of her husband, Indian Navy officer Lieutenant Vinay Narwal.
+
+# Your Response
+(Answer in English but return the rectification in the original language {{ claim.language_name }}.)

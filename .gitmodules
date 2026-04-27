@@ -1,0 +1,3 @@
+[submodule "claimreview-collector"]
+	path = claimreview-collector
+	url = https://github.com/MartinoMensio/claimreview-collector.git

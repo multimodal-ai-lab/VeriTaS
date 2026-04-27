@@ -1,0 +1,28 @@
+# Instructions
+Below is a claim, a corresponding fact-checking article, and a medium (image or video). **Your task is to find out if the medium belongs to the investigated claim** by proceeding as follows step-by-step:
+1. Describe the medium and extract/translate contained text/voices (100 words).
+2. Describe the claim (below) in the context of the article (100 words).
+3. Discuss whether the medium meets the following four criteria (50 words each):
+   * **Related**: True only if the claim used the medium as discussed in the article. It's not about correct usage or authenticity but whether the image/video itself and the claim occurred together.
+   * **Inherent**: True only if the medium is integral to the claim’s meaning. For example, the claim refers to it directly, or it functions as evidence. Removing it would affect the claim's meaning substantially.
+   * **Original**: True only if the medium is part of what was originally published with the claim. It must not be a screenshot of the claim’s appearance and must not contain interface elements.
+   * **Unmodified**: True only if the medium is free from annotations added by fact-checkers, such as verdict labels (“Fact-Check,” “Fake”), highlights, arrows, circles, crosses, blurring, or other editorial alterations. Normal social-media overlays or captions count as original.
+4. Only after the discussion, state your final verdict. Turn it into a JSON object enclosed in *single backticks* as follows: `{"related": ..., "inherent": ..., "original": ..., "unmodified": ...}`, with ... replaced with true or false, according to your evaluation.
+
+# Article
+You may refer to the media in the article, but only for comparison.
+{{ article }}
+
+# The Claim
+Date: {{ date }}
+Claim: {{ claim }}
+
+# Medium to Evaluate
+Concentrate your evaluation only on the following medium:
+{{ medium.reference }}
+
+# Rules
+* You don't have to include the discussion in the JSON output.
+* Do not discuss the claim's truthfulness, the article's arguments, or the medium's authenticity. It's all about whether the medium belongs to the claim or not.
+
+# Your Response

@@ -1,0 +1,79 @@
+# Pipeline stage configuration. Each stage can be enabled/disabled and
+# receives its parameters as keyword arguments to its `run_loop`.
+pipeline:
+  stage_1:
+    enabled: True
+    interval_seconds: 86400  # 60 * 60 * 24 (1 day)
+
+  stage_2:
+    enabled: True
+
+  stage_3:
+    enabled: True
+    start: [ 2020, 1 ]
+    end: [ 2026, 1 ]
+    batch_size: 1000
+
+  stage_4:
+    enabled: True
+    start: [ 2020, 1 ]
+    end: [ 2026, 1 ]
+    batch_size: 10000
+
+  stage_5:
+    enabled: True
+    start: [ 2020, 1 ]
+    end: [ 2026, 1 ]
+    max_per_quarter: 3500
+
+  stage_6:
+    enabled: True
+    start: [ 2020, 1 ]
+    end: [ 2026, 1 ]
+    max_verdicts_per_quarter: 2500
+    max_intact_claims_per_quarter: 550
+
+  stage_7:
+    enabled: True
+    start: [ 2020, 1 ]
+    end: [ 2026, 1 ]
+    max_per_quarter: 550
+
+  global:
+    min_scraped_article_length: 2000  # characters of raw page content
+    min_extracted_article_length: 1000  # characters of extracted article content
+    max_extracted_article_length: 40_000  # characters of extracted article content
+    max_appearances_per_claim: 2  # Successfully scraped appearances used for claim normalization
+    max_media_per_claim: 4
+    max_video_size: 128_000_000
+    max_video_duration: 300  # Seconds
+    n_frames_per_video: 5
+    sufficient_agreements_threshold: 1  # Maximum allowed difference between any two predictor ratings
+
+api_secrets:
+  openai:
+  google:
+  anthropic:
+  serper:
+
+database:
+  database:
+  user:
+  password:
+  host:
+  port: 5432
+
+selfhosted:
+  url:
+  key:
+
+proxy:
+
+ezmm_path:
+
+# For backups with Nextcloud
+nextcloud:
+  url:
+  user:
+  password:   # Custom app password, not user PW
+  backup_dir:

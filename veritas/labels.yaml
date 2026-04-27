@@ -1,0 +1,64 @@
+# Labeling Scheme
+# Properties, positive and negative category, tags, and their definitions.
+
+properties:
+  authenticity:
+    name: "Authenticity"
+    definition: "The media's originality."
+    positive:
+      name: "Pristine"
+      definition: "The media is an unaltered recording of reality."
+    negative:
+      name: "Fabricated"
+      definition: "The media involves synthetic creation that gives new impressions."
+      tags:
+        - name: "AI-generated"
+          definition: "The media was (partially or entirely) synthesized by AI."
+        - name: "Manipulated"
+          definition: "The media is derived from a real recording, but was altered to change its meaning."
+        - name: "Forged"
+          definition: "The media is mostly or entirely a manually created invention."
+    hints: "Judge only how the media was created, not how it is used or framed. Determine whether it is an actual recording or an artificial/synthetic fabrication. Ignore superficial edits that do not change the overall impression (e.g., overlays, text, logos, watermarks). The shown scene (e.g. a staged event) is irrelevant."
+
+  contextualization:
+    name: "Contextualization"
+    definition: "The accuracy of the media’s context as described or implied in the claim."
+    positive:
+      name: "Correct"
+      definition: "The claim accurately reflects the media's true context."
+    negative:
+      name: "Incorrect"
+      definition: "The claim wrongly reflects the media's true context."
+    hints: "Focus only on assertions about the meaning of the displayed media. Ignore assertions that are independent from it. Assertions about the media can be explicit (in the claim text) or implicit (implying facts about the media's meaning)."
+
+  veracity:
+    name: "Veracity"
+    definition: "The truthfulness of the claim's assertions."
+    positive:
+      name: "True"
+      definition: "The evidence supports all assertions."
+    negative:
+      name: "False"
+      definition: "The evidence contradicts one or more assertions."
+    hints: "Consider only the purely textual assertions and ignore assertions about the media. If there are none, simply select True."  # Show this hint only if the claim contains media.
+
+  context_coverage:
+    name: "Context Coverage"
+    definition: "The extent to which the claim contains the necessary contextual information to avoid false impressions."
+    positive:
+      name: "Sufficient"
+      definition: "The claim does not give any false impressions."
+    negative:
+      name: "Insufficient"
+      definition: "The claim gives a false impression."
+    hints: "The claim was evaluated as true. In rare cases the claim might still give a misleading impression. Identify any false impression the claim certainly (not just hypothetically) creates and which context is missing to avoid that impression. An impression is a conclusion naturally inferred from the claim, i.e., the premise."
+
+  integrity:
+    name: "Integrity"
+    definition: "The extent to which a claim is acceptable."
+    positive:
+      name: "Intact"
+      definition: "The claim contextualizes media correctly, has only true assertions, and does not give any false impressions."
+    negative:
+      name: "Compromised"
+      definition: "The claim puts media out of context, makes false assertions, or is misleading."
