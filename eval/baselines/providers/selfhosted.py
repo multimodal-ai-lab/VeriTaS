@@ -1,10 +1,10 @@
-"""Llama fact-checker provider with custom search tool (via vLLM).
+"""Self-hosted model fact-checker provider with custom search tool (via vLLM).
 
-This provider uses self-hosted Llama models via vLLM's OpenAI-compatible API
+This provider uses self-hosted models via vLLM's OpenAI-compatible API
 with a custom search tool that supports:
 1. Date filtering: Only results from before the claim date
 
-Note: Llama models have no native web search, so this always uses custom search.
+Note: Self-hosted models have no native web search, so this always uses custom search.
 """
 
 import json
@@ -30,10 +30,10 @@ from ..common.search import SearchService, OPENAI_SEARCH_TOOL, ScrapeMode
 from .base import BaseFactChecker
 
 
-class LlamaFactChecker(BaseFactChecker):
-    """Fact-checker using self-hosted Llama via vLLM with custom search tool."""
+class SelfhostedFactChecker(BaseFactChecker):
+    """Fact-checker using a self-hosted model via vLLM with custom search tool."""
 
-    provider_name = "llama"
+    provider_name = "selfhosted"
 
     def __init__(
         self,
@@ -49,7 +49,7 @@ class LlamaFactChecker(BaseFactChecker):
         seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
     ):
         """
-        Initialize the Llama fact-checker with custom search.
+        Initialize the self-hosted model fact-checker with custom search.
 
         Args:
             api_key: API key for vLLM endpoint. If None, uses config/env var.
@@ -110,7 +110,7 @@ class LlamaFactChecker(BaseFactChecker):
         claim_date: str | datetime | None = None,
     ) -> FactCheckResult:
         """
-        Fact-check a claim using Llama with custom search tool.
+        Fact-check a claim using a self-hosted model with custom search tool.
 
         Args:
             claim: The claim text to verify.

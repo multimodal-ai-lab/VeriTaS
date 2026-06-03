@@ -11,7 +11,8 @@ from google.genai import types
 
 # Import API key from Veritas config
 try:
-    from veritas import google_key as VERITAS_GOOGLE_KEY
+    from veritas import api_secrets
+    VERITAS_GOOGLE_KEY = api_secrets.get("google") if api_secrets else None
 except ImportError:
     VERITAS_GOOGLE_KEY = None
 

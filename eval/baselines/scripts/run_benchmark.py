@@ -25,6 +25,7 @@ Features:
 import argparse
 import csv
 import json
+import os
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,16 +36,16 @@ from threading import Lock
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from eval.baselines import UnifiedFactChecker, FactCheckResult
-from eval.baselines.common import (
+from baselines import UnifiedFactChecker, FactCheckResult
+from baselines.common import (
     classify_integrity,
     compute_metrics,
     compute_regression_metrics,
     print_metrics,
     LABELS,
 )
-from eval.baselines.common.metrics import compute_coarsened_metrics, COARSEN_7_TO_3
-from eval.baselines.common.types import get_label_scheme, get_property_label_scheme, LabelScheme
+from baselines.common.metrics import compute_coarsened_metrics, COARSEN_7_TO_3
+from baselines.common.types import get_label_scheme, get_property_label_scheme, LabelScheme
 
 # Thread-safe CSV writing
 csv_lock = Lock()
@@ -1564,7 +1565,8 @@ def run_benchmark(
         "openai": "gpt-5.2",
         "gemini": "gemini-2.5-flash",
         "perplexity": "sonar-pro",
-        "llama": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+        "selfhosted": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+        "anthropic": "claude-sonnet-4-6",
     }
 
     # Determine output directory

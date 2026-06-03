@@ -33,6 +33,7 @@ from plotting_utils import (
 
 # Default path to claims file
 DEFAULT_CLAIMS_PATH = Path(__file__).parent.parent / "data" / "veritas_release" / "veritas_longitudinal_2020_q1_2025_q4" / "claims.json"
+DEFAULT_CLAIMS_PATH = Path("/mnt/vast/workspaces/PI_Rohrbach/mk79honu/data/VeriTaS/veritas_release/veritas_longitudinal_2020_q1_2026_q1/claims.json")
 
 # Verdict to numerical value mapping
 VERDICT_TO_VALUE = {
@@ -44,7 +45,8 @@ VERDICT_TO_VALUE = {
 
 def verdict_to_value(verdict: str) -> float:
     """Convert verdict string to numerical value."""
-    return VERDICT_TO_VALUE.get(verdict.upper(), 0.0)
+    key = verdict.split("(")[0].strip().upper()
+    return VERDICT_TO_VALUE.get(key, 0.0)
 
 
 def classify_claim_modality(claim: dict) -> str | None:
@@ -337,7 +339,7 @@ Examples:
                 output_dir / config["filename"],
                 metric_name="MAE",
                 title="",
-                ylabel='MAE',
+                ylabel=f'MAE, {args.n_claims} Moving Average',
                 cutoff_dates=model_cutoffs if model_cutoffs else None,
                 max_jump=0.3,
                 legend_loc='upper left',

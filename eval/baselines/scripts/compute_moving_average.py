@@ -34,6 +34,7 @@ from plotting_utils import (
 
 # Default path to claims file
 DEFAULT_CLAIMS_PATH = Path(__file__).parent.parent / "data" / "veritas_release" / "veritas_longitudinal_2020_q1_2025_q4" / "claims.json"
+DEFAULT_CLAIMS_PATH = Path("/mnt/vast/workspaces/PI_Rohrbach/mk79honu/data/VeriTaS/veritas_release/veritas_longitudinal_2020_q1_2026_q1/claims.json")
 
 
 def load_claim_dates(claims_path: Path) -> dict[int, datetime]:
@@ -190,7 +191,7 @@ def plot_single_model_moving_averages(
                       label=f'Knowledge cutoff ({cutoff_date.strftime("%Y-%m-%d")})')
 
         ax.set_xlabel('Claim Date')
-        ax.set_ylabel('Accuracy')
+        ax.set_ylabel(f'Accuracy, {n} Moving Average')
         ax.set_ylim(0, 1)
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -217,7 +218,7 @@ def plot_single_model_moving_averages(
                       label=f'Knowledge cutoff ({cutoff_date.strftime("%Y-%m-%d")})')
 
         ax.set_xlabel('Date')
-        ax.set_ylabel('Accuracy')
+        ax.set_ylabel(f'Accuracy, {m}-day Moving Average')
         ax.set_ylim(0, 1)
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -373,7 +374,7 @@ Examples:
                 output_dir / f"MA{n}_claims_ACC.pdf",
                 metric_name="Accuracy",
                 title="",
-                ylabel='Accuracy',
+                ylabel=f'Accuracy, {n} Moving Average',
                 cutoff_dates=model_cutoffs if model_cutoffs else None,
                 max_jump=0.15,
                 legend_loc='lower left',
@@ -385,7 +386,7 @@ Examples:
                 output_dir / f"MA{m}_days_ACC.pdf",
                 metric_name="Accuracy",
                 title="",
-                ylabel='Accuracy',
+                ylabel=f'Accuracy, {m}-day Moving Average',
                 cutoff_dates=model_cutoffs if model_cutoffs else None,
                 max_jump=0.15,
                 legend_loc='lower left',

@@ -9,8 +9,8 @@ from perplexity import Perplexity
 
 # Import API key from Veritas config (if available)
 try:
-    from veritas import globals
-    VERITAS_PERPLEXITY_KEY = globals.get("perplexity")
+    from veritas import api_secrets
+    VERITAS_PERPLEXITY_KEY = api_secrets.get("perplexity") if api_secrets else None
 except ImportError:
     VERITAS_PERPLEXITY_KEY = None
 
@@ -52,7 +52,7 @@ class PerplexityFactChecker(BaseFactChecker):
             raise ValueError(
                 "Perplexity cannot operate without search. Perplexity's API is built around "
                 "web search and always performs search on queries. Use a different provider "
-                "(openai, gemini, llama) for parametric-only fact-checking."
+                "(openai, gemini, selfhosted) for parametric-only fact-checking."
             )
         super().__init__(
             api_key=api_key,

@@ -139,15 +139,20 @@ class BaseFactChecker(ABC):
                 return api_call_fn(*args, **kwargs)
             except Exception as e:
                 error_str = str(e).lower()
-                # Check if it's a rate limit error
-                if "429" in str(e) or "rate limit" in error_str or "resource exhausted" in error_str:
+                # Retry on rate limits and transient server errors
+                is_retryable = (
+                    "429" in str(e) or "rate limit" in error_str or "resource exhausted" in error_str
+                    or "503" in str(e) or "unavailable" in error_str
+                    or "500" in str(e) or "internal error" in error_str
+                )
+                if is_retryable:
                     last_exception = e
                     # Exponential backoff with jitter
                     delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_DELAY)
-                    print(f"    Rate limited, retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    print(f"    Transient error ({e}), retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     time.sleep(delay)
                 else:
-                    # Not a rate limit error, re-raise immediately
+                    # Not a retryable error, re-raise immediately
                     raise
 
         # All retries exhausted

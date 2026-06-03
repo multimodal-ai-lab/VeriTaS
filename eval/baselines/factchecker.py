@@ -11,11 +11,13 @@ from .providers import (
     PerplexityFactChecker,
     OpenAICustomSearchFactChecker,
     GeminiCustomSearchFactChecker,
-    LlamaFactChecker,
+    SelfhostedFactChecker,
+    AnthropicFactChecker,
+    AnthropicCustomSearchFactChecker,
 )
 
 
-Provider = Literal["openai", "gemini", "perplexity", "llama"]
+Provider = Literal["openai", "gemini", "perplexity", "selfhosted", "anthropic"]
 SevenBinPredictionMode = Literal["direct", "two_step"]
 
 # Default models for each provider
@@ -23,7 +25,8 @@ DEFAULT_MODELS = {
     "openai": "gpt-5.2",
     "gemini": "gemini-2.5-flash",
     "perplexity": "sonar-pro",
-    "llama": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "selfhosted": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "anthropic": "claude-sonnet-4-6",
 }
 
 # Provider class mapping - standard (built-in search)
@@ -31,8 +34,9 @@ PROVIDER_CLASSES = {
     "openai": OpenAIFactChecker,
     "gemini": GeminiFactChecker,
     "perplexity": PerplexityFactChecker,
-    # Llama has no native search, always use custom
-    "llama": LlamaFactChecker,
+    # Self-hosted models have no native search, always use custom
+    "selfhosted": SelfhostedFactChecker,
+    "anthropic": AnthropicFactChecker,
 }
 
 # Provider class mapping - custom search (with date filtering)
@@ -41,8 +45,9 @@ PROVIDER_CLASSES_CUSTOM_SEARCH = {
     "gemini": GeminiCustomSearchFactChecker,
     # Perplexity already has good date filtering, no custom version needed
     "perplexity": PerplexityFactChecker,
-    # Llama only supports custom search
-    "llama": LlamaFactChecker,
+    # Self-hosted models only support custom search
+    "selfhosted": SelfhostedFactChecker,
+    "anthropic": AnthropicCustomSearchFactChecker,
 }
 
 
@@ -87,7 +92,7 @@ class UnifiedFactChecker:
         Initialize the unified fact-checker.
 
         Args:
-            provider: Single provider to use (openai, gemini, perplexity, or llama).
+            provider: Single provider to use (openai, gemini, perplexity, or selfhosted).
             providers: List of providers to initialize (for multi-provider mode).
             model: Model to use for single provider mode.
             models: Dict mapping provider names to model identifiers.
@@ -148,7 +153,7 @@ class UnifiedFactChecker:
         provider_class = provider_classes[provider]
         model = self.models.get(provider, DEFAULT_MODELS[provider])
         api_key = self.api_keys.get(provider) or self.api_keys.get(
-            {"openai": "openai", "gemini": "google", "perplexity": "perplexity"}.get(provider)
+            {"openai": "openai", "gemini": "google", "perplexity": "perplexity", "anthropic": "anthropic"}.get(provider)
         )
 
         # Build kwargs based on provider type

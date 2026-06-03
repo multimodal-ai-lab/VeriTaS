@@ -36,6 +36,11 @@ except (ImportError, EOFError, OSError):
 ScrapeMode = Literal["scrapemm", "lite", "none"]
 
 
+class SerperCreditsExhaustedError(BaseException):
+    """Raised when Serper API credits are exhausted. Inherits BaseException so it
+    propagates past bare `except Exception` handlers and terminates the run."""
+
+
 class _AsyncRunner:
     """Manages a single background thread with an event loop for running async code.
 
@@ -103,7 +108,7 @@ def _run_async(coro):
     return _async_runner.run(coro)
 
 try:
-    from veritas import serper_key as VERITAS_SERPAPI_KEY
+    from config import serperapi_key as VERITAS_SERPAPI_KEY
 except ImportError:
     VERITAS_SERPAPI_KEY = None
 
@@ -385,6 +390,10 @@ class SearchService:
                     json=payload,
                     timeout=30,
                 )
+                if response.status_code == 402:
+                    raise SerperCreditsExhaustedError(
+                        "Serper API credits exhausted (HTTP 402). Terminating run."
+                    )
                 response.raise_for_status()
                 data = response.json()
                 break  # Success, exit retry loop
@@ -419,7 +428,12 @@ class SearchService:
             return SearchResponse(query=query, error="Search failed: no response received")
 
         if "error" in data:
-            return SearchResponse(query=query, error=data.get("message", str(data["error"])))
+            message = data.get("message", str(data["error"]))
+            if "credit" in message.lower() or "insufficient" in message.lower():
+                raise SerperCreditsExhaustedError(
+                    f"Serper API credits exhausted: {message}. Terminating run."
+                )
+            return SearchResponse(query=query, error=message)
 
         organic_results = data.get("organic", [])
 
@@ -498,6 +512,21 @@ OPENAI_SEARCH_TOOL = {
             },
             "required": ["query"]
         }
+    }
+}
+
+ANTHROPIC_SEARCH_TOOL = {
+    "name": "web_search",
+    "description": "Search the web for information and retrieve page content. Results are limited to content published before the claim date.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query to find relevant information about the claim."
+            }
+        },
+        "required": ["query"]
     }
 }
 

@@ -113,7 +113,7 @@ USER_PROMPT_TEMPLATE_WITH_DATE_NO_SEARCH = """Please fact-check the following cl
 
 {{claim}}
 
-This claim was made on {{claim_date}}. Consider only information that was publicly available before this date.
+This claim was made on {{claim_date}}.
 
 Provide your analysis, then give your final verdict ({label_list})."""
 

@@ -25,37 +25,76 @@ FONT_SIZES = {
 METRIC_YLIM = {
     'MSE': (0.0, 1.32),
     'MAE': (0.0, 1.05),
-    'Accuracy': (0.25, 0.95),
+    'Accuracy': (0.1, 0.9),
 }
 
 # Colors for multi-model plots
-MODEL_COLORS = [
-    '#1f77b4',  # blue
-    '#ff7f0e',  # orange
-    '#2ca02c',  # green
-    '#d62728',  # red
-    '#9467bd',  # purple
-    '#8c564b',  # brown
-    '#e377c2',  # pink
-    '#7f7f7f',  # gray
-    '#bcbd22',  # olive
-    '#17becf',  # cyan
-]
+# MODEL_COLORS = [
+#     '#1f77b4',  # blue
+#     '#ff7f0e',  # orange
+#     '#2ca02c',  # green
+#     '#d62728',  # red
+#     '#9467bd',  # purple
+#     '#8c564b',  # brown
+#     '#e377c2',  # pink
+#     '#7f7f7f',  # gray
+#     '#bcbd22',  # olive
+#     '#17becf',  # cyan
+# ]
+COLORS = dict(
+    orange="#EC6500",  # Primary, TUDa
+    soft_orange="#FFC599",
+    light_orange="#F5A300",  # Secondary, TUDa
+    soft_light_orange="#FFCE6B",
+    darkblue="#004E73",  # Tertiary, TUDa
+    blue="#0083CC",  # Quaternary, TUDa
+    soft_blue="#83D3FF",
+    negative="#BD0A0A",
+    neutral="#a1a1a1",
+    positive="#09C479",
+)
+
+
 # abstaining is dark gray
 ABSTAIN_COLOR = '#444444'
 
 # Model display name abbreviations (for cleaner legends)
 MODEL_DISPLAY_NAMES = {
-    "Llama-4-Maverick-17B-128E-Instruct-FP8": "Llama-4-Maverick",
-    "gemini-2.5-flash": "Gemini-2.5-Flash",
-    "gemini-2.0-flash": "Gemini-2.0-Flash",
+    "Llama-4-Maverick-17B-128E-Instruct-FP8": "Llama 4 Maverick",
+    "gemini-2.5-flash": "Gemini 2.5 Flash",
+    "gemini-2.0-flash": "Gemini 2.0 Flash",
     "gemini-3-pro-preview": "Gemini 3 Pro",
-    "gpt-4.1": "GPT-4.1",
-    "gpt-4o": "GPT-4o",
-    "gpt-4o_no": "GPT-4o",
-    "gpt-5.2": "GPT-5.2",
-    "gpt-5.2_no": "GPT-5.2",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
+    "gemini-3-flash-preview": "Gemini 3 Flash",
+    "gpt-4.1": "GPT 4.1",
+    "gpt-4o": "GPT 4o",
+    "gpt-4o_no": "GPT 4o",
+    "gpt-5.2": "GPT 5.2",
+    "gpt-5.2_no": "GPT 5.2",
     "sonar-pro": "Sonar-Pro",
+    "claude-opus-4-6": "Claude Opus 4.6",
+    "google/gemma-4-31B-it": "Gemma 4",
+    "gemma-4-31B-it": "Gemma 4",
+}
+
+COLORS_TO_MODELS = {
+    "gpt-4o": COLORS['darkblue'],
+    "gpt-5.2": COLORS['blue'],
+    "gemini-3.1-pro-preview": COLORS['orange'],
+    "gemini-3-flash-preview": COLORS['light_orange'],
+    "google/gemma-4-31B-it": COLORS['soft_orange'],
+    "claude-opus-4-6": COLORS['negative'],
+    "Llama-4-Maverick-17B-128E-Instruct-FP8": COLORS['positive'],
+}
+
+MODEL_LINE_STYLES = {
+    "gpt-4o": "--",
+    "gpt-5.2": "--",
+    "gemini-3.1-pro-preview": "-.",
+    "gemini-3-flash-preview": "-.",
+    "google/gemma-4-31B-it": "-.",
+    "claude-opus-4-6": "-",
+    "Llama-4-Maverick-17B-128E-Instruct-FP8": ":",
 }
 
 
@@ -64,6 +103,11 @@ def get_display_name(model_name: str) -> str:
     return MODEL_DISPLAY_NAMES.get(model_name, model_name)
 
 
+# Override labels for cutoff lines when multiple models share a date
+CUTOFF_LABELS: dict[datetime, str] = {
+    datetime(2025, 1, 1): "Gemini & Gemma",
+}
+
 # Known knowledge cutoff dates for models
 MODEL_CUTOFFS = {
     # OpenAI models
@@ -71,13 +115,18 @@ MODEL_CUTOFFS = {
     "gpt-4o": datetime(2023, 10, 1),
     # Google models
     "gemini-3-pro": datetime(2025, 1, 1),
+    "gemini-3.1-pro-preview": datetime(2025, 1, 1),
+    "gemini-3-flash-preview": datetime(2025, 1, 1),
     "gemini-2.5-flash": datetime(2025, 1, 9),
     "gemini-2.0-flash": datetime(2024, 8, 1),
+    "gemma-4-31B-it": datetime(2025, 1, 1),
     # Meta models
     "llama-4": datetime(2024, 8, 9),
     # Perplexity
     "sonar-pro": None,
     "sonar": None,
+    # Anthropic models
+    "claude-opus-4-6": datetime(2025, 5, 1),
 }
 
 
@@ -95,9 +144,17 @@ def get_model_cutoff(model_name: str) -> datetime | None:
 
 def build_model_colors(model_names: list[str]) -> dict[str, str]:
     """Build a color mapping for model names."""
-    result = {name: MODEL_COLORS[idx % len(MODEL_COLORS)] for idx, name in enumerate(model_names)}
+    result = {name: COLORS_TO_MODELS.get(name, 'gray') for name in model_names}
     if "Always Abstain" in model_names:
         result["Always Abstain"] = ABSTAIN_COLOR
+    return result
+
+
+def build_model_line_styles(model_names: list[str]) -> dict[str, str]:
+    """Build a line style mapping for model names."""
+    result = {name: MODEL_LINE_STYLES.get(name, '-') for name in model_names}
+    if "Always Abstain" in model_names:
+        result["Always Abstain"] = '--'
     return result
 
 
@@ -159,6 +216,7 @@ def add_cutoff_lines(
     cutoff_dates: dict[str, datetime] | None,
     model_colors: dict[str, str],
     kcd_position: Literal['top', 'bottom'] = 'top',
+    cutoff_labels: dict[datetime, str] | None = None,
 ):
     """Add vertical cutoff lines with labels to a plot."""
     if not cutoff_dates:
@@ -174,28 +232,36 @@ def add_cutoff_lines(
 
     # Draw cutoff lines with labels
     for idx, (cutoff, models) in enumerate(sorted(cutoff_to_models.items())):
-        line_color = model_colors.get(models[0], 'gray')
-        ax.axvline(x=cutoff, color=line_color, linestyle='-', linewidth=1.5, alpha=0.9)
-        label_text = ", ".join(get_display_name(m) for m in models)
+        n = len(models)
+        seg = 8  # dash segment length in points
+        for i, model_name in enumerate(models):
+            line_color = model_colors.get(model_name, 'gray')
+            if n == 1:
+                linestyle = (0, (1, 0))  # solid
+            else:
+                linestyle = (i * seg, (seg, seg * (n - 1)))
+            ax.axvline(x=cutoff, color=line_color, linestyle=linestyle, linewidth=1.5, alpha=0.9)
+        label_text = (cutoff_labels or CUTOFF_LABELS).get(cutoff) or ", ".join(get_display_name(m) for m in models)
+        label_color = 'black' if len(models) > 1 else model_colors.get(models[0], 'gray')
         # Shift text left for specific models
         text_x = cutoff
-        if any("gemini-2.0" in m.lower() or "gemini-3" in m.lower() for m in models):
-            text_x = cutoff - timedelta(days=22)
+        if any("gpt-5.2" in m.lower() for m in models):
+            text_x = cutoff - timedelta(days=54)
         else:
             text_x = cutoff + timedelta(days=2)
 
-        ax.text(
-            text_x,
-            0.98 if kcd_position == 'top' else 0.0,
-            f" {label_text}",
-            fontsize=FONT_SIZES['cutoff_label'],
-            color=line_color,
-            ha='left',
-            va=kcd_position,
-            rotation=90,
-            transform=ax.get_xaxis_transform(),
-            fontweight='bold'
-        )
+        # ax.text(
+        #     text_x,
+        #     0.98 if kcd_position == 'top' else 0.0,
+        #     f" {label_text}",
+        #     fontsize=FONT_SIZES['cutoff_label'],
+        #     color=label_color,
+        #     ha='left',
+        #     va=kcd_position,
+        #     rotation=90,
+        #     transform=ax.get_xaxis_transform(),
+        #     fontweight='bold'
+        # )
 
 
 def add_mean_lines(ax, model_means: dict[str, float], model_colors: dict[str, str]):
@@ -242,6 +308,7 @@ def plot_multi_model_metric(
     title: str,
     ylabel: str,
     cutoff_dates: dict[str, datetime] | None = None,
+    cutoff_labels: dict[datetime, str] | None = None,
     fixed_ylim: tuple[float, float] | None = None,
     max_jump: float = 0.15,
     legend_loc: str = 'lower left',
@@ -270,13 +337,13 @@ def plot_multi_model_metric(
 
     # Sort models by this:
     # "Always Abstain" first
-    # Llama-4 second
+    # Claude and Llama-4 second
     # Gemini model versions in order
     # GPT model versions in order
     def model_sort_key(name: str) -> tuple[int, int, int, int]:
         if name == "Always Abstain":
             return (0, 0, 0, 0)
-        if "llama-4" in name.lower():
+        if "claude" in name.lower() or "llama-4" in name.lower():
             return (1, 0, 0, 0)
         if "gemini" in name.lower():
             parts = name.lower().split('-')
@@ -312,15 +379,25 @@ def plot_multi_model_metric(
                 color = model_colors[model_name]
                 plot_dates, plot_vals = filter_spikes(dates, values, max_jump)
                 display_name = get_display_name(model_name)
-                ax.plot(
-                    plot_dates,
-                    plot_vals,
-                    '-',
-                    linewidth=1.5,
-                    color=color,
-                    label=display_name,
-                    alpha=0.8
-                )
+                cutoff = cutoff_dates.get(model_name) if cutoff_dates else None
+
+                if cutoff:
+                    cutoff_idx = next(
+                        (i for i, d in enumerate(plot_dates) if d > cutoff),
+                        len(plot_dates)
+                    )
+                    if cutoff_idx > 0:
+                        ax.plot(plot_dates[:cutoff_idx], plot_vals[:cutoff_idx],
+                                ':', linewidth=1.5, color=color, alpha=0.8)
+                    if cutoff_idx < len(plot_dates):
+                        start = max(0, cutoff_idx - 1)
+                        ax.plot(plot_dates[start:], plot_vals[start:],
+                                '-', linewidth=1.5, color=color,
+                                label=display_name, alpha=0.8)
+                else:
+                    ax.plot(plot_dates, plot_vals, '-', linewidth=1.5,
+                            color=color, label=display_name, alpha=0.8)
+
                 model_means[model_name] = mean_val
                 all_data_for_avg.append((dates, values))
                 all_values.extend(values)
@@ -342,7 +419,7 @@ def plot_multi_model_metric(
     # add_mean_lines(ax, model_means, model_colors)
 
     # Add cutoff lines
-    add_cutoff_lines(ax, cutoff_dates, model_colors, 'top' if metric_name == 'MAE' else 'bottom')
+    add_cutoff_lines(ax, cutoff_dates, model_colors, 'top' if metric_name == 'MAE' else 'bottom', cutoff_labels)
 
     # Set y-axis limits (explicit > metric default > dynamic)
     if fixed_ylim:

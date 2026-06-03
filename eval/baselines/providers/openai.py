@@ -10,7 +10,8 @@ from openai import OpenAI
 
 # Import API key from Veritas config
 try:
-    from veritas import openai_key as VERITAS_OPENAI_KEY
+    from veritas import api_secrets
+    VERITAS_OPENAI_KEY = api_secrets.get("openai") if api_secrets else None
 except ImportError:
     VERITAS_OPENAI_KEY = None
 

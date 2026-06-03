@@ -6,7 +6,9 @@ from .gemini import GeminiFactChecker
 from .perplexity import PerplexityFactChecker
 from .openai_custom import OpenAICustomSearchFactChecker
 from .gemini_custom import GeminiCustomSearchFactChecker
-from .llama import LlamaFactChecker
+from .selfhosted import SelfhostedFactChecker
+from .anthropic import AnthropicFactChecker
+from .anthropic_custom import AnthropicCustomSearchFactChecker
 
 __all__ = [
     "BaseFactChecker",
@@ -15,5 +17,7 @@ __all__ = [
     "PerplexityFactChecker",
     "OpenAICustomSearchFactChecker",
     "GeminiCustomSearchFactChecker",
-    "LlamaFactChecker",
+    "SelfhostedFactChecker",
+    "AnthropicFactChecker",
+    "AnthropicCustomSearchFactChecker",
 ]
