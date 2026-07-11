@@ -1821,9 +1821,9 @@ Examples:
     parser.add_argument("--scrape-mode", choices=["lite", "scrapemm", "none"],
                         default="lite",
                         help="For --custom-search: how to fetch page content. "
-                             "'scrapemm' scrapes via scrapeMM; choose its backends with --scrape-methods")
+                             "'scrapemm' scrapes via scrapeMM; choose its backends with --scrapemm-methods")
     parser.add_argument(
-        "--scrape-methods",
+        "--scrapemm-methods",
         nargs="+",
         choices=["auto", "integrations", "firecrawl", "decodo"],
         default=["firecrawl"],
@@ -1873,5 +1873,5 @@ Examples:
         mode=args.mode,
         seven_bin_prediction_mode=args.seven_bin_prediction_mode,
         scrape_mode=args.scrape_mode,
-        scrape_methods=args.scrape_methods,
+        scrape_methods=args.scrapemm_methods,
     )
