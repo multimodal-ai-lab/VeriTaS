@@ -27,9 +27,7 @@ from bs4 import BeautifulSoup
 
 # Optional scrapeMM import (needed for "scrapemm" mode). scrapeMM is a meta-scraper
 # whose own backends include Firecrawl ("firecrawl"), social-media APIs
-# ("integrations") and the Decodo web-scraping API ("decodo"); the desired subset is
-# selected via the `scrape_methods` argument and forwarded to retrieve(methods=...).
-# Catches ImportError and EOFError (raised in non-interactive environments like SLURM)
+# ("integrations") and the Decodo web-scraping API ("decodo")
 try:
     from scrapemm import retrieve
     from scrapemm.common import ScrapingResponse
