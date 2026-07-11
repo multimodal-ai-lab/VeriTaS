@@ -7,7 +7,8 @@ via function calling, with proper constraints for fact-checking benchmarks:
 2. Content retrieval: Fetch page content (via scrapeMM or simple static requests)
 
 Scrape modes:
-- "scrapemm": Full multimodal scraping with JS rendering (slower, more complete)
+- "scrapemm": Scrape via scrapeMM, a meta-scraper whose backends (Firecrawl,
+  social-media integrations, Decodo) are selected via the `scrape_methods` argument
 - "lite": Simple static HTTP requests + BeautifulSoup (faster, text-only)
 - "none": No scraping, only use search snippets
 """
@@ -24,7 +25,10 @@ from typing import Literal
 import requests
 from bs4 import BeautifulSoup
 
-# Optional scrapeMM import (only needed for "scrapemm" mode)
+# Optional scrapeMM import (needed for "scrapemm" mode). scrapeMM is a meta-scraper
+# whose own backends include Firecrawl ("firecrawl"), social-media APIs
+# ("integrations") and the Decodo web-scraping API ("decodo"); the desired subset is
+# selected via the `scrape_methods` argument and forwarded to retrieve(methods=...).
 # Catches ImportError and EOFError (raised in non-interactive environments like SLURM)
 try:
     from scrapemm import retrieve
@@ -137,7 +141,7 @@ class SearchService:
     Web search service with date filtering and content retrieval.
 
     Uses SerpAPI for search. Content scraping supports multiple modes:
-    - "scrapemm": Full scraping with JS rendering via scrapeMM (slower, more complete)
+    - "scrapemm": Full scraping via scrapeMM
     - "lite": Static HTTP requests + BeautifulSoup (faster, text-only)
     - "none": No scraping, only use search snippets
     """
@@ -147,6 +151,7 @@ class SearchService:
         serpapi_key: str | None = None,
         max_content_length: int = 8000,
         scrape_mode: ScrapeMode = "lite",
+        scrape_methods: list[str] | str | None = "firecrawl",
     ):
         """
         Initialize the search service.
@@ -155,16 +160,33 @@ class SearchService:
             serpapi_key: SerpAPI key. If None, uses config/env var.
             max_content_length: Maximum characters of content to include per result.
             scrape_mode: How to fetch page content - "scrapemm", "lite", or "none".
+            scrape_methods: For scrape_mode="scrapemm", which scrapeMM backends to
+                           use, in order. A subset of {"integrations", "firecrawl",
+                           "decodo"}, or "auto" to let scrapeMM choose per domain.
+                           Defaults to ["firecrawl"] (Firecrawl only). Forwarded to
+                           scrapeMM's retrieve(methods=...).
         """
         self.serpapi_key = self._resolve_serpapi_key(serpapi_key)
         self.max_content_length = max_content_length
         self.scrape_mode = scrape_mode
+        self.scrape_methods = self._normalize_scrape_methods(scrape_methods)
 
         if scrape_mode == "scrapemm" and not SCRAPEMM_AVAILABLE:
             raise ImportError("scrapeMM is required for scrape_mode='scrapemm'. Install it or use 'lite' mode.")
 
         # Session for lite mode (connection pooling)
         self._session: requests.Session | None = None
+
+    @staticmethod
+    def _normalize_scrape_methods(methods: list[str] | str | None) -> list[str] | Literal["auto"]:
+        """Normalize `scrape_methods` into the form scrapeMM's retrieve() expects:
+        either the literal "auto" or a non-empty list[str] of backend names."""
+        if methods is None or methods == "auto" or methods == ["auto"]:
+            return "auto"
+        if isinstance(methods, str):
+            return [methods]
+        methods = [m for m in methods if m]
+        return methods or "auto"
 
     def _resolve_serpapi_key(self, key: str | None) -> str | None:
         """Resolve SerpAPI key from parameter, config, or environment."""
@@ -195,6 +217,7 @@ class SearchService:
                 url,
                 show_progress=False,
                 format="multimodal_sequence",
+                methods=self.scrape_methods,
             )
 
             if response.successful and response.content:
@@ -218,6 +241,7 @@ class SearchService:
                 urls,
                 show_progress=False,
                 format="multimodal_sequence",
+                methods=self.scrape_methods,
             )
 
             results = []
@@ -485,11 +509,13 @@ class SearchService:
             lines.append(f"URL: {result.url}")
             if result.date:
                 lines.append(f"Date: {result.date}")
-            lines.append(f"Summary: {result.snippet}")
 
             if include_content and result.content:
-                lines.append(f"\n--- Page Content ---")
+                lines.append(f"\n--- Page Content for {result.url} ---")
                 lines.append(result.content)
+                lines.append(f"\n--- End of page content for {result.url} ---")
+            else:
+                lines.append(f"Summary: {result.snippet}")
 
             lines.append("")
 
@@ -555,10 +581,12 @@ def create_search_service(
     serpapi_key: str | None = None,
     max_content_length: int = 8000,
     scrape_mode: ScrapeMode = "lite",
+    scrape_methods: list[str] | str | None = "firecrawl",
 ) -> SearchService:
     """Factory function to create a SearchService instance."""
     return SearchService(
         serpapi_key=serpapi_key,
         max_content_length=max_content_length,
         scrape_mode=scrape_mode,
+        scrape_methods=scrape_methods,
     )

@@ -1,8 +1,10 @@
 """Unified fact-checker that supports multiple providers."""
 
+import inspect
 from datetime import datetime
 from typing import Literal
 
+from .common.search import ScrapeMode
 from .common.types import FactCheckResult, LabelScheme
 from .providers import (
     BaseFactChecker,
@@ -87,6 +89,8 @@ class UnifiedFactChecker:
         use_search: bool = True,
         label_scheme: LabelScheme | None = None,
         seven_bin_prediction_mode: SevenBinPredictionMode = "direct",
+        scrape_mode: ScrapeMode = "lite",
+        scrape_methods: list[str] | str | None = "firecrawl",
     ):
         """
         Initialize the unified fact-checker.
@@ -108,6 +112,11 @@ class UnifiedFactChecker:
             seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
                                       combined label; "two_step" asks for
                                       direction + certainty in one response.
+            scrape_mode: For custom_search providers, how to fetch page content -
+                        "lite" (fast), "scrapemm" (full), or "none".
+            scrape_methods: For scrape_mode="scrapemm", which scrapeMM backends to use
+                        (subset of integrations/firecrawl/decodo, or "auto"). Default
+                        ["firecrawl"]. Custom-search providers only.
 
         Note: Specify either `provider` or `providers`, not both.
         """
@@ -115,8 +124,10 @@ class UnifiedFactChecker:
         self.models = models or {}
         self.custom_search = custom_search
         self.use_search = use_search
+        self.scrape_mode = scrape_mode
         self.label_scheme = label_scheme
         self.seven_bin_prediction_mode = seven_bin_prediction_mode
+        self.scrape_methods = scrape_methods
         self._checkers: dict[Provider, BaseFactChecker] = {}
 
         # Determine which providers to initialize
@@ -165,6 +176,14 @@ class UnifiedFactChecker:
         }
         if api_key:
             kwargs["api_key"] = api_key
+
+        # Only custom-search providers accept scrape_mode / scrape_methods;
+        # pass them when supported.
+        provider_params = inspect.signature(provider_class.__init__).parameters
+        if "scrape_mode" in provider_params:
+            kwargs["scrape_mode"] = self.scrape_mode
+        if "scrape_methods" in provider_params:
+            kwargs["scrape_methods"] = self.scrape_methods
 
         self._checkers[provider] = provider_class(**kwargs)
 

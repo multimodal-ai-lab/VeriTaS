@@ -1165,6 +1165,8 @@ def init_staged_checkers(
     use_search: bool,
     property_label_classes: int = 3,
     seven_bin_prediction_mode: str = "direct",
+    scrape_mode: str = "lite",
+    scrape_methods: list[str] | str | None = "firecrawl",
 ) -> dict[str, dict[str, UnifiedFactChecker]]:
     """Initialize per-provider, per-property checkers for staged mode."""
     per_property_checkers = {}
@@ -1179,6 +1181,8 @@ def init_staged_checkers(
                 use_search=use_search,
                 label_scheme=get_property_label_scheme(property_name, n_classes=property_label_classes),
                 seven_bin_prediction_mode=seven_bin_prediction_mode,
+                scrape_mode=scrape_mode,
+                scrape_methods=scrape_methods,
             )
     return per_property_checkers
 
@@ -1532,6 +1536,8 @@ def run_benchmark(
     label_scheme: LabelScheme | None = None,
     mode: str = "integrity",
     seven_bin_prediction_mode: str = "direct",
+    scrape_mode: str = "lite",
+    scrape_methods: list[str] | str | None = "firecrawl",
 ):
     """
     Run the fact-checker benchmark on VeriTaS claims.
@@ -1551,6 +1557,10 @@ def run_benchmark(
         seven_bin_prediction_mode: For 7-class schemes, "direct" asks the model
                                   for a combined label, while "two_step" asks for
                                   direction + certainty in one response.
+        scrape_mode: For custom_search, how to fetch page content - "lite" (fast),
+                    "scrapemm" (full), or "none".
+        scrape_methods: For scrape_mode="scrapemm", which scrapeMM backends to use
+                    (subset of integrations/firecrawl/decodo, or "auto"). Default ["firecrawl"].
     """
     # Default to all providers
     if providers is None:
@@ -1607,6 +1617,8 @@ def run_benchmark(
         "num_workers": num_workers,
         "custom_search": custom_search,
         "use_search": use_search,
+        "scrape_mode": scrape_mode,
+        "scrape_methods": scrape_methods,
         "mode": mode,
         "label_scheme": label_scheme.name if label_scheme else "3-class",
         "seven_bin_prediction_mode": seven_bin_prediction_mode,
@@ -1627,7 +1639,7 @@ def run_benchmark(
     if not use_search:
         search_mode = "disabled (parametric knowledge only)"
     elif custom_search:
-        search_mode = "custom (date filter + content retrieval)"
+        search_mode = f"custom (date filter + content retrieval, scrape_mode={scrape_mode})"
     else:
         search_mode = "built-in"
     label_scheme_name = label_scheme.name if label_scheme else "3-class"
@@ -1647,6 +1659,8 @@ def run_benchmark(
             use_search=use_search,
             property_label_classes=property_label_classes,
             seven_bin_prediction_mode=seven_bin_prediction_mode,
+            scrape_mode=scrape_mode,
+            scrape_methods=scrape_methods,
         )
     else:
         fc = UnifiedFactChecker(
@@ -1656,6 +1670,8 @@ def run_benchmark(
             use_search=use_search,
             label_scheme=label_scheme,
             seven_bin_prediction_mode=seven_bin_prediction_mode,
+            scrape_mode=scrape_mode,
+            scrape_methods=scrape_methods,
         )
 
     # Process each provider
@@ -1802,6 +1818,19 @@ Examples:
                         help="Number of parallel workers")
     parser.add_argument("--custom-search", action="store_true",
                         help="Use custom search with date filtering and content retrieval")
+    parser.add_argument("--scrape-mode", choices=["lite", "scrapemm", "none"],
+                        default="lite",
+                        help="For --custom-search: how to fetch page content. "
+                             "'scrapemm' scrapes via scrapeMM; choose its backends with --scrape-methods")
+    parser.add_argument(
+        "--scrape-methods",
+        nargs="+",
+        choices=["auto", "integrations", "firecrawl", "decodo"],
+        default=["firecrawl"],
+        help="For --scrape-mode scrapemm: which scrapeMM backends to use, in order. "
+             "Subset of integrations/firecrawl/decodo, or 'auto' (used alone) to let "
+             "scrapeMM pick per domain. Default: firecrawl.",
+    )
     parser.add_argument("--no-search", action="store_true",
                         help="Disable web search, use parametric knowledge only")
     parser.add_argument("--label-scheme", type=int, choices=[3, 7], default=3,
@@ -1843,4 +1872,6 @@ Examples:
         label_scheme=get_label_scheme(args.label_scheme),
         mode=args.mode,
         seven_bin_prediction_mode=args.seven_bin_prediction_mode,
+        scrape_mode=args.scrape_mode,
+        scrape_methods=args.scrape_methods,
     )

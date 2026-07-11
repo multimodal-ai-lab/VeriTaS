@@ -54,6 +54,7 @@ class GeminiCustomSearchFactChecker(BaseFactChecker):
         max_search_calls: int = 5,
         scrape_content: bool = True,
         scrape_mode: ScrapeMode = "lite",
+        scrape_methods: list[str] | str | None = "firecrawl",
         use_search: bool = True,
         label_scheme: LabelScheme | None = None,
         seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
@@ -68,6 +69,8 @@ class GeminiCustomSearchFactChecker(BaseFactChecker):
             max_search_calls: Maximum number of search calls per fact-check.
             scrape_content: Whether to scrape full page content.
             scrape_mode: Scraping method - "lite" (fast), "scrapemm" (full), or "none".
+            scrape_methods: For scrape_mode="scrapemm", which scrapeMM backends to use
+                       (subset of integrations/firecrawl/decodo, or "auto"). Default ["firecrawl"].
             use_search: If True (default), use web search. If False, use only
                        parametric knowledge.
             label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
@@ -89,6 +92,7 @@ class GeminiCustomSearchFactChecker(BaseFactChecker):
                 serpapi_key=serpapi_key,
                 scrape_mode=scrape_mode,
                 max_content_length=5000,
+                scrape_methods=scrape_methods,
             )
         else:
             self.search_service = None
