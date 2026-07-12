@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,7 +69,8 @@ CSV_COLUMNS = [
     "first_error_step",
     "correct",
     "status",
-    "error_message"
+    "error_message",
+    "justification"
 ]
 
 PROPERTY_POS_NEG_LABELS = {
@@ -77,6 +79,18 @@ PROPERTY_POS_NEG_LABELS = {
     "veracity": ("True", "False"),
     "context_coverage": ("Sufficient", "Insufficient"),
 }
+
+JUSTIFICATION_CSV_MAX_CHARS = 1000
+
+
+def format_justification_for_csv(result: FactCheckResult | None) -> str:
+    """Flatten a justification onto one line for the CSV; the JSONL keeps it raw."""
+    if not result or not result.justification:
+        return ""
+    flat = re.sub(r"\s+", " ", result.justification).strip()
+    if len(flat) > JUSTIFICATION_CSV_MAX_CHARS:
+        return flat[:JUSTIFICATION_CSV_MAX_CHARS - 3] + "..."
+    return flat
 
 def extract_score(value) -> float | None:
     """Extract numeric score from scalar or {score: ...} objects."""
@@ -243,7 +257,8 @@ def build_csv_record(
         "first_error_step": staged.get("first_error_step") if staged else None,
         "correct": correct,
         "status": status,
-        "error_message": error_message
+        "error_message": error_message,
+        "justification": format_justification_for_csv(result)
     }
 
 

@@ -11,6 +11,17 @@ from ..common.types import LabelScheme, DEFAULT_LABEL_SCHEME, MAX_RETRIES, BASE_
 from ..common.prompts import build_prompts
 
 
+def extract_justification(response: str) -> str:
+    """Extract the JUSTIFICATION field from a response ("" when absent)."""
+    match = re.search(r"JUSTIFICATION\s*:\s*([^\n\r]+)", response or "", re.IGNORECASE)
+    if not match:
+        return ""
+
+    # Only leading/trailing wrappers: stripping punctuation like the verdict
+    # fields do would break URLs and markdown links inside the justification.
+    return match.group(1).strip().strip("[]<>`*_ ").strip()
+
+
 class BaseFactChecker(ABC):
     """Abstract base class for fact-checking providers."""
 
@@ -72,12 +83,11 @@ class BaseFactChecker(ABC):
 
     def _get_system_prompt(self) -> str:
         """Get the appropriate system prompt based on search mode."""
-        prompt = ""
         if self.use_search:
-            prompt = self._prompts["system_prompt"]
-        else:
-            prompt = self._prompts["system_prompt_no_search"]
-        return prompt + self._get_two_step_prompt_suffix()
+            return self._prompts["system_prompt"] + self._get_two_step_prompt_suffix()
+        if self._is_two_step_7bin_mode():
+            return self._prompts["system_prompt_no_search_two_step"]
+        return self._prompts["system_prompt_no_search"]
 
     def _get_user_prompt(self, claim: str, claim_date: str | datetime | None = None) -> str:
         """Get the formatted user prompt based on search mode and claim date."""
@@ -88,13 +98,14 @@ class BaseFactChecker(ABC):
                     claim=claim, claim_date=formatted_date
                 )
             return self._prompts["user_prompt"].format(claim=claim)
-        else:
-            if claim_date:
-                formatted_date = self._format_date_for_prompt(claim_date)
-                return self._prompts["user_prompt_with_date_no_search"].format(
-                    claim=claim, claim_date=formatted_date
-                )
-            return self._prompts["user_prompt_no_search"].format(claim=claim)
+
+        two_step = self._is_two_step_7bin_mode()
+        if claim_date:
+            key = "user_prompt_with_date_no_search_two_step" if two_step else "user_prompt_with_date_no_search"
+            formatted_date = self._format_date_for_prompt(claim_date)
+            return self._prompts[key].format(claim=claim, claim_date=formatted_date)
+        key = "user_prompt_no_search_two_step" if two_step else "user_prompt_no_search"
+        return self._prompts[key].format(claim=claim)
 
     def _get_custom_search_system_prompt(self) -> str:
         """Get the custom search system prompt."""
@@ -206,8 +217,11 @@ class BaseFactChecker(ABC):
         if match:
             return self.label_scheme.normalize_verdict(match.group(1))
 
-        # Fallback: look for verdict words at end of response
-        last_lines = response.strip().split("\n")[-3:]
+        # Fallback: look for verdict words at end of response. Drop the
+        # JUSTIFICATION line first — it sits inside this window and routinely
+        # contains label words ("compromised", "intact") that would win here.
+        scan_text = re.sub(r"^.*JUSTIFICATION\s*:.*$", "", response, flags=re.IGNORECASE | re.MULTILINE)
+        last_lines = scan_text.strip().split("\n")[-3:]
         last_text = " ".join(last_lines).upper()
 
         # Try to match any label in the last lines (longest match first)

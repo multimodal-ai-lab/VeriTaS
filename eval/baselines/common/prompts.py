@@ -153,7 +153,8 @@ This claim was made on {{claim_date}}. Use the web_search tool to find evidence 
 # Custom search + dedicated 7-bin two-step prompts
 # =============================================================================
 
-SYSTEM_PROMPT_CUSTOM_SEARCH_TWO_STEP_TEMPLATE = """You are a professional fact-checker. Your task is to verify claims by searching the web for reliable sources and evidence.
+SYSTEM_PROMPT_CUSTOM_SEARCH_TWO_STEP_TEMPLATE = """
+You are a professional fact-checker. Your task is to verify claims by searching the web for reliable sources and evidence.
 
 # Method
 
@@ -177,33 +178,74 @@ For each claim, follow this decision protocol:
 # Output 
 The final verdict MUST be exactly one of: {label_list}
 End your response with these exact lines:
-  DIRECTION: `<{direction_list}>`
-  CERTAINTY: `_<certain/rather certain/rather uncertain/N/A>_`
-  VERDICT: [{label_list}]"""
+  DIRECTION: <{direction_list}>
+  CERTAINTY: <certain/rather certain/rather uncertain/N/A>
+  JUSTIFICATION: <1-2 sentence justification citing ALL the exact retrieved URLs of the Evidence you build your verdict on as inline markdown hyperlinks>
+  VERDICT: [{label_list}]
+  """.strip()
 
-USER_PROMPT_CUSTOM_SEARCH_TWO_STEP_TEMPLATE = """Please fact-check the following claim:
-
+USER_PROMPT_CUSTOM_SEARCH_TWO_STEP_TEMPLATE = """
+Please fact-check the following claim:
 {{claim}}
 
-Use the web_search tool to find evidence and provide your analysis.
-Then decide in two steps:
-1) direction ({direction_list})
-   - Choose UNKNOWN only for true evidence dead-ends or unresolved contradictions.
-   - If evidence weakly leans one side, choose that direction (not UNKNOWN).
-2) certainty (certain/rather certain/rather uncertain, or N/A if direction is UNKNOWN)
-Finally output the mapped 7-bin verdict."""
+Provide your analysis, then give your final verdict.
+""".strip()
 
-USER_PROMPT_CUSTOM_SEARCH_TWO_STEP_WITH_DATE_TEMPLATE = """Please fact-check the following claim:
-
+USER_PROMPT_CUSTOM_SEARCH_TWO_STEP_WITH_DATE_TEMPLATE = """
+Please fact-check the following claim:
 {{claim}}
 
-This claim was made on {{claim_date}}. Use the web_search tool to find evidence and provide your analysis.
-Then decide in two steps:
-1) direction ({direction_list})
-   - Choose UNKNOWN only for true evidence dead-ends or unresolved contradictions.
-   - If evidence weakly leans one side, choose that direction (not UNKNOWN).
-2) certainty (certain/rather certain/rather uncertain, or N/A if direction is UNKNOWN)
-Finally output the mapped 7-bin verdict."""
+This claim was made on {{claim_date}}.
+
+Provide your analysis, then give your final verdict.
+""".strip()
+
+# =============================================================================
+# No-search + dedicated 7-bin two-step prompts (parametric knowledge only)
+# =============================================================================
+
+SYSTEM_PROMPT_NO_SEARCH_TWO_STEP_TEMPLATE = """
+You are a professional fact-checker. Your task is to verify claims.
+
+# Method
+
+## Arriving at a verdict
+For each claim, follow this decision protocol:
+1. Evaluate your knowledge about the claim and choose a DIRECTION from: {direction_list}
+2. Use UNKNOWN only as a last resort: choose UNKNOWN only when your knowledge is genuinely insufficient or strongly contradictory after reasonable analysis.
+3. If there is any directional lean (even weak), do NOT use UNKNOWN. Choose the leaning direction and encode uncertainty via CERTAINTY.
+4. If direction is UNKNOWN, do not assign certainty (use N/A).
+5. If direction is not UNKNOWN, choose CERTAINTY based on evidence strength:
+   - certain: your knowledge is unequivocal and leaves little room for doubt
+   - rather certain: your knowledge is strong but not fully definitive
+   - rather uncertain: your knowledge weakly supports one side; misclassification risk is high
+6. Map direction + certainty to exactly one final 7-bin verdict from:
+{label_descriptions}
+
+# Output
+The final verdict MUST be exactly one of: {label_list}
+End your response with these exact lines:
+  DIRECTION: <{direction_list}>
+  CERTAINTY: <certain/rather certain/rather uncertain/N/A>
+  JUSTIFICATION: <1-2 sentence justification naming the specific knowledge you build your verdict on>
+  VERDICT: [{label_list}]
+  """.strip()
+
+USER_PROMPT_NO_SEARCH_TWO_STEP_TEMPLATE = """
+Please fact-check the following claim:
+{{claim}}
+
+Provide your analysis, then give your final verdict.
+""".strip()
+
+USER_PROMPT_NO_SEARCH_TWO_STEP_WITH_DATE_TEMPLATE = """
+Please fact-check the following claim:
+{{claim}}
+
+This claim was made on {{claim_date}}.
+
+Provide your analysis, then give your final verdict.
+""".strip()
 
 
 def build_prompts(scheme: LabelScheme | None = None) -> dict[str, str]:
@@ -220,6 +262,12 @@ def build_prompts(scheme: LabelScheme | None = None) -> dict[str, str]:
         - system_prompt_custom_search
         - user_prompt_custom_search
         - user_prompt_custom_search_with_date
+        - system_prompt_custom_search_two_step
+        - user_prompt_custom_search_two_step
+        - user_prompt_custom_search_with_date_two_step
+        - system_prompt_no_search_two_step
+        - user_prompt_no_search_two_step
+        - user_prompt_with_date_no_search_two_step
 
     The returned user prompts still contain {claim} and {claim_date}
     placeholders to be filled at call time.
@@ -251,6 +299,9 @@ def build_prompts(scheme: LabelScheme | None = None) -> dict[str, str]:
         "system_prompt_custom_search_two_step": SYSTEM_PROMPT_CUSTOM_SEARCH_TWO_STEP_TEMPLATE.format(**fmt),
         "user_prompt_custom_search_two_step": USER_PROMPT_CUSTOM_SEARCH_TWO_STEP_TEMPLATE.format(**fmt),
         "user_prompt_custom_search_with_date_two_step": USER_PROMPT_CUSTOM_SEARCH_TWO_STEP_WITH_DATE_TEMPLATE.format(**fmt),
+        "system_prompt_no_search_two_step": SYSTEM_PROMPT_NO_SEARCH_TWO_STEP_TEMPLATE.format(**fmt),
+        "user_prompt_no_search_two_step": USER_PROMPT_NO_SEARCH_TWO_STEP_TEMPLATE.format(**fmt),
+        "user_prompt_with_date_no_search_two_step": USER_PROMPT_NO_SEARCH_TWO_STEP_WITH_DATE_TEMPLATE.format(**fmt),
     }
 
 

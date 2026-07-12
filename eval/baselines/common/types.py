@@ -334,6 +334,7 @@ class FactCheckResult:
     model: str = ""
     provider: str = ""
     usage: dict = field(default_factory=dict)
+    justification: str = ""  # Parsed JUSTIFICATION field; "" when the model emitted none
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -344,4 +345,5 @@ class FactCheckResult:
             "model": self.model,
             "provider": self.provider,
             "usage": self.usage,
+            "justification": self.justification,
         }

@@ -110,7 +110,8 @@ def _run_async(coro):
     return _async_runner.run(coro)
 
 try:
-    from config import serperapi_key as VERITAS_SERPAPI_KEY
+    from veritas import api_secrets
+    VERITAS_SERPAPI_KEY = api_secrets.get("serper") if api_secrets else None
 except ImportError:
     VERITAS_SERPAPI_KEY = None
 
@@ -187,12 +188,12 @@ class SearchService:
         return methods or "auto"
 
     def _resolve_serpapi_key(self, key: str | None) -> str | None:
-        """Resolve SerpAPI key from parameter, config, or environment."""
+        """Resolve Serper key from parameter, config.yaml (api_secrets.serper), or environment."""
         if key:
             return key
         if VERITAS_SERPAPI_KEY:
             return VERITAS_SERPAPI_KEY
-        return os.environ.get("SERPAPI_API_KEY")
+        return os.environ.get("SERPER_API_KEY") or os.environ.get("SERPAPI_API_KEY")
 
     def _format_date_for_serper(self, before_date: datetime | date | str) -> str:
         """
@@ -380,7 +381,7 @@ class SearchService:
         if not self.serpapi_key:
             return SearchResponse(
                 query=query,
-                error="No Serper API key configured. Set serperapi_key in config/globals.yaml or SERPER_API_KEY env var."
+                error="No Serper API key configured. Set api_secrets.serper in config.yaml or the SERPER_API_KEY env var."
             )
 
         # Build Serper.dev request

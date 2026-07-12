@@ -17,6 +17,7 @@ from .providers import (
     AnthropicFactChecker,
     AnthropicCustomSearchFactChecker,
 )
+from .providers.base import extract_justification
 
 
 Provider = Literal["openai", "gemini", "perplexity", "selfhosted", "anthropic"]
@@ -236,7 +237,11 @@ class UnifiedFactChecker:
             FactCheckResult with verdict, reasoning, citations, etc.
         """
         checker = self.get_provider(provider)
-        return checker.check_claim(claim, image_paths, video_paths, claim_date)
+        result = checker.check_claim(claim, image_paths, video_paths, claim_date)
+        if not result.justification:
+            # `reasoning` holds the raw model response for every provider.
+            result.justification = extract_justification(result.reasoning or "")
+        return result
 
     def check_claim_all_providers(
         self,
