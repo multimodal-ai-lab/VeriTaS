@@ -21,7 +21,7 @@ def configure_third_party_logging() -> None:
     duplication.
     """
     quiet_critical = (
-        "httpx", "httpcore", "urllib3", "hlsnative",
+        "httpx", "httpcore", "urllib3", "hlsnative", "websockets",
         "yt_dlp", "youtube_dl", "asyncio", "filelock",
     )
     quiet_error = (

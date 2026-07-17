@@ -124,6 +124,7 @@ async def scrape_appearances(appearances: list[Appearance]):
     Downloads only as many appearances as needed.
     """
     # Only take appearances that are not deferred and are missing original content (regardless of archive)
+    # Implicitly ignores the dismissed status
     unscraped_appearances = [
         app for app in appearances
         if not app.original_scraped_content and not app.deferred
@@ -183,9 +184,14 @@ async def scrape_appearances(appearances: list[Appearance]):
                 else:
                     last_error = "Empty response from scraper."
 
-            # If we get here, neither original nor archive produced sufficient content
+            # Update dismissal status
             if not (app.original_scrape_ok or app.archived_scrape_ok):
+                # Neither original nor archive produced sufficient content, hence, dismiss
                 await app.dismiss(last_error or "Could not retrieve sufficient content from either source.")
+            elif app.dismissed:
+                # The appearance might have been dismissed once before but retrieval was successful this time
+                await app.take_back_dismissal()
+
         finally:
             await app.save_to_db()
 

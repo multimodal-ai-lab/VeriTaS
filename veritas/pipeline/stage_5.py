@@ -46,6 +46,7 @@ class Stage5(Stage):
                                max_per_quarter: int) -> list[Review]:
         """Fetches a batch of reviews at stage 4, respecting per-quarter claim limits."""
         from veritas.util.util import get_quarter_date_range, get_quarters
+        import random
 
         if not self.quarters:
             self.quarters.update({q: False for q in get_quarters(start, end)})
@@ -68,6 +69,7 @@ class Stage5(Stage):
 
         if self.quarters and all(self.quarters.values()):
             self.done = True
+        random.shuffle(all_reviews)
         return all_reviews
 
 

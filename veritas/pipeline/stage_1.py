@@ -204,9 +204,21 @@ async def _process_raw_claim_reviews_from_review(review: Review):
         review.raw_claimant_name = claimant[0] if claimant else None
         review.raw_claimant_url = claimant[1] if claimant else None
         review.raw_claim_date = claim_date
+
         review.raw_publisher_name = publisher_details[0] if publisher_details else None
         review.raw_publisher_url = publisher_details[1] if publisher_details else None
         review.publisher_id = publisher.id if publisher else None
+
+        # Validate claim date for publisher provereno.media because this publisher
+        # frequently submits claims with wrong claim dates. In such cases, remove
+        # the raw claim date.
+        if (review.raw_publisher_url
+                and "provereno.media" in review.raw_publisher_url
+                and review.raw_claim_date
+                and review.published):
+            if ((review.raw_claim_date > review.published) or
+                (review.published.day - review.raw_claim_date.day > 30)):
+                review.raw_claim_date = None
 
         review.author_name = author[0] if author else None
         review.author_url = author[1] if author else None

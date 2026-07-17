@@ -3,6 +3,8 @@ from collections import Counter
 from datetime import date
 from typing import Any
 
+from pydantic import ValidationError
+
 from veritas.common import Claim
 from veritas.common.annotation.rating import Category3Bin
 from veritas.db import db
@@ -45,7 +47,12 @@ async def fetch_claim_integrity_by_quarter(start: date | None, end: date | None,
 
     per_quarter: dict[tuple[int, int], Counter] = {}
     for claim in claims:
-        verdict = await claim.current_verdict
+        try:
+            verdict = await claim.current_verdict
+        except (AssertionError, ValidationError):
+            # Older verdict version that doesn't have individual ratings
+            continue
+
         label = "Unset"
         match verdict.integrity.as_3_bin():
             case Category3Bin.POSITIVE:

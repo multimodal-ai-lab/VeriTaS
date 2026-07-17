@@ -70,9 +70,10 @@ class Model:
         for attempt in range(retries):
             try:
                 response = await self._generate(prompt, response_format, **kwargs)
-                if response is not None:
-                    logger.debug(f"Response generation took {time.time() - start:.1f} seconds for {self.specifier}.")
-                    break
+                logger.debug(f"Response generation took {time.time() - start:.1f} seconds for {self.specifier}.")
+                if response is None:
+                    logger.info(f"Model {self.specifier} returned an empty response.")
+                break
             except RateLimitError:
                 msg = f"⚠️ Rate limit hit for model {self.specifier}."
                 logger.warning(msg)
