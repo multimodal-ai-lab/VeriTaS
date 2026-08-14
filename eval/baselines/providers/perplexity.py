@@ -16,6 +16,7 @@ except ImportError:
 
 from ..common.types import FactCheckResult, LabelScheme
 from ..common.media import encode_image_base64, extract_video_frames
+from ..common.search import strict_cutoff_date
 from .base import BaseFactChecker
 
 
@@ -191,13 +192,14 @@ class PerplexityFactChecker(BaseFactChecker):
         Format claim date for Perplexity's search_before_date parameter.
 
         Perplexity expects format: "%m/%d/%Y" (e.g., "3/1/2025")
+
+        The cutoff day itself is excluded (see `strict_cutoff_date`). Perplexity
+        does not document whether `search_before_date_filter` is inclusive, so
+        stepping back a day is what makes strictness independent of that answer.
         """
         try:
-            if isinstance(claim_date, str):
-                dt = datetime.fromisoformat(claim_date.replace("Z", "+00:00"))
-            else:
-                dt = claim_date
-
-            return dt.strftime("%-m/%-d/%Y")  # e.g., "2/5/2024"
-        except (ValueError, AttributeError):
+            cutoff = strict_cutoff_date(claim_date)
+        except (ValueError, AttributeError, TypeError):
             return None
+
+        return f"{cutoff.month}/{cutoff.day}/{cutoff.year}"  # e.g., "2/4/2024"

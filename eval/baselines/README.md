@@ -47,6 +47,19 @@ Use `--custom-search` for benchmarking and serious evaluation. Native provider s
 - controllable retrieval pipeline
 - optional page-content scraping for richer evidence
 
+#### Cutoff semantics
+
+The claim's own day is **excluded**, not just capped. Search APIs filter at day
+granularity with an inclusive end date, so a cutoff of the claim day itself would
+admit content published hours *after* the claim — and fact-checks of a viral claim
+often appear the same day. `strict_cutoff_date` (`common/search.py`) therefore steps
+back one day: a claim dated `2024-02-05T12:22` searches with `cd_max:2/4/2024`.
+
+The tradeoff is that genuine same-day pre-claim evidence is also dropped. The APIs
+expose no intra-day resolution, so this is the only way to guarantee no leakage, and
+losing evidence is the safe direction for a benchmark. Results produced before this
+change used an inclusive same-day cutoff and are not comparable at the boundary.
+
 ### ⚠️ Important: Temporal Data Leakage
 
 If you run OpenAI/Gemini with built-in native search (without `--custom-search`), date constraints are prompt-level only (soft constraint). For temporal integrity, prefer `--custom-search` (or Perplexity built-in filtering).

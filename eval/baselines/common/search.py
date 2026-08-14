@@ -19,7 +19,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Literal
 
 import requests
@@ -115,6 +115,31 @@ try:
 except ImportError:
     VERITAS_SERPAPI_KEY = None
 
+def strict_cutoff_date(before_date: datetime | date | str) -> date:
+    """
+    Return the latest calendar day allowed in results for a claim made on `before_date`.
+
+    Upstream search APIs filter at day granularity with an inclusive end date, so
+    passing the claim's own day would admit content published hours *after* the
+    claim - and fact-checks of a viral claim frequently land the same day. Stepping
+    back one day makes the constraint strictly "published before the claim date".
+
+    This deliberately also discards same-day evidence that predates the claim: the
+    APIs expose no intra-day resolution, so over-filtering by up to 24h is the only
+    way to guarantee no leakage, and losing evidence is the safe direction for a
+    benchmark.
+    """
+    if isinstance(before_date, str):
+        day = datetime.fromisoformat(before_date.replace("Z", "+00:00")).date()
+    elif isinstance(before_date, datetime):
+        # Must precede the `date` branch: datetime is a subclass of date.
+        day = before_date.date()
+    else:
+        day = before_date
+
+    return day - timedelta(days=1)
+
+
 @dataclass
 class SearchResult:
     """A single search result with optional full content."""
@@ -199,15 +224,11 @@ class SearchService:
         """
         Format date for Serper.dev's tbs parameter.
         Format: cdr:1,cd_max:MM/DD/YYYY
-        """
-        if isinstance(before_date, str):
-            dt = datetime.fromisoformat(before_date.replace("Z", "+00:00"))
-        elif isinstance(before_date, date) and not isinstance(before_date, datetime):
-            dt = datetime.combine(before_date, datetime.min.time())
-        else:
-            dt = before_date
 
-        return f"cdr:1,cd_max:{dt.month}/{dt.day}/{dt.year}"
+        The cutoff day itself is excluded (see `strict_cutoff_date`).
+        """
+        cutoff = strict_cutoff_date(before_date)
+        return f"cdr:1,cd_max:{cutoff.month}/{cutoff.day}/{cutoff.year}"
 
     async def _scrape_url_async(self, url: str) -> str | None:
         """Scrape a single URL using scrapeMM."""
