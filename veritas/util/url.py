@@ -66,6 +66,7 @@ async def resolve_archiving_url(url: str) -> dict | None:
 
 async def resolve_perma_cc_url(url: str) -> dict | None:
     """Resolves a Perma.cc URL to the original URL.
+    TODO: Speed this up. Instead of scraping the page, find a different way.
 
     Handles two formats:
     1. Regular perma.cc URLs: https://perma.cc/XXXX-XXXX - scrapes the page
@@ -88,14 +89,12 @@ async def resolve_perma_cc_url(url: str) -> dict | None:
             if resolved_url.startswith("http"):
                 return dict(original_url=resolved_url)
 
-        # Handle regular perma.cc URLs by scraping
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10, headers=HEADERS) as response:
-                if response.status != 200:
-                    logger.info(f"Failed to fetch Perma.cc URL: {url} (status: {response.status})")
-                    return None
+        # Handle regular perma.cc URLs by scraping via scrapeMM
+        response: ScrapingResponse = await retrieve(url, show_progress=False, format="html")
+        if not response.successful:
+            return None
 
-                html = await response.text()
+        html: str = response.content
 
         # Parse the HTML to extract the original URL
         soup = BeautifulSoup(html, "lxml")
@@ -111,6 +110,7 @@ async def resolve_perma_cc_url(url: str) -> dict | None:
         return None
 
     except Exception as e:
+        raise
         logger.info(f"Unable to resolve Perma.cc URL: {url}\n{e}")
         return None
 
@@ -241,6 +241,12 @@ async def resolve_ghostarchive_url(url: str) -> dict | None:
     return dict(original_url=original_url)
 
 
+def resolve_archiveport_url(url: str) -> dict:
+    """Resolves an ArchivePort URL to the original URL. Example:
+    https://archiveport.org/?url=https://archive.ph/20241001093811/https://romios.gr/to-vinteo-me-tin-methysmeni-i-ftiagmeni-kamala-kanei-ton-gyro-toy-diadiktyoy/"""
+    # TODO
+
+
 def is_archiving_url(url: str):
     return get_domain(url) in ARCHIVING_SITES
 
@@ -259,6 +265,7 @@ ARCHIVING_SITES = {
     "awesomescreenshot.com": None,  # TODO
     "mvau.lt": None,  # TODO
     "archive.st": None,  # TODO
+    "archiveport.org": None,  # TODO  # Meta archiving service by https://factreview.gr/, linking to captures from other archivers
     "sharethefacts.co": None,  # Not available anymore, former project by Duke Reporters' Lab
     # See also https://reporterslab.org/2016/05/12/new-share-facts-widget-helps-facts-rather-falsehoods-go-viral/
 }
@@ -280,6 +287,7 @@ ARCHIVING_SERVICE_NAMES: dict[str, str] = {
     "awesomescreenshot.com": "Awesome Screenshot",
     "mvau.lt": "MediaVault",
     "archive.st": "Archive.st",
+    "archiveport.org": "ArchivePort",
 }
 
 

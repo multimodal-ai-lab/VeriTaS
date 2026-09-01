@@ -4,6 +4,7 @@ from datetime import date, datetime
 from bs4 import BeautifulSoup
 from scrapemm import retrieve
 from scrapemm.common import ScrapingResponse
+from ezmm.common import item_registry
 
 from veritas.common import Article, Review, Prompt
 from veritas.db import db
@@ -127,14 +128,18 @@ async def process_articles(reviews: list[Review]):
                 if await validate_article(article):
                     await review.set_stage(3)
             else:
-                error_msgs = ""
                 response = url_to_response[url]
                 if response.errors:
                     error_msgs = " Errors by scraping method: "
                     error_msgs += ", ".join(f"{method}: {error}" for method, error in response.errors.items())
-                await review.dismiss(reason=f"Unable to scrape article.{error_msgs}")
+                    if "RateLimitError" in error_msgs:
+                        logger.warning(f"⚠️ Rate limit error encountered while scraping article: {error_msgs}")
+                await review.dismiss(reason=f"Unable to scrape article.")
         else:
             await review.set_stage(3)
+
+    # Free up memory
+    item_registry.cache.clear()
 
 
 async def validate_article(article: Article) -> bool:

@@ -3,7 +3,8 @@ import logging
 import traceback
 
 from ezmm import MultimodalSequence
-from pydantic import BaseModel, Field
+from ezmm.common import item_registry
+from pydantic import BaseModel, Field, ValidationError
 from scrapemm import retrieve
 from scrapemm.common import ScrapingResponse
 from scrapemm.common.exceptions import RateLimitError
@@ -73,8 +74,7 @@ async def worker(worker_id: int, queue: asyncio.Queue):
         try:
             await process_appearances_single_review(review)
         except Exception as e:
-            logger.warning(f"Worker {worker_id} failed processing appearances: {e}")
-            logger.debug(traceback.format_exc())
+            logger.debug(f"Worker {worker_id} failed processing appearances: {e}", exc_info=True)
         finally:
             queue.task_done()
 
@@ -86,6 +86,10 @@ async def process_appearances(reviews: list[Review], queue: asyncio.Queue):
     for review in reviews:
         queue.put_nowait(review)
     await queue.join()
+
+    # Free up memory
+    item_registry.cache.clear()
+
     logger.info(f"Appearance queue successfully completed.")
 
 
@@ -144,7 +148,14 @@ async def scrape_appearances(appearances: list[Appearance]):
                 response = await retrieve(url, show_progress=False, max_video_size=max_video_size)
                 if isinstance(response, ScrapingResponse):
                     app.scrape_method = response.method
-                    if response.errors:
+                    if response.successful:
+                        app.original_scraped_content = MultimodalSequence(response.content)
+                        if is_sufficient_content(app.original_scraped_content):
+                            app.original_scrape_ok = True
+                            await app.save_to_db()
+                            n_successes += 1
+                            continue  # success, no need to try archive
+                    elif response.errors:
                         error = list(response.errors.values())[0]
                         if isinstance(error, RateLimitError):
                             await app.defer(hours=24)
@@ -152,15 +163,9 @@ async def scrape_appearances(appearances: list[Appearance]):
                             # skip trying archive when rate limited
                             continue
                         last_error = str(error)
-                    else:
-                        app.original_scraped_content = MultimodalSequence(response.content)
-                        if is_sufficient_content(app.original_scraped_content):
-                            app.original_scrape_ok = True
-                            await app.save_to_db()
-                            continue  # success, no need to try archive
                         # Not sufficient -> try archive below if available
                 else:
-                    last_error = "Empty response from scraper."
+                    last_error = "scrapeMM did not return a ScrapingResponse."
 
             # Try archived URL only if original is absent or insufficient
             if app.archive_url and not app.archived_scrape_ok:
@@ -168,21 +173,22 @@ async def scrape_appearances(appearances: list[Appearance]):
                 response = await retrieve(url, show_progress=False, max_video_size=max_video_size)
                 if isinstance(response, ScrapingResponse):
                     app.scrape_method = response.method
-                    if response.errors:
+                    if response.successful:
+                        app.archived_scraped_content = MultimodalSequence(response.content)
+                        if is_sufficient_content(app.archived_scraped_content):
+                            app.archived_scrape_ok = True
+                            n_successes += 1
+                        else:
+                            last_error = "Scraped content too short."
+                    elif response.errors:
                         error = list(response.errors.values())[0]
                         if isinstance(error, RateLimitError):
                             await app.defer(hours=24)
                             await app.save_to_db()
                             continue
                         last_error = str(error)
-                    else:
-                        app.archived_scraped_content = MultimodalSequence(response.content)
-                        if is_sufficient_content(app.archived_scraped_content):
-                            app.archived_scrape_ok = True
-                        else:
-                            last_error = "Scraped content too short."
                 else:
-                    last_error = "Empty response from scraper."
+                    last_error = "scrapeMM did not return a ScrapingResponse."
 
             # Update dismissal status
             if not (app.original_scrape_ok or app.archived_scrape_ok):
@@ -191,6 +197,15 @@ async def scrape_appearances(appearances: list[Appearance]):
             elif app.dismissed:
                 # The appearance might have been dismissed once before but retrieval was successful this time
                 await app.take_back_dismissal()
+
+        except AssertionError:
+            # scrapeMM cannot download that type of URL
+            await app.dismiss("scrapeMM cannot download that type of URL")
+
+        except Exception as e:
+            logger.error(f"Error encountered when scraping appearance at {url}.", exc_info=True)
+            await app.dismiss(f"Uncaught error encountered when trying to scrape this "
+                              f"appearance. {type(e).__name__}: {e}")
 
         finally:
             await app.save_to_db()
@@ -238,6 +253,9 @@ async def extract_appearance_urls(review: Review) -> list[str]:
         extracted: ExtractedAppearances = await gpt_cheap.generate(prompt, response_format=ExtractedAppearances)
         if extracted:
             urls = list(set(extracted.appearances))
+    except ValidationError as e:
+        # Sometimes the LLM fails to format its response correctly. Just discard such instances
+        logger.debug(f"Could not extract appearances because LLM response was not formatted correctly. {e}")
     except Exception as e:
         logger.warning(f"Could not extract appearances: {e}\n{traceback.format_exc()}")
 

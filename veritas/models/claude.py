@@ -95,6 +95,7 @@ class Claude(Model):
             model=self.specifier,
             system=str(self.system_prompt),
             messages=messages,
+            cache_control=dict(type="ephemeral"),
             max_tokens=max_tokens,
             **filtered_kwargs,
         )

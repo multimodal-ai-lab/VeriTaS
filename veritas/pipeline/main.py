@@ -22,7 +22,7 @@ def configure_third_party_logging() -> None:
     """
     quiet_critical = (
         "httpx", "httpcore", "urllib3", "hlsnative", "websockets",
-        "yt_dlp", "youtube_dl", "asyncio", "filelock",
+        "yt_dlp", "youtube_dl", "asyncio", "filelock", "seleniumbase",
     )
     quiet_error = (
         "scrapeMM", "ezMM", "firecrawl", "tweepy", "telethon", "aiohttp",
@@ -89,7 +89,7 @@ async def run_pipeline(
                     elif p.exitcode == 0:
                         status = "🏁"
                     else:
-                        status = "❌"
+                        status = f"❌(e:{p.exitcode}) "
                     parts.append(f"{status}S{i}")
                     parts.append(str(summary.get(i, 0)))
 

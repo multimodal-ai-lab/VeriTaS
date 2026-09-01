@@ -175,8 +175,6 @@ def is_sufficient_content(content: MultimodalSequence | None) -> bool:
     app_str = str(content).lower()
     if len(app_str) < 100 and not content.has_images() and not content.has_videos():
         return False
-    if "no longer available" in app_str or "error 404" in app_str or "currently unavailable" in app_str:
-        return False
-    if "something went wrong" in app_str or "dns error" in app_str:
+    if "error 404" in app_str or "dns error" in app_str:
         return False
     return True

@@ -1,3 +1,4 @@
+import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -67,6 +68,9 @@ async def identify_publishers(reviews: list[Review]):
             if (publisher.ifcn_status not in [SignatoryStatus.ACTIVE, SignatoryStatus.IN_RENEWAL] and
                     publisher.efcsn_status not in [SignatoryStatus.ACTIVE, SignatoryStatus.IN_RENEWAL]):
                 await review.dismiss("Publisher is not an IFCN or EFCSN signatory.")
+
+        if review.published and review.published < datetime.datetime(2020, 1, 1):
+            await review.dismiss("Review published before 2020-01-01.")
 
         await review.set_stage(2)
 
