@@ -125,7 +125,7 @@ async def _fetch_successful_appearances_per_claim_distribution() -> list[tuple[s
     """Distribution of number of successfully scraped appearances per claim.
 
     Success definition (consistent with appearance stats):
-    - scraped_content IS NOT NULL AND dismissed = FALSE
+    - (original_scrape_ok OR archived_scrape_ok) AND dismissed = FALSE
 
     Buckets: 0..9, 10+
     """
@@ -136,7 +136,7 @@ async def _fetch_successful_appearances_per_claim_distribution() -> list[tuple[s
             LEFT JOIN LATERAL unnest(c.appearance_ids) AS aid(aid) ON TRUE
             LEFT JOIN appearances a
               ON a.id = aid
-             AND a.scraped_content IS NOT NULL
+             AND (COALESCE(a.original_scrape_ok, FALSE) OR COALESCE(a.archived_scrape_ok, FALSE))
              AND COALESCE(a.dismissed, FALSE) = FALSE
             GROUP BY c.id
             """

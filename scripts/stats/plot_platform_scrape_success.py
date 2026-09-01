@@ -36,9 +36,9 @@ async def fetch_platform_scrape_status(
     whose published date falls within [start, end).
 
     Status definitions (matching Appearance.scrape_ok):
-    - Success: original_scrape_ok OR archived_scrape_ok
-    - Failed:  dismissed = TRUE AND scrape_ok = FALSE
-    - Queued:  dismissed = FALSE AND scrape_ok = FALSE
+    - Success: (original_scrape_ok OR archived_scrape_ok) AND dismissed = FALSE
+    - Failed:  (NOT original_scrape_ok AND NOT archived_scrape_ok) AND dismissed = TRUE
+    - Queued:  (NOT original_scrape_ok AND NOT archived_scrape_ok) AND dismissed = FALSE
     """
     await db.connect_maybe_initialize()
 
@@ -54,8 +54,7 @@ async def fetch_platform_scrape_status(
     query = f"""
         SELECT DISTINCT ON (a.id)
                a.url,
-               COALESCE(a.original_scrape_ok, FALSE) AS original_scrape_ok,
-               COALESCE(a.archived_scrape_ok, FALSE)  AS archived_scrape_ok,
+               (COALESCE(a.original_scrape_ok, FALSE) OR COALESCE(a.archived_scrape_ok, FALSE)) AS has_scrape,
                COALESCE(a.dismissed, FALSE)            AS is_dismissed
         FROM appearances a
         JOIN reviews r ON a.id = ANY(r.appearance_ids)
@@ -74,12 +73,12 @@ async def fetch_platform_scrape_status(
         label = _normalize_platform_or_domain(domain)
         platform = label if label in known_platforms else "Other"
 
-        scrape_ok = bool(r["original_scrape_ok"]) or bool(r["archived_scrape_ok"])
+        has_scrape = bool(r["has_scrape"])
         is_dismissed = bool(r["is_dismissed"])
 
-        if scrape_ok:
+        if has_scrape and not is_dismissed:
             per_platform[platform]["Success"] += 1
-        elif is_dismissed:
+        elif (not has_scrape) and is_dismissed:
             per_platform[platform]["Failed"] += 1
         else:
             per_platform[platform]["Queued"] += 1

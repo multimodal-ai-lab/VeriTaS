@@ -213,8 +213,8 @@ def build_in_memory_objects(pipeline_data: dict, temp_dir: Path) -> dict[int, In
             url=article_data['url'],
             publisher_id=metadata['publisher_id'] or 0,  # Default to 0 if missing
             review_ids=metadata['review_ids'],
-            scraped_page=article_data.get('scraped_content'),
-            extracted_article=article_data.get('extracted_content'),
+            scraped_page=article_data.get('scraped_page') or article_data.get('scraped_content'),
+            extracted_article=article_data.get('extracted_content') or article_data.get('extracted_article'),
             title=article_data.get('headline') or article_data.get('title'),
         )
         articles_by_url[url] = article
@@ -238,10 +238,14 @@ def build_in_memory_objects(pipeline_data: dict, temp_dir: Path) -> dict[int, In
 
     appearances_by_id = {}
     for appearance_data in pipeline_data.get('appearances', []):
-        # Convert scraped_content to MultimodalSequence if it's a string
-        scraped_content = appearance_data.get('scraped_content')
-        if scraped_content and isinstance(scraped_content, str):
-            scraped_content = MultimodalSequence(scraped_content)
+        # Handle backward compatibility for scraped_content vs original/archived
+        original_content = appearance_data.get('original_scraped_content') or appearance_data.get('scraped_content')
+        archived_content = appearance_data.get('archived_scraped_content')
+
+        if original_content and isinstance(original_content, str):
+            original_content = MultimodalSequence(original_content)
+        if archived_content and isinstance(archived_content, str):
+            archived_content = MultimodalSequence(archived_content)
 
         appearance = Appearance(
             id=appearance_data['id'],
@@ -250,7 +254,10 @@ def build_in_memory_objects(pipeline_data: dict, temp_dir: Path) -> dict[int, In
             published=parse_date(appearance_data.get('published')),
             author_name=appearance_data.get('author_name'),
             author_url=appearance_data.get('author_url'),
-            scraped_content=scraped_content,
+            original_scraped_content=original_content,
+            archived_scraped_content=archived_content,
+            original_scrape_ok=appearance_data.get('original_scrape_ok', False),
+            archived_scrape_ok=appearance_data.get('archived_scrape_ok', False),
             platform=appearance_data.get('platform'),
         )
         appearances_by_id[appearance.id] = appearance

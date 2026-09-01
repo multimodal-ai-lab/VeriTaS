@@ -88,15 +88,15 @@ async def _fetch_scrape_method_success_fail() -> dict[str, dict[str, int]]:
     """Return per-scrape_method counts split into success vs fail.
 
     Definitions:
-    - success: scraped_content IS NOT NULL AND dismissed = FALSE
-    - fail: scraped_content IS NULL AND dismissed = TRUE
+    - success: (original_scrape_ok OR archived_scrape_ok) AND dismissed = FALSE
+    - fail: (NOT original_scrape_ok AND NOT archived_scrape_ok) AND dismissed = TRUE
     Queued (no scrape and not dismissed) is excluded from this chart.
     Unknown/blank scrape_method rows are excluded.
     """
     await db.connect_maybe_initialize()
     query = """
             SELECT scrape_method,
-                   (scraped_content IS NOT NULL) AS has_scrape,
+                   (COALESCE(original_scrape_ok, FALSE) OR COALESCE(archived_scrape_ok, FALSE)) AS has_scrape,
                    COALESCE(dismissed, FALSE)  AS is_dismissed
             FROM appearances
             WHERE scrape_method IS NOT NULL AND TRIM(scrape_method) <> ''
@@ -159,14 +159,14 @@ async def _fetch_appearance_domain_counts() -> Counter:
 async def _fetch_status_counts() -> dict[str, int]:
     """Return counts for success/failed/queued appearances.
 
-    - success: scraped_content IS NOT NULL AND dismissed = FALSE
-    - failed: scraped_content IS NULL AND dismissed = TRUE
-    - queued: scraped_content IS NULL AND dismissed = FALSE
+    - success: (original_scrape_ok OR archived_scrape_ok) AND dismissed = FALSE
+    - failed: (NOT original_scrape_ok AND NOT archived_scrape_ok) AND dismissed = TRUE
+    - queued: (NOT original_scrape_ok AND NOT archived_scrape_ok) AND dismissed = FALSE
     Other combinations (rare) are folded into the closest category logically.
     """
     await db.connect_maybe_initialize()
     query = """
-            SELECT scraped_content IS NOT NULL AS has_scrape,
+            SELECT (COALESCE(original_scrape_ok, FALSE) OR COALESCE(archived_scrape_ok, FALSE)) AS has_scrape,
                    COALESCE(dismissed, FALSE) AS is_dismissed
             FROM appearances
             """

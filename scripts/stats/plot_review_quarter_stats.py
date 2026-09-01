@@ -67,7 +67,7 @@ if __name__ == "__main__":
     asyncio.run(
         main_async(
             start="2016-01-01",
-            end="2026-03-31",
+            end="2026-06-30",
             top_languages=8,
             top_publishers=15,
             save="plots/",

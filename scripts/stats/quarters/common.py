@@ -101,6 +101,7 @@ async def fetch_review_rows(start: date | None, end: date | None) -> list[Row]:
                 publisher_name=r["publisher_name"],
                 ifcn_status=r["ifcn_status"],
                 efcsn_status=r["efcsn_status"],
+                dismissed=bool(r["dismissed"]) if r["dismissed"] is not None else False,
             )
         )
     return out

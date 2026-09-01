@@ -913,9 +913,9 @@ if __name__ == "__main__":
         export_benchmark(
             resample=True,
             start_year=2026,
-            start_quarter=1,
+            start_quarter=2,
             end_year=2026,
-            end_quarter=1,
+            end_quarter=2,
             output_dir="exports/",
             target_count=1000,
         )
