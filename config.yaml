@@ -45,10 +45,72 @@ pipeline:
     max_extracted_article_length: 40_000  # characters of extracted article content
     max_appearances_per_claim: 2  # Successfully scraped appearances used for claim normalization
     max_media_per_claim: 4
-    max_video_size: 128_000_000
+    max_video_size: 128_000_000  # Bytes
     max_video_duration: 300  # Seconds
     n_frames_per_video: 5
     sufficient_agreements_threshold: 1  # Maximum allowed difference between any two predictor ratings
+
+# Gold Evidence Reconstruction & Temporal Analysis (veritas/gold_evidence).
+# Runs separately from the 7-stage benchmark pipeline above.
+gold_evidence:
+  # Models. "auto" -> gemini_strong for articles with videos, gpt_strong otherwise
+  # (extraction); gpt_strong (filtering); gpt_nano (dating).
+  extraction_model: "auto"
+  filtering_model: "auto"
+  dating_model: "auto"
+
+  # Sufficiency ensemble. Null -> use the global VeriTaS ensemble singleton.
+  # Members should come from different model families.
+  ensemble_models:
+  #  - "openai:gpt-5"
+  #  - "anthropic:claude-sonnet-4-5-20250929"
+  #  - "gemini:gemini-2.5-pro"
+  #  - "selfhosted:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+
+  # 'integrity' -> one ensemble call per claim and condition (default).
+  # 'full'      -> the whole stage-6 property cascade, 4-6x the calls.
+  ensemble_mode: "integrity"
+  min_ensemble_ratings: 3
+
+  # Reasoning effort, scaled with task complexity. Null omits the parameter.
+  reasoning_effort_extraction: "medium"
+  reasoning_effort_dating:
+  reasoning_effort_faithfulness: "low"
+  reasoning_effort_temporal: "medium"
+  reasoning_effort_sufficiency: "high"
+
+  # Thresholds
+  proximity_threshold: 0.3      # Max. allowed distance to the gold verdict
+  faithfulness_threshold: 0.334 # 1/3 = "entailed (rather uncertain)"
+  min_extraction_confidence: 0.0
+
+  # How to treat evidence whose source has no determinable publication time:
+  # 'tool_only' (default) | 'permissive' | 'strict'
+  undated_policy: "tool_only"
+
+  # Budgets
+  max_evidence_per_claim: 20
+  max_reviews_per_claim: 2
+  max_source_content_length: 30_000
+  max_article_length: 50_000
+  concurrency: 20
+  max_video_size:  # Null -> inherit pipeline.global.max_video_size
+
+  # Reconstruction run (scripts/gold_evidence/run_reconstruction.py). The script
+  # has no CLI - edit these keys to change what a run processes.
+  reconstruction:
+    start:  # [ YEAR, QUARTER ], e.g. [ 2024, 1 ]. Null -> no lower bound
+    end:  # [ YEAR, QUARTER ]. Null -> no upper bound (inclusive)
+    limit: 100  # Maximum number of claims to process
+    batch_size: 25  # Claims fetched and processed per batch
+    claim_ids:  # e.g. [ 1234, 5678 ]. Processes exactly these, ignoring the date range
+    include_unreleased: False  # Do not prioritize released claims
+    redo: False  # Process claims regardless of their current status
+    re_extract: False  # Re-run Stage 1 even if evidence is already stored
+    re_filter: False  # Re-run Stage 2 for evidence that was already filtered
+    skip_sufficiency: False  # Run Stages 1-2 only (useful to pre-fill the evidence table)
+    dry_run: False  # Only report which claims would be processed
+    log_level: "INFO"
 
 api_secrets:
   openai:

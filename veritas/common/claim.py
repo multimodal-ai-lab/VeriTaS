@@ -48,6 +48,13 @@ class Claim(Dismissable, VeritasBaseModel):
     released_longitudinal: bool = False  # Whether this claim was released in the longitudinal split
     text_embedding: list[float] | None = None  # The OpenAI text-embedding-3-large embedding vector of the claim
 
+    # Gold Evidence Reconstruction (see veritas.gold_evidence). Written exclusively
+    # by that pipeline; `dismissed` deliberately stays untouched, so a rejected
+    # instance remains a valid VeriTaS claim.
+    gold_evidence_status: str | None = None  # pending|extracted|filtered|accepted|rejected
+    gold_evidence_reason: str | None = None  # Why the instance was rejected, if it was
+    gold_evidence_updated_at: datetime | None = None
+
     @property
     def released(self) -> bool:
         """Returns True if the claim was released in any split."""
@@ -105,6 +112,20 @@ class Claim(Dismissable, VeritasBaseModel):
             return list(claimants)
         else:
             return []
+
+    @property
+    def gold_evidence_rejected(self) -> bool:
+        """True if the Gold Evidence Reconstruction could not recover the gold verdict."""
+        from veritas.gold_evidence import STATUS_REJECTED
+
+        return self.gold_evidence_status == STATUS_REJECTED
+
+    @property
+    async def evidence(self) -> list["Evidence"]:
+        """The reconstructed gold evidence of this claim."""
+        from veritas.db import db
+
+        return await db.get_evidence_for_claim(self.id)
 
     @property
     async def variant(self) -> Optional["Claim"]:

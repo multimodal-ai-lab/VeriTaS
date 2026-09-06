@@ -198,6 +198,19 @@ class VeritasDB(Database):
             """
         )
 
+        # Gold Evidence Reconstruction: additive-only claim columns.
+        # These are written exclusively by `veritas.gold_evidence`; existing claim
+        # data (incl. `dismissed`) is never touched by that pipeline.
+        await self._execute(
+            """
+            ALTER TABLE claims ADD COLUMN IF NOT EXISTS gold_evidence_status     TEXT;
+            ALTER TABLE claims ADD COLUMN IF NOT EXISTS gold_evidence_reason     TEXT;
+            ALTER TABLE claims ADD COLUMN IF NOT EXISTS gold_evidence_updated_at TIMESTAMP;
+            CREATE INDEX IF NOT EXISTS claims_gold_evidence_status_idx
+                ON claims (gold_evidence_status);
+            """
+        )
+
         # Media embeddings
         await self._execute(
             """
@@ -249,6 +262,86 @@ class VeritasDB(Database):
             -- GIN index for JSONB media column (supports media verdict filtering)
             CREATE INDEX IF NOT EXISTS verdicts_media_gin_idx
                 ON verdicts USING GIN (media) WHERE is_current = TRUE;
+            """
+        )
+
+        # Reconstructed gold evidence
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS evidence
+            (
+                id                      SERIAL PRIMARY KEY,
+                claim_id                INT     NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                review_id               INT,
+                article_id              INT,
+                proposition             TEXT    NOT NULL,
+                proposition_hash        INTEGER NOT NULL,
+                source_name             TEXT,
+                source_kind             TEXT,
+                source_locator          TEXT    NOT NULL,
+                source_locator_hash     INTEGER NOT NULL,
+                source_proximity        TEXT,
+                source_raw_content      TEXT,
+                available_since         TIMESTAMP,
+                role                    TEXT,
+                accessed_at             TIMESTAMP,
+                extraction_reasoning    TEXT,
+                extraction_confidence   FLOAT,
+                accessible              BOOLEAN,
+                faithfulness_assessment FLOAT,
+                faithfulness_reasoning  TEXT,
+                faithfulness_justification TEXT,
+                before_fact_check       BOOLEAN,
+                before_claim            BOOLEAN,
+                professional_fact_check BOOLEAN,
+                concurrent_fact_check   BOOLEAN,
+                later_event             BOOLEAN,
+                temporal_reasoning      TEXT,
+                temporal_justification  TEXT,
+                admissible              BOOLEAN,
+                inadmissibility_reason  TEXT,
+                dismissed               BOOLEAN   DEFAULT FALSE,
+                dismissed_reason        TEXT      DEFAULT NULL,
+                full_evidence           JSONB,
+                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_evidence
+                    UNIQUE (claim_id, source_locator_hash, proposition_hash)
+            );
+            CREATE INDEX IF NOT EXISTS evidence_claim_id_idx
+                ON evidence (claim_id);
+            CREATE INDEX IF NOT EXISTS evidence_admissible_idx
+                ON evidence (claim_id, admissible);
+            CREATE INDEX IF NOT EXISTS evidence_available_since_idx
+                ON evidence (available_since);
+            """
+        )
+
+        # Per-claim, per-condition outcome of the sufficiency validator
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS gold_evidence_results
+            (
+                id                SERIAL PRIMARY KEY,
+                claim_id          INT  NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                condition         TEXT NOT NULL,
+                ensemble_mode     TEXT NOT NULL,
+                n_evidence        INT       DEFAULT 0,
+                predicted_verdict JSONB,
+                member_responses  JSONB,
+                property_diffs    JSONB,
+                max_property_diff FLOAT,
+                is_close          BOOLEAN,
+                threshold         FLOAT,
+                model_specifiers  TEXT[],
+                error             TEXT,
+                created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_gold_evidence_result
+                    UNIQUE (claim_id, condition, ensemble_mode)
+            );
+            CREATE INDEX IF NOT EXISTS gold_evidence_results_claim_idx
+                ON gold_evidence_results (claim_id);
             """
         )
 
@@ -589,13 +682,16 @@ class VeritasDB(Database):
                                     is_ambiguous, is_inconsistent, is_unshareable,
                                     media_expose_verdict, text_exposes_verdict, missing_referenced_media,
                                     check_completed, media_origin,
-                                    is_rectified, variant_id, text_embedding)
+                                    is_rectified, variant_id, text_embedding,
+                                    gold_evidence_status, gold_evidence_reason,
+                                    gold_evidence_updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6,
                         $7, $8, $9,
                         $10, $11, $12,
                         $13, $14, $15,
                         $16, $17,
-                        $18, $19, $20)
+                        $18, $19, $20,
+                        $21, $22, $23)
                 RETURNING id;
                 """
         identifier = await self._fetchval(
@@ -619,7 +715,10 @@ class VeritasDB(Database):
             claim.media_origin,
             claim.is_rectified,
             claim.variant_id,
-            claim.text_embedding
+            claim.text_embedding,
+            claim.gold_evidence_status,
+            claim.gold_evidence_reason,
+            claim.gold_evidence_updated_at,
         )
         return identifier
 
@@ -658,8 +757,11 @@ class VeritasDB(Database):
                     is_rectified             = $18,
                     variant_id               = $19,
                     text_embedding           = $20,
+                    gold_evidence_status     = $21,
+                    gold_evidence_reason     = $22,
+                    gold_evidence_updated_at = $23,
                     updated_at               = CURRENT_TIMESTAMP
-                WHERE id = $21;
+                WHERE id = $24;
                 """
         await self._execute(
             query,
@@ -683,6 +785,9 @@ class VeritasDB(Database):
             claim.is_rectified,
             claim.variant_id,
             claim.text_embedding,
+            claim.gold_evidence_status,
+            claim.gold_evidence_reason,
+            claim.gold_evidence_updated_at,
             claim.id
         )
 
@@ -762,9 +867,198 @@ class VeritasDB(Database):
         query = "UPDATE verdicts SET integrity = $1 WHERE id = $2"
         await self._execute(query, integrity_score, verdict_id)
 
+    # ------------------------------------------------------------------
+    # Gold Evidence Reconstruction
+    # ------------------------------------------------------------------
+
+    async def insert_evidence(self, evidence: "Evidence") -> int:
+        """Adds a reconstructed evidence item to the database and returns its ID.
+        If an identical item (same claim, locator and proposition) already exists,
+        that row is updated instead and its ID returned."""
+        columns, values = _evidence_columns(evidence)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns
+                            if c not in ("claim_id", "proposition", "proposition_hash",
+                                         "source_locator", "source_locator_hash"))
+        query = f"""
+                INSERT INTO evidence ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT ON CONSTRAINT unique_evidence DO UPDATE
+                    SET {updates}, updated_at = CURRENT_TIMESTAMP
+                RETURNING id;
+                """
+        return await self._fetchval(query, *values)
+
+    async def update_evidence(self, evidence: "Evidence") -> None:
+        """Updates an existing evidence item."""
+        assert evidence.id is not None, "Evidence must have an ID."
+        columns, values = _evidence_columns(evidence)
+        assignments = ", ".join(f"{c} = ${i + 1}" for i, c in enumerate(columns))
+        query = (f"UPDATE evidence SET {assignments}, updated_at = CURRENT_TIMESTAMP "
+                 f"WHERE id = ${len(values) + 1};")
+        await self._execute(query, *values, evidence.id)
+
+    async def get_evidence_by_id(self, evidence_id: int) -> "Evidence | None":
+        row = await self._fetchrow("SELECT id, full_evidence FROM evidence WHERE id = $1", evidence_id)
+        if row:
+            return row_to_evidence(row)
+
+    async def get_evidence_for_claim(self, claim_id: int,
+                                     admissible_only: bool = False) -> list["Evidence"]:
+        """Returns all reconstructed evidence items of a claim, oldest ID first."""
+        query = "SELECT id, full_evidence FROM evidence WHERE claim_id = $1"
+        if admissible_only:
+            query += " AND admissible IS TRUE"
+        query += " ORDER BY id;"
+        rows = await self._fetch(query, claim_id)
+        return [row_to_evidence(row) for row in rows]
+
+    async def get_evidence_for_claims(self, claim_ids: list[int]) -> dict[int, list["Evidence"]]:
+        """Bulk variant of `get_evidence_for_claim` for the analysis scripts."""
+        if not claim_ids:
+            return {}
+        rows = await self._fetch(
+            "SELECT id, claim_id, full_evidence FROM evidence WHERE claim_id = ANY($1) ORDER BY id;",
+            claim_ids,
+        )
+        result: dict[int, list] = {claim_id: [] for claim_id in claim_ids}
+        for row in rows:
+            result[row["claim_id"]].append(row_to_evidence(row))
+        return result
+
+    async def count_evidence_for_claim(self, claim_id: int) -> int:
+        return await self._fetchval("SELECT COUNT(*) FROM evidence WHERE claim_id = $1", claim_id)
+
+    async def set_gold_evidence_status(self, claim_id: int, status: str,
+                                       reason: str | None = None) -> None:
+        """Records the Gold Evidence Reconstruction outcome on the claim.
+
+        Touches only the three additive `gold_evidence_*` columns. In particular,
+        `dismissed` is deliberately left untouched: a rejected instance stays a
+        valid VeriTaS claim."""
+        query = """
+                UPDATE claims
+                SET gold_evidence_status     = $1,
+                    gold_evidence_reason     = $2,
+                    gold_evidence_updated_at = CURRENT_TIMESTAMP
+                WHERE id = $3;
+                """
+        await self._execute(query, status, reason, claim_id)
+
+    async def save_gold_evidence_result(self, result: dict) -> int:
+        """Upserts the outcome of the sufficiency validator for one
+        (claim, condition, ensemble_mode) triple."""
+        query = """
+                INSERT INTO gold_evidence_results (claim_id, condition, ensemble_mode, n_evidence,
+                                                   predicted_verdict, member_responses, property_diffs,
+                                                   max_property_diff, is_close, threshold,
+                                                   model_specifiers, error)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT ON CONSTRAINT unique_gold_evidence_result DO UPDATE
+                    SET n_evidence        = EXCLUDED.n_evidence,
+                        predicted_verdict = EXCLUDED.predicted_verdict,
+                        member_responses  = EXCLUDED.member_responses,
+                        property_diffs    = EXCLUDED.property_diffs,
+                        max_property_diff = EXCLUDED.max_property_diff,
+                        is_close          = EXCLUDED.is_close,
+                        threshold         = EXCLUDED.threshold,
+                        model_specifiers  = EXCLUDED.model_specifiers,
+                        error             = EXCLUDED.error,
+                        updated_at        = CURRENT_TIMESTAMP
+                RETURNING id;
+                """
+        return await self._fetchval(
+            query,
+            result["claim_id"],
+            result["condition"],
+            result["ensemble_mode"],
+            result.get("n_evidence", 0),
+            to_jsonb(result.get("predicted_verdict")),
+            to_jsonb(result.get("member_responses")),
+            to_jsonb(result.get("property_diffs")),
+            result.get("max_property_diff"),
+            result.get("is_close"),
+            result.get("threshold"),
+            result.get("model_specifiers"),
+            result.get("error"),
+        )
+
+    async def get_gold_evidence_results(self, claim_id: int,
+                                        ensemble_mode: str | None = None) -> list[dict]:
+        query = "SELECT * FROM gold_evidence_results WHERE claim_id = $1"
+        args = [claim_id]
+        if ensemble_mode:
+            query += " AND ensemble_mode = $2"
+            args.append(ensemble_mode)
+        rows = await self._fetch(query + ";", *args)
+        return [dict(row) for row in rows]
+
+    async def get_all_gold_evidence_results(self, ensemble_mode: str | None = None) -> list[dict]:
+        if ensemble_mode:
+            rows = await self._fetch(
+                "SELECT * FROM gold_evidence_results WHERE ensemble_mode = $1 ORDER BY claim_id;",
+                ensemble_mode)
+        else:
+            rows = await self._fetch("SELECT * FROM gold_evidence_results ORDER BY claim_id;")
+        return [dict(row) for row in rows]
+
+    async def get_claims_for_gold_evidence(
+            self,
+            limit: int | None = None,
+            start_date: date | datetime | None = None,
+            end_date: date | datetime | None = None,
+            statuses: list[str] | None = None,
+            released_first: bool = True,
+            claim_ids: list[int] | None = None,
+    ) -> list[Claim]:
+        """Returns candidate claims for the Gold Evidence Reconstruction.
+
+        A candidate is a non-dismissed claim with a current verdict whose reviews
+        completed at least stage 6 (7 for rectified claims), i.e. the gold verdict
+        is final. Released claims are processed first; if none are left, the
+        remaining verdict-complete claims follow.
+
+        `statuses` filters on `gold_evidence_status`; pass `[None]`-like values via
+        the string 'unprocessed' to select claims that were never processed.
+        """
+        if isinstance(start_date, date) and not isinstance(start_date, datetime):
+            start_date = datetime.combine(start_date, datetime.min.time())
+        if isinstance(end_date, date) and not isinstance(end_date, datetime):
+            end_date = datetime.combine(end_date, datetime.max.time())
+
+        wants_unprocessed = bool(statuses) and "unprocessed" in statuses
+        concrete_statuses = [s for s in (statuses or []) if s != "unprocessed"] or None
+
+        order = ("(c.released_quarter OR c.released_longitudinal) DESC, c.id"
+                 if released_first else "c.id")
+
+        query = f"""
+                SELECT DISTINCT c.*
+                FROM claims c
+                         JOIN verdicts v ON v.claim_id = c.id AND v.is_current
+                         JOIN reviews r ON r.id = ANY (c.review_ids)
+                WHERE c.dismissed = FALSE
+                  AND r.dismissed = FALSE
+                  AND r.stage >= CASE WHEN c.is_rectified THEN 7 ELSE 6 END
+                  AND ($2::timestamp IS NULL OR c.date >= $2)
+                  AND ($3::timestamp IS NULL OR c.date <= $3)
+                  AND ($4::text[] IS NULL OR c.gold_evidence_status = ANY ($4)
+                       OR ($5::bool AND c.gold_evidence_status IS NULL))
+                  AND ($6::int[] IS NULL OR c.id = ANY ($6))
+                ORDER BY {order}
+                LIMIT $1;
+                """
+        rows = await self._fetch(query, limit, start_date, end_date,
+                                 concrete_statuses, wants_unprocessed, claim_ids)
+        return [Claim.model_validate(dict(row)) for row in rows]
+
     async def insert(self, instance: VeritasBaseModel) -> int:
         """Inserts any (compatible) object into the database and returns the assigned ID."""
+        from veritas.gold_evidence.models import Evidence
+
         match instance:
+            case Evidence():
+                return await self.insert_evidence(instance)
             case Review():
                 return await self.insert_review(instance)
             case Publisher():
@@ -782,8 +1076,12 @@ class VeritasDB(Database):
 
     async def update(self, instance: VeritasBaseModel):
         """Updates any (compatible) object into the database."""
+        from veritas.gold_evidence.models import Evidence
+
         assert instance.id is not None, "Object must have an ID."
         match instance:
+            case Evidence():
+                return await self.update_evidence(instance)
             case Review():
                 return await self.update_review(instance)
             case Publisher():
@@ -800,6 +1098,10 @@ class VeritasDB(Database):
                 raise ValueError(f"Unsupported object type: {type(instance)}")
 
     async def get(self, cls, id: int) -> VeritasBaseModel | None:
+        from veritas.gold_evidence.models import Evidence
+
+        if cls is Evidence:
+            return await self.get_evidence_by_id(id)
         if cls is Review:
             return await self.get_review_by_id(id)
         elif cls is Publisher:
@@ -1353,3 +1655,60 @@ def row_to_verdict(row) -> Verdict:
     if "id" in row:
         verdict.id = row["id"]
     return verdict
+
+
+def row_to_evidence(row):
+    """Reconstructs an Evidence object from its JSONB round-trip blob."""
+    from veritas.gold_evidence.models import Evidence
+
+    row = dict(row)
+    evidence = Evidence.model_validate(row["full_evidence"])
+    if row.get("id") is not None:
+        evidence.id = row["id"]
+    return evidence
+
+
+def _evidence_columns(evidence) -> tuple[list[str], list]:
+    """Flattens an Evidence object into (column names, values) for SQL.
+
+    The flat columns exist for querying/aggregation; `full_evidence` is the
+    authoritative round-trip representation (same pattern as `verdicts`)."""
+    faithfulness = evidence.faithfulness
+    temporal = evidence.temporal_validation
+    data = {
+        "claim_id": evidence.claim_id,
+        "review_id": evidence.review_id,
+        "article_id": evidence.article_id,
+        "proposition": evidence.proposition,
+        "proposition_hash": hash_int32(evidence.proposition),
+        "source_name": evidence.source.name,
+        "source_kind": evidence.source.kind.value,
+        "source_locator": evidence.source.locator,
+        "source_locator_hash": hash_int32(evidence.source.locator),
+        "source_proximity": evidence.source.proximity.value,
+        "source_raw_content": evidence.source.raw_content,
+        "available_since": evidence.available_since,
+        "role": evidence.role.value,
+        "accessed_at": evidence.accessed_at,
+        "extraction_reasoning": evidence.extraction_reasoning,
+        "extraction_confidence": evidence.extraction_confidence,
+        "accessible": evidence.accessible,
+        "faithfulness_assessment": faithfulness.assessment if faithfulness else None,
+        # `reasoning` is the provider's reasoning trace, `justification` the
+        # short reason the model was asked to state.
+        "faithfulness_reasoning": faithfulness.reasoning if faithfulness else None,
+        "faithfulness_justification": faithfulness.justification if faithfulness else None,
+        "before_fact_check": temporal.before_fact_check if temporal else None,
+        "before_claim": temporal.before_claim if temporal else None,
+        "professional_fact_check": temporal.professional_fact_check if temporal else None,
+        "concurrent_fact_check": temporal.concurrent_fact_check if temporal else None,
+        "later_event": temporal.later_event if temporal else None,
+        "temporal_reasoning": temporal.reasoning if temporal else None,
+        "temporal_justification": temporal.justification if temporal else None,
+        "admissible": evidence.admissible,
+        "inadmissibility_reason": evidence.inadmissibility_reason,
+        "dismissed": evidence.dismissed,
+        "dismissed_reason": evidence.dismissed_reason,
+        "full_evidence": to_jsonb(evidence),
+    }
+    return list(data.keys()), list(data.values())

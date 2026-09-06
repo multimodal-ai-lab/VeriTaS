@@ -14,7 +14,7 @@ from ezmm import Image, Video
 
 from veritas import api_secrets
 from veritas.models.gpt import gpt_transcribe
-from veritas.models.base import Model
+from veritas.models.base import Generation, Model, THINKING_BUDGETS
 from veritas.common.prompt import Prompt
 
 logging.getLogger("anthropic").setLevel(logging.WARNING)
@@ -85,10 +85,21 @@ class Claude(Model):
     async def _generate(
             self, prompt: Prompt | str,
             response_format: Any | None = None,
+            reasoning_effort: str | None = None,
             max_tokens: int = 2048,
             **kwargs
-    ) -> str | Any:
+    ) -> Generation | None:
         messages = await to_anthropic_payload(prompt)
+
+        # Anthropic has no `reasoning_effort` parameter; it takes an explicit
+        # thinking budget instead. Without this mapping, passing the parameter
+        # (as the ensemble does) would drop Claude out of every call.
+        if reasoning_effort:
+            budget = THINKING_BUDGETS.get(reasoning_effort.lower())
+            if budget:
+                kwargs["thinking"] = dict(type="enabled", budget_tokens=budget)
+                # `max_tokens` must exceed the thinking budget.
+                max_tokens = max(max_tokens, budget + 1024)
 
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         completion = await self.client.messages.create(
@@ -100,8 +111,22 @@ class Claude(Model):
             **filtered_kwargs,
         )
         if isinstance(completion, Message):
-            return "".join(part.text for part in completion.content
-                           if isinstance(part, TextBlock))
+            content = "".join(part.text for part in completion.content
+                              if isinstance(part, TextBlock))
+            return Generation(content=content,
+                              reasoning=self._extract_reasoning(completion))
+
+    @staticmethod
+    def _extract_reasoning(completion: Message) -> str | None:
+        """Returns the model's reasoning from Anthropic's dedicated thinking
+        blocks - never parsed out of the answer text.
+
+        Only present when extended thinking was requested (see `reasoning_effort`).
+        Redacted thinking blocks carry no readable text and are skipped."""
+        parts = [block.thinking for block in completion.content
+                 if getattr(block, "type", None) == "thinking"
+                 and getattr(block, "thinking", None)]
+        return "\n\n".join(parts) or None
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
 from typing import Type
@@ -18,6 +19,37 @@ logger = logging.getLogger("VeriTaS")
 FAMILIES = ["gpt", "claude", "llama", "gemini"]
 
 
+# Extended thinking budgets (in tokens) per reasoning effort level.
+THINKING_BUDGETS = {
+    "none": 0,
+    "low": 1024,
+    "medium": 4096,
+    "high": 16384,
+    "max": 65536,
+}
+
+
+@dataclass
+class Generation:
+    """One model response.
+
+    - `content`: the answer, i.e. the text or the parsed object.
+    - `reasoning`: the model's own reasoning trace, taken from the dedicated field
+      the provider's API returns it in (OpenAI reasoning items, Anthropic thinking
+      blocks, Gemini thought parts) - *not* parsed out of the answer text.
+      None when the model or the request produced no reasoning.
+    """
+
+    content: str | Any | None = None
+    reasoning: str | None = None
+
+
+def as_generation(value: "Generation | str | Any | None") -> Generation:
+    """Normalizes whatever `_generate` returned into a `Generation`, so providers
+    that do not expose reasoning keep working unchanged."""
+    return value if isinstance(value, Generation) else Generation(content=value)
+
+
 class Model:
     """Common interface for model providers."""
     specifier: str
@@ -30,11 +62,12 @@ class Model:
     async def generate(
             self, prompt: Prompt | str,
             response_format: Any | None = None,
-            extract: bool = None,
+            extract: Literal["last_code_span"] = None,
             retries: int = 20,
             resolve_media: bool = True,
+            return_reasoning: bool = False,
             **kwargs
-    ) -> MultimodalSequence | Any:
+    ) -> MultimodalSequence | Any | tuple[MultimodalSequence | Any, str | None]:
         """
         Submit the given prompt to the model and return the (extracted) response.
 
@@ -53,15 +86,20 @@ class Model:
         :param resolve_media: A boolean indicating whether to resolve multimedia elements
             in the prompt. Defaults to True. If set to False, the prompt will be treated
             as a plain string.
+        :param return_reasoning: If True, returns a `(response, reasoning)` tuple, where
+            `reasoning` is the model's own reasoning trace as reported by the provider's
+            API, or None if it reported none. Defaults to False, which returns just the
+            response.
 
         :return: A `MultimodalSequence` object or a response in the specified format,
-            depending on the parameters provided.
+            depending on the parameters provided. A `(response, reasoning)` tuple if
+            `return_reasoning` is set.
 
         :raises RateLimitError: If the rate limit is exceeded and all retries are exhausted.
         :raises QuotaExceededError: If the model's quota is exceeded.
         """
 
-        response = None
+        generation = Generation()
 
         if not resolve_media:
             prompt = str(prompt)
@@ -69,9 +107,10 @@ class Model:
         start = time.time()
         for attempt in range(retries):
             try:
-                response = await self._generate(prompt, response_format, **kwargs)
+                generation = as_generation(
+                    await self._generate(prompt, response_format, **kwargs))
                 logger.debug(f"Response generation took {time.time() - start:.1f} seconds for {self.specifier}.")
-                if response is None:
+                if generation.content is None:
                     logger.info(f"Model {self.specifier} returned an empty response.")
                 break
             except RateLimitError:
@@ -85,11 +124,14 @@ class Model:
             await self._backoff(attempt)
 
         # Format the response and return
+        response = generation.content
         if response is not None:
             if not response_format:
                 match extract:
                     case "last_code_span": response = extract_last(response, delimiter="`")
                 response = MultimodalSequence(response)
+        if return_reasoning:
+            return response, generation.reasoning
         return response
 
     async def _generate(
@@ -97,7 +139,10 @@ class Model:
             response_format: Any | None = None,
             reasoning_effort: Literal["none", "low", "medium", "high"] | None = None,
             **kwargs
-    ) -> str | Any:
+    ) -> "Generation | str | Any":
+        """Provider-specific call. Should return a `Generation` carrying both the
+        answer and the reasoning the provider reported; a bare answer is accepted
+        too and is treated as having no reasoning."""
         raise NotImplementedError
 
     async def _backoff(self, attempt: int):

@@ -1,0 +1,58 @@
+# Reading
+Below is a fact-checking article published by {{ publisher_name }}{% if fact_check_date %} on {{ fact_check_date }}{% endif %}. It establishes a verdict about the Claim shown further below.
+
+## The Fact-Checking Article
+{{ article }}
+
+## The Claim Being Checked
+{{ claim }}
+{% if claim_date %}
+**The claim was released on {{ claim_date }}.**
+{% endif %}
+
+# Instructions
+Your goal is to **reconstruct the evidence the fact-checker used** to establish the verdict. Work through the steps in order.
+
+## 1. Evidence Identification
+Read the article and identify every *distinct* piece of evidence it relies on. A piece of evidence is one **atomic factual information contributed by an external source**, for example:
+- what an original social media post actually said or showed,
+- what an official register, database, statute or press release states,
+- what a named expert or eyewitness stated,
+- what a scientific study found,
+- what a tool (reverse image search, geolocation tool, metadata analyzer, deepfake detector, ...) reported.
+
+## 2. Source Attribution
+For each piece of evidence, name the **original source** and give a stable locator (usually a URL) for it.
+
+## 3. Output
+Output a single fenced JSON code block containing a list of objects. Use exactly this schema:
+
+```json
+[
+  {
+    "proposition": "The atomic factual information, stated as a self-contained sentence.",
+    "source_name": "Name of the publishing organization or person",
+    "source_kind": "one of: {{ source_kinds | join(', ') }}",
+    "source_locator": "https://... (must occur verbatim in the article)",
+    "source_proximity": "one of: primary, secondary, tertiary",
+    "role": "one of: essential, auxiliary, background",
+    "reasoning": "Why you believe the fact-checker used this evidence and how it bears on the verdict.",
+    "confidence": 0.0
+  }
+]
+```
+
+# Rules
+* **Do NOT extract** the fact-checker's own interpretation or reasoning, conclusions that are not backed by an external source, or the final verdict itself.
+* Every evidence item **must have an independently locatable source**. If you cannot name a locator that appears in the article, drop the item.
+* The source must be the **original source**, not the fact-check article quoting it. Never use {{ publisher_name }}'s own URL as a locator, and never use the article's own URL.
+* If the evidence originates from a **tool** used by the fact-checker, use the tool's webpage, documentation or source repository as the locator and set `source_kind` to `tool`.
+* If the evidence doesn't originate from the web (e.g., a phone call, interview, etc.), leave `source_locator` empty and set `source_kind` to `offline`.
+* `source_proximity`: `primary` = first-hand material produced by a party directly involved (the original post, an eyewitness recording, an official register, a tool's own output); `secondary` = reporting, analysis or aggregation of primary material; `tertiary` = compilations of secondary material (encyclopedia, etc.).
+* `role`: `essential` = the verdict does not hold without this evidence; `auxiliary` = it corroborates or refines essential evidence; `background` = context only, no probative weight on its own.
+* `confidence` is a number in [0, 1] expressing how certain you are that the fact-checker actually used this evidence for the verdict.
+* If the evidence is (partly) an image or a video that appears in the article, include its reference — the `<image:N>` or `<video:N>` marker, where `N` is the number shown in the article — **inline in the proposition text**. Copy such markers verbatim from the article; never invent one and never make up a number.
+* Write propositions in the language of the article.
+* If the article contains no usable evidence at all, output an empty list `[]`.
+
+# Your Response

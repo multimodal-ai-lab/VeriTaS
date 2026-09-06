@@ -1,0 +1,18 @@
+# Task
+Determine when the web content below was **first published**, i.e. when it became publicly accessible.
+
+## Source URL
+{{ url }}
+
+## Retrieved Content
+{{ content }}
+
+# Instructions
+1. Look for an explicitly stated publication time: a post timestamp, a dateline, a "published on ..." line, a byline date, an upload date, or an issue date.
+2. Ignore "last updated", "last modified", "accessed on" and "retrieved on" times, as well as dates that belong to the *events described* rather than to the publication itself.
+3. If, and only if, you find an explicit publication time, output it as an ISO-8601 timestamp enclosed in backticks, e.g. `2023-04-17` or `2023-04-17T09:30:00`. Use the most precise form the content supports.
+4. If no publication time is explicitly stated - which is normal for software tools, documentation and reference pages - output `none`.
+
+Do not guess and do not infer a date from context. Output exactly one backticked value.
+
+# Your Response

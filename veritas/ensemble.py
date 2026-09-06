@@ -27,11 +27,15 @@ class ModelResponse:
 
     - `model`: The model that returned this response.
     - `output`: The model's output (text or parsed object).
+    - `reasoning`: The model's reasoning trace as reported by the provider's API
+      (OpenAI reasoning items, Anthropic thinking blocks, Gemini thought parts).
+      None if the model reported none.
     - `error`: Exception string if the call failed.
     """
 
     model: Model
     output: MultimodalSequence | Any | None
+    reasoning: str | None = None
     error: Exception | None = None
 
 
@@ -174,10 +178,10 @@ class Ensemble:
         async def _call(name: str):
             model = self._members[name]
             try:
-                out = await model.generate(
-                    prompt, response_format=response_format, **kwargs
+                out, reasoning = await model.generate(
+                    prompt, response_format=response_format, return_reasoning=True, **kwargs
                 )
-                return ModelResponse(model=model, output=out)
+                return ModelResponse(model=model, output=out, reasoning=reasoning)
             except (anthropic.InternalServerError, openai.InternalServerError) as e:
                 logger.info(f"Internal server error in model {name}: {e}")
                 return ModelResponse(model=model, output=None, error=e)

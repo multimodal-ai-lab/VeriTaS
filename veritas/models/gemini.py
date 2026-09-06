@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from veritas import api_secrets
 from veritas.common.prompt import Prompt
-from veritas.models.base import Model, RateLimitError, QuotaExceededError
+from veritas.models.base import Generation, Model, RateLimitError, QuotaExceededError, THINKING_BUDGETS
 
 logger = logging.getLogger("VeriTaS")
 
@@ -34,7 +34,7 @@ class Gemini(Model):
             response_format: Any | None = None,
             reasoning_effort: Literal["none", "low", "medium", "high"] | None = None,
             **kwargs
-    ) -> str | Any:
+    ) -> Generation | None:
         # Track files uploaded during this call to clean them up afterwards
         uploaded_names: set[str] = set()
         contents = await self.prepare_gemini_message(prompt, uploaded_names=uploaded_names)
@@ -42,16 +42,7 @@ class Gemini(Model):
         # Compose configuration dict
         config = dict()
         if reasoning_effort:
-            thinking_budget = 0
-            match reasoning_effort:
-                case "none":
-                    thinking_budget = 0
-                case "low":
-                    thinking_budget = 512
-                case "medium":
-                    thinking_budget = 1024
-                case _:
-                    thinking_budget = 2048  # high
+            thinking_budget = THINKING_BUDGETS[reasoning_effort]
             config["thinking_config"] = ThinkingConfig(thinking_budget=thinking_budget)
 
         if isinstance(response_format, BaseModel):
@@ -94,13 +85,49 @@ class Gemini(Model):
                         pass
 
         if response:
+            reasoning = self._extract_reasoning(response)
+            text = self._extract_text(response)
             if response_format:
                 try:
-                    return response_format.model_validate_json(str(response.text))
+                    content = response_format.model_validate_json(str(text))
                 except Exception:
-                    return None
+                    content = None
             else:
-                return response.text
+                content = text
+            return Generation(content=content, reasoning=reasoning)
+
+    @staticmethod
+    def _iter_parts(response):
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                yield part
+
+    @classmethod
+    def _extract_reasoning(cls, response) -> str | None:
+        """Returns the model's reasoning from Gemini's dedicated thought parts -
+        never parsed out of the answer text.
+
+        Only present when the request enabled `include_thoughts` (see
+        `reasoning_effort`)."""
+        parts = [part.text for part in cls._iter_parts(response)
+                 if getattr(part, "thought", False) and getattr(part, "text", None)]
+        return "\n\n".join(parts) or None
+
+    @classmethod
+    def _extract_text(cls, response) -> str | None:
+        """The answer text, with thought parts excluded.
+
+        `response.text` concatenates all parts, so once `include_thoughts` is on it
+        can carry the reasoning into the answer and corrupt downstream parsing."""
+        parts = [part.text for part in cls._iter_parts(response)
+                 if not getattr(part, "thought", False) and getattr(part, "text", None)]
+        if parts:
+            return "".join(parts)
+        try:
+            return response.text
+        except Exception:
+            return None
 
     async def prepare_gemini_message(self, prompt: Prompt | str, uploaded_names: set[str] | None = None) -> list:
         """Uploads media to the Google Files API:

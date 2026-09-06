@@ -1,0 +1,32 @@
+# Task
+Determine whether the given Proposition was already true at time *t_c = {{ claim_date }}*.
+
+## Context (Evidence)
+{% if source_name %}Published by: {{ source_name }}{% endif %}
+{% if source_url %}URL: {{ source_url }}{% endif %}
+{% if available_since %}Stated publication time: {{ available_since }}{% endif %}
+
+{{ source }}
+
+## The Proposition
+{{ proposition }}
+
+# Question
+Would the factual basis provided by this Proposition already have been true at time t_c, even if nobody had yet published or discovered the above Evidence?
+
+# Output Format
+First, reason briefly. Then, output your final answer as a single fenced JSON code block with exactly these keys:
+
+```json
+{
+  "true_at_t_c": true,
+  "justification": "One or two sentences summarizing the decisive observations."
+}
+```
+
+# Rules
+* You are **not** asked whether the Claim is true, and you must not state a verdict about it.
+* Base your answers only on the contents shown above.
+* Answer in English, no matter the language of the Proposition or Context.
+
+# Your Response

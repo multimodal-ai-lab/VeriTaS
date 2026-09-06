@@ -63,6 +63,17 @@ VeriTaS is organized in quarterly splits, extended dynamically in the future wit
 6. **Create backup**: Run `python -m scripts.export.create_backup` to create a backup of the entire pipeline data.
 
 
+## Gold Evidence Reconstruction
+A separate analysis pipeline reconstructs the evidence the original professional fact-check used, filters invalid and leaked evidence, and validates whether the remainder suffices to recover the VeriTaS gold verdict. It answers whether evidence that only became available *during* the fact-checking period is necessary for that reconstruction.
+
+```bash
+python -m scripts.gold_evidence.run_reconstruction   # parameters set in config.yaml
+python -m scripts.gold_evidence.run_temporal_analysis
+```
+
+It runs independently of the 7-stage benchmark pipeline and never modifies existing data — see [`veritas/gold_evidence/README.md`](veritas/gold_evidence/README.md) for usage and [`veritas/gold_evidence/DESIGN_DECISIONS.md`](veritas/gold_evidence/DESIGN_DECISIONS.md) for the methodological choices.
+
+
 ## Required Services
 - LLM APIs:
   - OpenAI

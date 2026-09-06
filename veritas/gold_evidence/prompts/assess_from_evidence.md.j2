@@ -1,0 +1,87 @@
+# Reading
+Below is a set of evidence items. Each was published by an independent source and is presented together with that source's identity, its proximity to the reported matter, and - where known - the time it became publicly available. Read all of them carefully, then follow the Instructions section.
+
+{% if evidence %}
+{% for item in evidence %}
+## Evidence {{ loop.index }} — {{ item.source.name }}
+Source type: {{ item.source.kind.value }} · Proximity: {{ item.source.proximity.value }}{% if item.available_since %} · Available since: {{ item.available_since.strftime("%B %d, %Y") }}{% endif %}
+{{ item.proposition }}
+{% endfor %}
+{% else %}
+*No evidence is available.*
+{% endif %}
+
+# Subject of Analysis
+{% if claim %}
+## The Claim to Analyze
+{{ claim }}
+{% if claim_date %}
+The claim was released on {{ claim_date }}.
+{% endif %}
+{% endif %}
+
+{% if medium %}
+## The {{ medium.kind.capitalize() }}
+{{ medium.reference }}
+{% endif %}
+
+# Instructions
+Your goal is to **assess the {{ property.name }} of the {{ subject }} shown above using only the Evidence**. Follow the steps in order:
+
+## 1. Evidence Summary
+Summarize the evidence items that bear specifically on the {{ subject }}'s {{ property.name }}. If none of them do, output "No evidence provided."
+
+## 2. Evaluation
+Reason step-by-step from the summarized evidence to what it implies about the {{ subject }}'s {{ property.name }}. Weigh sources by their proximity: first-hand (primary) material outweighs reporting about it.
+
+## 3. Category Decision
+Choose whether the {{ property.name }} is rather `{{ property.negative_category }}` or `{{ property.positive_category }}`. If the evidence is missing or fully inconclusive, answer `Unknown` and then skip directly to step 5. Enclose your choice in backticks like `this`.
+{% if property.negative_tags or property.positive_tags %}
+## 3a. Tag Selection
+If your chosen category includes tags, list all applicable tags for the {{ subject }}, each enclosed in colons.
+{% endif %}
+
+## 4. Certainty
+Choose one certainty level and enclose it in underscores. Certainty refers to the strength and clarity of the Evidence, not to your own confidence.
+    - _Certain_: The evidence is unequivocal and leaves no room for doubt.
+    - _Rather certain_: The evidence is strong and mostly consistent, but not fully definitive.
+    - _Rather uncertain_: The evidence only weakly supports one side, and misclassification is likely.
+
+## 5. Explanation
+Provide a short explanation (1-4 sentences) justifying your category and certainty. Use only the Evidence. Do not restate the {{ subject }} or the decision itself. Enclose your explanation in a fenced code block like ```this```.
+
+# Rules
+* Follow the definitions of {{ property.name }} strictly.
+* Base your reasoning **only** on the Evidence above. Do not invent facts, do not speculate, and do not rely on your own recollection of this case or of any fact-check about it.
+* If the Evidence contains nothing about the {{ property.name }}, choose `Unknown`.
+* If the Evidence is contradictory, weigh it and say so in the explanation rather than defaulting to `Unknown`.
+
+# {{ property.name }}
+Definition: {{ property.definition }}
+This property has the following two categories:
+
+## Category: {{ property.negative_category }}
+Definition: {{ property.negative_definition }}
+{% if property.negative_tags %}
+Tags:
+{% for tag in property.negative_tags %}
+- :{{ tag.name }}: {{ tag.definition }}
+{% endfor %}
+{% endif %}
+
+## Category: {{ property.positive_category }}
+Definition: {{ property.positive_definition }}
+{% if property.positive_tags %}
+Tags:
+{% for tag in property.positive_tags %}
+- :{{ tag.name }}: {{ tag.definition }}
+{% endfor %}
+{% endif %}
+
+{% if property.hints %}
+## Hints
+{{ property.hints }}
+{% endif %}
+
+# Your Response
+(Answer in English.)

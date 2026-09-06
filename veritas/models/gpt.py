@@ -12,7 +12,7 @@ from openai.types.upload_create_params import ExpiresAfter
 
 from veritas import api_secrets, selfhosted
 from veritas.common import Prompt
-from veritas.models.base import Model, RateLimitError, QuotaExceededError
+from veritas.models.base import Generation, Model, RateLimitError, QuotaExceededError
 
 logger = logging.getLogger("VeriTaS")
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -49,11 +49,14 @@ class GPT(Model):
             response_format: Any | None = None,
             reasoning_effort: Literal["none", "low", "medium", "high"] | None = None,
             **kwargs
-    ) -> str | Any:
+    ) -> Generation:
         # TODO: Truncate prompt to match context length
 
         messages = await self._prepare_gpt_messages(prompt)
 
+        # `summary` makes the Responses API return the reasoning items we read in
+        # `_extract_reasoning`. It is only valid together with an effort, so models
+        # called without one simply report no reasoning.
         reasoning = dict(effort=reasoning_effort, summary="detailed") if reasoning_effort else None
 
         try:
@@ -61,15 +64,15 @@ class GPT(Model):
                 response = await self.client.responses.parse(
                     model=self.specifier, input=messages, text_format=response_format, reasoning=reasoning, **kwargs
                 )
-                # self._log_reasoning(response)
-                return response.output_parsed
+                content = response.output_parsed
 
             else:
                 response = await self.client.responses.create(
                     model=self.specifier, input=messages, reasoning=reasoning, **kwargs
                 )
-                # self._log_reasoning(response)
-                return response.output_text
+                content = response.output_text
+
+            return Generation(content=content, reasoning=self._extract_reasoning(response))
 
         except InternalServerError as e:
             if e.status_code == 502:
@@ -100,15 +103,36 @@ class GPT(Model):
             logger.error(f"Failed to compute embeddings with {self.specifier}: {e}")
             raise
 
+    @staticmethod
+    def _extract_reasoning(response: Response) -> str | None:
+        """Returns the model's reasoning from the Responses API's dedicated
+        reasoning items - never parsed out of the answer text.
+
+        Reads the reasoning summaries OpenAI returns, and additionally any plain
+        reasoning content, which OpenAI-compatible servers (vLLM and friends) put
+        there instead. Returns None when the response carries no reasoning."""
+        parts: list[str] = []
+        for item in getattr(response, "output", None) or []:
+            if not (isinstance(item, ResponseReasoningItem)
+                    or getattr(item, "type", None) == "reasoning"):
+                continue
+            for block in (getattr(item, "summary", None) or []):
+                if text := getattr(block, "text", None):
+                    parts.append(text)
+            for block in (getattr(item, "content", None) or []):
+                if text := getattr(block, "text", None):
+                    parts.append(text)
+
+        # Some OpenAI-compatible endpoints expose the trace on the response itself.
+        if not parts:
+            if text := getattr(response, "reasoning_content", None):
+                parts.append(str(text))
+
+        return "\n\n".join(parts) or None
+
     def _log_reasoning(self, response: Response) -> None:
-        """Gets and logs the LLM's reasoning."""
-        reasoning = None
-        reasoning_items = [r for r in response.output if isinstance(r, ResponseReasoningItem)]
-        if reasoning_items:
-            summary = [s.text for reasoning_item in reasoning_items for s in reasoning_item.summary]
-            reasoning = "\n\n".join(summary)
-        if not reasoning:
-            reasoning = response.output_text
+        """Logs the LLM's reasoning."""
+        reasoning = self._extract_reasoning(response) or response.output_text
         logger.debug(f"{self.specifier} Reasoning:\n{reasoning}")
 
     async def transcribe(self, file, **kwargs) -> str | None:
