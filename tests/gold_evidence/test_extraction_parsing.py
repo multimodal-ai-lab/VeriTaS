@@ -141,9 +141,35 @@ def test_hallucinated_media_reference_is_rejected():
     assert build(proposition="The video <image:999999999> shows a crowd.") is None
 
 
-def test_missing_proposition_or_locator_is_rejected():
+def test_missing_proposition_is_rejected():
     assert build(proposition="") is None
+
+
+def test_a_locator_is_required_for_ordinary_sources():
     assert build(source_locator="") is None
+
+
+@pytest.mark.parametrize("kind", ["offline", "tool"])
+def test_tools_and_offline_evidence_need_no_locator(kind):
+    """A phone call has no URL, and not every tool has a public page."""
+    evidence = build(source_locator="", source_kind=kind,
+                     source_name="Prof. Meier (phone interview)")
+    assert evidence is not None
+    assert evidence.source.locator is None
+    assert evidence.source.kind is SourceKind(kind)
+    assert evidence.source.name == "Prof. Meier (phone interview)"
+
+
+def test_a_locator_less_item_still_needs_a_proposition():
+    assert build(source_locator="", source_kind="offline", proposition="") is None
+
+
+def test_locator_less_items_are_deduplicated_by_proposition():
+    a = build(source_locator="", source_kind="offline", confidence=0.3)
+    b = build(source_locator="", source_kind="offline", confidence=0.7)
+    deduplicated = deduplicate([a, b])
+    assert len(deduplicated) == 1
+    assert deduplicated[0].extraction_confidence == pytest.approx(0.7)
 
 
 # --- Value coercion --------------------------------------------------------

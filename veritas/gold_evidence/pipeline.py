@@ -18,6 +18,7 @@ from veritas.gold_evidence import (
     CONDITION_FACT_CHECK,
     CONDITIONS,
     STATUS_ACCEPTED,
+    STATUS_DEFERRED,
     STATUS_EXTRACTED,
     STATUS_FILTERED,
     STATUS_PENDING,
@@ -29,7 +30,7 @@ from veritas.gold_evidence import (
 from veritas.gold_evidence.admissibility import select
 from veritas.gold_evidence.extraction import extract_evidence
 from veritas.gold_evidence.filtering import filter_evidence, get_reference_times
-from veritas.gold_evidence.models import Evidence, SourceKind
+from veritas.gold_evidence.models import Evidence
 from veritas.gold_evidence.sufficiency import SufficiencyResult, validate_sufficiency
 from veritas.models import QuotaExceededError, RateLimitError
 from veritas.util import run_with_semaphore
@@ -55,11 +56,18 @@ class ClaimOutcome:
     reason: str | None = None
     n_candidates: int = 0
     n_admissible: int = 0
+    n_deferred: int = 0
     results: dict[str, SufficiencyResult] = field(default_factory=dict)
 
     @property
     def accepted(self) -> bool:
         return self.status == STATUS_ACCEPTED
+
+    @property
+    def deferred(self) -> bool:
+        """The claim was neither accepted nor rejected: part of its evidence is
+        waiting for a rate-limited source and the run must revisit it."""
+        return self.status == STATUS_DEFERRED
 
     def recoverable(self, condition: str) -> bool | None:
         result = self.results.get(condition)
@@ -73,7 +81,6 @@ async def reconstruct_claim(
         threshold: float = None,
         re_extract: bool = False,
         re_filter: bool = False,
-        skip_sufficiency: bool = False,
 ) -> ClaimOutcome:
     """Runs stages 1-3 for a single claim. Resumable: work already stored in the
     DB is reused unless `re_extract`/`re_filter` force it to be redone."""
@@ -98,9 +105,11 @@ async def reconstruct_claim(
         return await _finish(claim, outcome, STATUS_REJECTED, REJECT_NO_FACT_CHECK_TIME)
 
     # --- Stage 1 -----------------------------------------------------------
-    evidence: list[Evidence] = await claim.evidence
+    # Read through `db` rather than `claim.evidence`, so that the whole stage
+    # orchestration talks to one injectable database handle.
+    evidence: list[Evidence] = await db.get_evidence_for_claim(claim.id)
     if re_extract or not evidence:
-        evidence = await extract_evidence(claim)
+        evidence = await extract_evidence(claim, replace=re_extract)
     outcome.n_candidates = len(evidence)
 
     if not evidence:
@@ -108,20 +117,27 @@ async def reconstruct_claim(
     await db.set_gold_evidence_status(claim.id, STATUS_EXTRACTED)
 
     # --- Stage 2 -----------------------------------------------------------
-    pending = [e for e in evidence if (re_filter or not e.filtered)
-               and e.source.kind not in [SourceKind.OFFLINE, SourceKind.TOOL]]
+    # Items waiting out a rate limit are left alone until their window expires.
+    pending = [e for e in evidence
+               if (re_filter or not e.filtered) and not e.deferred]
     if pending:
         await filter_evidence(claim, pending)
+
+    outcome.n_deferred = sum(1 for e in evidence if e.deferred)
+    if outcome.n_deferred:
+        # The evidence set is incomplete, so neither admissibility nor sufficiency
+        # can be decided yet. Rejecting here would blame the claim for a throttled
+        # source, and that rejection would be recorded permanently.
+        logger.debug(f"Claim {claim.id} deferred: {outcome.n_deferred} evidence "
+                     f"item(s) wait for a rate-limited source.")
+        return await _finish(claim, outcome, STATUS_DEFERRED, None)
+
     admissible = select(evidence, CONDITION_FACT_CHECK)
     outcome.n_admissible = len(admissible)
 
     if not admissible:
         return await _finish(claim, outcome, STATUS_REJECTED, REJECT_NO_ADMISSIBLE_EVIDENCE)
     await db.set_gold_evidence_status(claim.id, STATUS_FILTERED)
-
-    if skip_sufficiency:
-        outcome.status = STATUS_FILTERED
-        return outcome
 
     # --- Stage 3 -----------------------------------------------------------
     for condition in CONDITIONS:
@@ -193,6 +209,7 @@ def summarize(outcomes: list[ClaimOutcome]) -> dict:
         "rejection_reasons": dict(reasons),
         "n_candidates": sum(o.n_candidates for o in outcomes),
         "n_admissible": sum(o.n_admissible for o in outcomes),
+        "n_deferred_evidence": sum(o.n_deferred for o in outcomes),
         "recoverable": {
             condition: {str(k): v for k, v in counter.items()}
             for condition, counter in recoverable.items()

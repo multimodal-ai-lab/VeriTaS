@@ -41,8 +41,7 @@ def test_missing_faithfulness_counts_as_unfiltered():
     (dict(faithfulness=0.0), InadmissibilityReason.UNFAITHFUL),
     (dict(faithfulness=-1.0), InadmissibilityReason.UNFAITHFUL),
     (dict(before_fact_check=False), InadmissibilityReason.AFTER_FACT_CHECK),
-    (dict(professional_fact_check=True, concurrent_fact_check=True),
-     InadmissibilityReason.VERDICT_LEAK),
+    (dict(kind=SourceKind.FACT_CHECK), InadmissibilityReason.VERDICT_LEAK),
     (dict(later_event=True), InadmissibilityReason.LATER_EVENT),
     (dict(confidence=0.1), None),  # No minimum confidence by default
 ])
@@ -51,11 +50,12 @@ def test_each_criterion_rejects(kwargs, expected):
     assert determine_inadmissibility(evidence) is expected
 
 
-def test_professional_fact_check_on_another_claim_is_kept():
-    """Only a *concurrent* fact-check leaks the verdict."""
-    evidence = make_evidence(available_since=T_C, professional_fact_check=True,
-                             concurrent_fact_check=False)
-    assert determine_inadmissibility(evidence) is None
+def test_a_fact_check_source_leaks_the_verdict_whenever_it_appeared():
+    """The registry check records its finding as `SourceKind.FACT_CHECK`, so a
+    fact-check is rejected as a leak no matter where it sits on the timeline."""
+    early = make_evidence(available_since=datetime(2024, 4, 1),
+                          kind=SourceKind.FACT_CHECK)
+    assert determine_inadmissibility(early) is InadmissibilityReason.VERDICT_LEAK
 
 
 def test_reason_order_is_deterministic():
@@ -83,10 +83,12 @@ def test_min_extraction_confidence_is_applied_when_configured():
 
 @pytest.mark.parametrize("policy, kind, expected", [
     ("tool_only", SourceKind.TOOL, True),
+    ("tool_only", SourceKind.OFFLINE, True),
     ("tool_only", SourceKind.NEWS_ARTICLE, False),
     ("permissive", SourceKind.NEWS_ARTICLE, True),
     ("permissive", SourceKind.TOOL, True),
     ("strict", SourceKind.TOOL, False),
+    ("strict", SourceKind.OFFLINE, False),
     ("strict", SourceKind.NEWS_ARTICLE, False),
 ])
 def test_undated_policies(policy, kind, expected):
@@ -107,6 +109,44 @@ def test_undated_tool_is_kept_by_default():
 def test_unknown_undated_policy_raises():
     with pytest.raises(AssertionError):
         keeps_undated(SourceKind.TOOL, "whatever")
+
+
+# --- Sources that cannot be retrieved --------------------------------------
+
+@pytest.mark.parametrize("kind", [SourceKind.TOOL, SourceKind.OFFLINE])
+def test_unretrievable_evidence_is_admissible_without_locator_or_date(kind):
+    """Neither is a publication: nothing to retrieve, nothing to date, and for
+    offline evidence nothing to point at either."""
+    evidence = make_evidence(kind=kind, locator=None, available_since=None,
+                             filtered=False)
+    assert evidence.source.locator is None
+    assert determine_inadmissibility(evidence, undated_policy="tool_only") is None
+
+
+@pytest.mark.parametrize("kind", [SourceKind.TOOL, SourceKind.OFFLINE])
+def test_the_strict_policy_still_removes_them(kind):
+    """`strict` is the sensitivity analysis: it drops everything undated."""
+    evidence = make_evidence(kind=kind, available_since=None, filtered=False)
+    assert determine_inadmissibility(evidence, undated_policy="strict")            is InadmissibilityReason.UNDATED
+
+
+def test_unretrievable_items_still_obey_the_confidence_floor():
+    evidence = make_evidence(kind=SourceKind.TOOL, available_since=None,
+                             confidence=0.2, filtered=False)
+    assert determine_inadmissibility(evidence, min_extraction_confidence=0.5)            is InadmissibilityReason.LOW_CONFIDENCE
+
+
+def test_an_undated_source_of_another_kind_is_still_rejected():
+    evidence = make_evidence(kind=SourceKind.NEWS_ARTICLE, available_since=None)
+    assert determine_inadmissibility(evidence, undated_policy="tool_only")            is InadmissibilityReason.UNDATED
+
+
+def test_an_unfiltered_tool_is_in_both_conditions():
+    """Without a temporal validation, an undated item satisfies both cutoffs."""
+    evidence = make_evidence(kind=SourceKind.TOOL, available_since=None, filtered=False)
+    apply_admissibility(evidence)
+    assert in_condition(evidence, CONDITION_FACT_CHECK)
+    assert in_condition(evidence, CONDITION_CLAIM)
 
 
 # --- Temporal bounds -------------------------------------------------------

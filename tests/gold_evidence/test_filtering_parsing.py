@@ -1,4 +1,4 @@
-"""Stage 2 response parsing (faithfulness and the single-call temporal verdict)."""
+"""Stage 2 response parsing (faithfulness and the temporal verdict)."""
 
 import pytest
 
@@ -61,60 +61,45 @@ def test_category_is_case_insensitive():
 
 # --- Temporal validation ---------------------------------------------------
 
-def temporal_response(professional=True, concurrent=None, later_event=False,
-                      reasoning="Because.") -> str:
+def temporal_response(later_event=False, justification="Because.") -> str:
     return (
-        "Reasoning about A, B and C.\n\n```json\n"
-        f'{{"professional_fact_check": {str(professional).lower()}, '
-        f'"concurrent_fact_check": {"null" if concurrent is None else str(concurrent).lower()}, '
-        f'"later_event": {str(later_event).lower()}, '
-        f'"reasoning": "{reasoning}"}}\n```'
+        "Reasoning about the timing.\n\n```json\n"
+        f'{{"later_event": {str(later_event).lower()}, '
+        f'"justification": "{justification}"}}\n```'
     )
 
 
-def test_parses_all_three_judgements_from_one_call():
-    parsed = parse_temporal_response(
-        temporal_response(professional=True, concurrent=True, later_event=False))
-    assert parsed == {
-        "professional_fact_check": True,
-        "concurrent_fact_check": True,
-        "later_event": False,
-        "reasoning": "Because.",
-    }
+def test_parses_the_later_event_judgement():
+    parsed = parse_temporal_response(temporal_response(later_event=True))
+    assert parsed == {"later_event": True, "justification": "Because."}
 
 
-def test_concurrency_is_nulled_when_not_a_fact_check():
-    """A non-fact-check cannot be a concurrent fact-check, whatever the model said."""
-    parsed = parse_temporal_response(
-        temporal_response(professional=False, concurrent=True))
-    assert parsed["professional_fact_check"] is False
-    assert parsed["concurrent_fact_check"] is None
-
-
-def test_yes_no_strings_are_accepted():
-    response = ('```json\n{"professional_fact_check": "yes", '
-                '"concurrent_fact_check": "no", "later_event": "NO"}\n```')
-    parsed = parse_temporal_response(response)
-    assert parsed["professional_fact_check"] is True
-    assert parsed["concurrent_fact_check"] is False
+def test_no_later_event_is_not_confused_with_a_missing_answer():
+    """`false` is a judgement, not the absence of one. The prompt asks directly for
+    `later_event`, so nothing on this path inverts the model's answer."""
+    parsed = parse_temporal_response(temporal_response(later_event=False))
     assert parsed["later_event"] is False
 
 
-def test_missing_keys_default_to_false():
+def test_yes_no_strings_are_accepted():
+    assert parse_temporal_response('```json\n{"later_event": "NO"}\n```')["later_event"] is False
+    assert parse_temporal_response('```json\n{"later_event": "yes"}\n```')["later_event"] is True
+
+
+def test_missing_justification_is_tolerated():
     parsed = parse_temporal_response('```json\n{"later_event": true}\n```')
-    assert parsed["professional_fact_check"] is False
-    assert parsed["concurrent_fact_check"] is None
     assert parsed["later_event"] is True
+    assert parsed["justification"] is None
 
 
 def test_unparseable_response_returns_none():
     assert parse_temporal_response("I cannot answer that.") is None
 
 
-def test_response_without_any_recognized_key_returns_none():
+def test_response_without_the_judgement_returns_none():
     assert parse_temporal_response('```json\n{"foo": 1}\n```') is None
 
 
 def test_json_without_a_fence_is_accepted():
-    parsed = parse_temporal_response('{"professional_fact_check": true, "later_event": false}')
-    assert parsed["professional_fact_check"] is True
+    parsed = parse_temporal_response('{"later_event": false, "justification": "x"}')
+    assert parsed["later_event"] is False

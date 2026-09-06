@@ -13,6 +13,21 @@ from veritas.db.base import Database
 from veritas.util import get_domain
 from veritas.util.util import hash_int32
 
+#: Matches an ezMM item reference such as `<image:42>` inside stored text. The ID
+#: is length-capped so that the cast to a PostgreSQL `INTEGER` cannot overflow on
+#: a bogus reference that happens to sit in some scraped page.
+MEDIA_REF_PATTERN = r"<(image|video|audio):([0-9]{1,9})>"
+
+#: SQL predicate on `media`: the medium occurs at least once somewhere in VeriTaS.
+MEDIA_IS_USED = ("(CARDINALITY(claim_ids) > 0 OR CARDINALITY(appearance_ids) > 0 "
+                 "OR CARDINALITY(article_ids) > 0 OR CARDINALITY(evidence_ids) > 0)")
+
+
+def _usage_agg(source: str) -> str:
+    """SQL collecting the distinct IDs of one source kind into an `INTEGER[]`."""
+    return (f"COALESCE(ARRAY_AGG(DISTINCT source_id) FILTER (WHERE source = '{source}'), "
+            f"'{{}}'::INTEGER[])")
+
 
 class VeritasDB(Database):
     """Core VeriTaS data store, containing all pipeline data."""
@@ -211,18 +226,81 @@ class VeritasDB(Database):
             """
         )
 
-        # Media embeddings
+        # Media. Formerly `media_embeddings`: the table now indexes every medium
+        # VeriTaS refers to and records where it is used, with the embedding being
+        # one (optional) column among them.
+        #
+        # Existing embeddings are carried over in every case and never recomputed:
+        # the table is *renamed*, so the rows stay exactly where they are, and if a
+        # `media` table already exists the embeddings are copied into it instead.
+        # Nothing below drops a table or writes to `embedding`.
         await self._execute(
             """
-            CREATE TABLE IF NOT EXISTS media_embeddings
+            DO
+            $$
+                BEGIN
+                    IF to_regclass('public.media_embeddings') IS NOT NULL
+                        AND to_regclass('public.media') IS NULL THEN
+                        ALTER TABLE media_embeddings RENAME TO media;
+                    END IF;
+                END
+            $$;
+
+            CREATE TABLE IF NOT EXISTS media
             (
-                id         SERIAL PRIMARY KEY,
-                kind       TEXT    NOT NULL,
-                media_id   INTEGER NOT NULL,
-                embedding  FLOAT[] NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                id             SERIAL PRIMARY KEY,
+                kind           TEXT      NOT NULL,
+                media_id       INTEGER   NOT NULL,
+                embedding      FLOAT[],
+                -- Where the medium occurs. Empty everywhere <=> unused by VeriTaS.
+                claim_ids      INTEGER[] NOT NULL DEFAULT '{}',
+                appearance_ids INTEGER[] NOT NULL DEFAULT '{}',
+                article_ids    INTEGER[] NOT NULL DEFAULT '{}',
+                evidence_ids   INTEGER[] NOT NULL DEFAULT '{}',
+                indexed_at     TIMESTAMP,
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (kind, media_id)
             );
+
+            -- Additive upgrade of a table that came from `media_embeddings`: it has
+            -- neither the usage columns nor a nullable embedding (a medium without
+            -- an embedding must be indexable, too).
+            ALTER TABLE media ALTER COLUMN embedding DROP NOT NULL;
+            ALTER TABLE media ADD COLUMN IF NOT EXISTS claim_ids      INTEGER[] NOT NULL DEFAULT '{}';
+            ALTER TABLE media ADD COLUMN IF NOT EXISTS appearance_ids INTEGER[] NOT NULL DEFAULT '{}';
+            ALTER TABLE media ADD COLUMN IF NOT EXISTS article_ids    INTEGER[] NOT NULL DEFAULT '{}';
+            ALTER TABLE media ADD COLUMN IF NOT EXISTS evidence_ids   INTEGER[] NOT NULL DEFAULT '{}';
+            ALTER TABLE media ADD COLUMN IF NOT EXISTS indexed_at     TIMESTAMP;
+
+            CREATE INDEX IF NOT EXISTS media_kind_idx ON media (kind);
+            CREATE INDEX IF NOT EXISTS media_claim_ids_idx
+                ON media USING GIN (claim_ids);
+            CREATE INDEX IF NOT EXISTS media_appearance_ids_idx
+                ON media USING GIN (appearance_ids);
+            CREATE INDEX IF NOT EXISTS media_article_ids_idx
+                ON media USING GIN (article_ids);
+            CREATE INDEX IF NOT EXISTS media_evidence_ids_idx
+                ON media USING GIN (evidence_ids);
+
+            DO
+            $$
+                BEGIN
+                    -- Reached only if `media_embeddings` survived the rename above,
+                    -- i.e. if a `media` table already existed. Its embeddings would
+                    -- otherwise be stranded in a table nothing reads any more, so
+                    -- copy them over - without overwriting anything `media` already
+                    -- has, and without dropping `media_embeddings`.
+                    IF to_regclass('public.media_embeddings') IS NOT NULL THEN
+                        EXECUTE $migrate$
+                            INSERT INTO media (kind, media_id, embedding)
+                            SELECT kind, media_id, embedding
+                            FROM media_embeddings
+                            ON CONFLICT (kind, media_id) DO UPDATE
+                            SET embedding = COALESCE(media.embedding, EXCLUDED.embedding);
+                        $migrate$;
+                    END IF;
+                END
+            $$;
             """
         )
 
@@ -278,8 +356,10 @@ class VeritasDB(Database):
                 proposition_hash        INTEGER NOT NULL,
                 source_name             TEXT,
                 source_kind             TEXT,
-                source_locator          TEXT    NOT NULL,
-                source_locator_hash     INTEGER NOT NULL,
+                -- NULL for sources that are not publications: a tool without a
+                -- page, or offline evidence such as an interview.
+                source_locator          TEXT,
+                source_locator_hash     INTEGER,
                 source_proximity        TEXT,
                 source_raw_content      TEXT,
                 available_since         TIMESTAMP,
@@ -293,8 +373,6 @@ class VeritasDB(Database):
                 faithfulness_justification TEXT,
                 before_fact_check       BOOLEAN,
                 before_claim            BOOLEAN,
-                professional_fact_check BOOLEAN,
-                concurrent_fact_check   BOOLEAN,
                 later_event             BOOLEAN,
                 temporal_reasoning      TEXT,
                 temporal_justification  TEXT,
@@ -302,6 +380,7 @@ class VeritasDB(Database):
                 inadmissibility_reason  TEXT,
                 dismissed               BOOLEAN   DEFAULT FALSE,
                 dismissed_reason        TEXT      DEFAULT NULL,
+                deferred_until          TIMESTAMP,
                 full_evidence           JSONB,
                 created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -314,6 +393,51 @@ class VeritasDB(Database):
                 ON evidence (claim_id, admissible);
             CREATE INDEX IF NOT EXISTS evidence_available_since_idx
                 ON evidence (available_since);
+
+            -- Optional helper index for checking deferral windows on evidence
+            CREATE INDEX IF NOT EXISTS evidence_deferred_until_idx
+                ON evidence (deferred_until);
+
+            -- Migrations for tables created by an earlier version
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS deferred_until TIMESTAMP;
+            ALTER TABLE evidence DROP COLUMN IF EXISTS professional_fact_check;
+            ALTER TABLE evidence DROP COLUMN IF EXISTS concurrent_fact_check;
+            ALTER TABLE evidence ALTER COLUMN source_locator DROP NOT NULL;
+            ALTER TABLE evidence ALTER COLUMN source_locator_hash DROP NOT NULL;
+            """
+        )
+
+        # A missing locator must not defeat the uniqueness constraint: by default
+        # PostgreSQL treats NULLs as distinct, so two extractions of the same
+        # offline source would insert twice instead of upserting. NULLS NOT
+        # DISTINCT fixes that from PostgreSQL 15 on; older servers keep the plain
+        # constraint, where locator-less rows are simply not covered by it.
+        await self._execute(
+            """
+            DO
+            $$
+                DECLARE
+                    nulls_are_distinct BOOLEAN;
+                BEGIN
+                    IF current_setting('server_version_num')::INT < 150000 THEN
+                        RETURN;
+                    END IF;
+                    EXECUTE 'SELECT EXISTS (SELECT 1
+                                            FROM pg_constraint c
+                                                     JOIN pg_index i ON i.indexrelid = c.conindid
+                                            WHERE c.conrelid = ''evidence''::REGCLASS
+                                              AND c.conname = ''unique_evidence''
+                                              AND NOT i.indnullsnotdistinct)'
+                        INTO nulls_are_distinct;
+                    IF nulls_are_distinct THEN
+                        ALTER TABLE evidence DROP CONSTRAINT unique_evidence;
+                        EXECUTE 'ALTER TABLE evidence
+                            ADD CONSTRAINT unique_evidence
+                                UNIQUE NULLS NOT DISTINCT (claim_id, source_locator_hash,
+                                                           proposition_hash)';
+                    END IF;
+                END
+            $$;
             """
         )
 
@@ -725,10 +849,10 @@ class VeritasDB(Database):
     async def insert_media_embedding(self, kind: str, media_id: int, embedding: list[float]):
         """Inserts a media embedding into the database."""
         query = """
-                INSERT INTO media_embeddings (kind, media_id, embedding)
+                INSERT INTO media (kind, media_id, embedding)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (kind, media_id) DO UPDATE
-                SET embedding = $3,
+                SET embedding  = $3,
                     created_at = CURRENT_TIMESTAMP;
                 """
         await self._execute(query, kind, media_id, embedding)
@@ -874,7 +998,13 @@ class VeritasDB(Database):
     async def insert_evidence(self, evidence: "Evidence") -> int:
         """Adds a reconstructed evidence item to the database and returns its ID.
         If an identical item (same claim, locator and proposition) already exists,
-        that row is updated instead and its ID returned."""
+        that row is updated instead and its ID returned.
+
+        Items without a locator match each other on claim and proposition alone,
+        which is what `UNIQUE NULLS NOT DISTINCT` on `evidence` provides. On
+        PostgreSQL below 15 they are not covered by the constraint and a repeated
+        insert adds a second row; nothing in the pipeline does that, because
+        extraction deduplicates in memory and re-extraction deletes first."""
         columns, values = _evidence_columns(evidence)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
         updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns
@@ -925,6 +1055,16 @@ class VeritasDB(Database):
         for row in rows:
             result[row["claim_id"]].append(row_to_evidence(row))
         return result
+
+    async def delete_evidence_for_claim(self, claim_id: int) -> int:
+        """Removes all reconstructed evidence of a claim and returns how many rows
+        were deleted. Used before a re-extraction, so that items the new run no
+        longer produces do not survive as orphans."""
+        result = await self._execute("DELETE FROM evidence WHERE claim_id = $1;", claim_id)
+        try:
+            return int(str(result).split()[-1])
+        except (ValueError, IndexError, TypeError):
+            return 0
 
     async def count_evidence_for_claim(self, claim_id: int) -> int:
         return await self._fetchval("SELECT COUNT(*) FROM evidence WHERE claim_id = $1", claim_id)
@@ -1010,6 +1150,7 @@ class VeritasDB(Database):
             statuses: list[str] | None = None,
             released_first: bool = True,
             claim_ids: list[int] | None = None,
+            exclude_claim_ids: list[int] | None = None,
     ) -> list[Claim]:
         """Returns candidate claims for the Gold Evidence Reconstruction.
 
@@ -1020,6 +1161,9 @@ class VeritasDB(Database):
 
         `statuses` filters on `gold_evidence_status`; pass `[None]`-like values via
         the string 'unprocessed' to select claims that were never processed.
+        `exclude_claim_ids` skips claims a caller has already handled - a run that
+        batches through the resumable statuses needs it, because a claim it just
+        deferred still matches the filter.
         """
         if isinstance(start_date, date) and not isinstance(start_date, datetime):
             start_date = datetime.combine(start_date, datetime.min.time())
@@ -1029,7 +1173,10 @@ class VeritasDB(Database):
         wants_unprocessed = bool(statuses) and "unprocessed" in statuses
         concrete_statuses = [s for s in (statuses or []) if s != "unprocessed"] or None
 
-        order = ("(c.released_quarter OR c.released_longitudinal) DESC, c.id"
+        # Both flags are ordered separately rather than as `a OR b`: with
+        # SELECT DISTINCT, PostgreSQL only accepts ORDER BY expressions that appear
+        # in the select list, and this yields the same released-first grouping.
+        order = ("c.released_quarter DESC, c.released_longitudinal DESC, c.id"
                  if released_first else "c.id")
 
         query = f"""
@@ -1045,11 +1192,13 @@ class VeritasDB(Database):
                   AND ($4::text[] IS NULL OR c.gold_evidence_status = ANY ($4)
                        OR ($5::bool AND c.gold_evidence_status IS NULL))
                   AND ($6::int[] IS NULL OR c.id = ANY ($6))
+                  AND ($7::int[] IS NULL OR NOT (c.id = ANY ($7)))
                 ORDER BY {order}
                 LIMIT $1;
                 """
         rows = await self._fetch(query, limit, start_date, end_date,
-                                 concrete_statuses, wants_unprocessed, claim_ids)
+                                 concrete_statuses, wants_unprocessed, claim_ids,
+                                 exclude_claim_ids or None)
         return [Claim.model_validate(dict(row)) for row in rows]
 
     async def insert(self, instance: VeritasBaseModel) -> int:
@@ -1614,7 +1763,7 @@ class VeritasDB(Database):
     async def get_media_embedding(self, kind: str, media_id: int) -> list[float] | None:
         """Returns the embedding of a media item."""
         query = """
-                SELECT embedding FROM media_embeddings
+                SELECT embedding FROM media
                 WHERE kind = $1 AND media_id = $2;
                 """
         return await self._fetchval(query, kind, media_id)
@@ -1628,9 +1777,144 @@ class VeritasDB(Database):
                            AND (released_longitudinal OR released_quarter)"""
             rows = await self._fetch(query)
         else:
-            query = "SELECT media_id AS id, embedding FROM media_embeddings WHERE kind = $1"
+            # `media` also holds media that were only indexed, never embedded.
+            query = """SELECT media_id AS id, embedding
+                       FROM media
+                       WHERE kind = $1
+                         AND embedding IS NOT NULL"""
             rows = await self._fetch(query, kind)
         return [(row["id"], row["embedding"]) for row in rows]
+
+    # -- Media index --------------------------------------------------------
+
+    async def rebuild_media_index(self) -> int:
+        """Rebuilds the usage columns of `media` from every place a medium can
+        occur in VeriTaS, and returns the number of media that are in use.
+
+        Scanned are `claims.data`, both scraped contents of an appearance, an
+        article's raw page and extracted content, and the gold evidence's raw
+        source content.
+
+        The scan runs entirely inside PostgreSQL, so none of the (potentially
+        huge) scraped content ever has to cross the wire - but it does read every
+        such column once, which takes a while on a grown database. Reset and
+        re-insert share one transaction: an interrupted run must never leave the
+        index empty, because an empty index looks exactly like "nothing is in use".
+        """
+        reset_query = """
+                      UPDATE media
+                      SET claim_ids      = '{}',
+                          appearance_ids = '{}',
+                          article_ids    = '{}',
+                          evidence_ids   = '{}',
+                          indexed_at     = CURRENT_TIMESTAMP;
+                      """
+
+        # `regexp_matches` is strict, so a NULL column simply contributes no rows.
+        index_query = f"""
+            WITH refs AS (
+                SELECT 'claim'::TEXT AS source, c.id AS source_id, ref[1] AS kind, ref[2]::INTEGER AS media_id
+                FROM claims c, LATERAL regexp_matches(c.data, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'appearance', a.id, ref[1], ref[2]::INTEGER
+                FROM appearances a, LATERAL regexp_matches(a.original_scraped_content, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'appearance', a.id, ref[1], ref[2]::INTEGER
+                FROM appearances a, LATERAL regexp_matches(a.archived_scraped_content, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'article', ar.id, ref[1], ref[2]::INTEGER
+                FROM articles ar, LATERAL regexp_matches(ar.scraped_page, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'article', ar.id, ref[1], ref[2]::INTEGER
+                FROM articles ar, LATERAL regexp_matches(ar.extracted_article, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'evidence', e.id, ref[1], ref[2]::INTEGER
+                FROM evidence e, LATERAL regexp_matches(e.source_raw_content, $1, 'g') AS m(ref)
+            ),
+                 aggregated AS (
+                     SELECT kind,
+                            media_id,
+                            {_usage_agg("claim")}      AS claim_ids,
+                            {_usage_agg("appearance")} AS appearance_ids,
+                            {_usage_agg("article")}    AS article_ids,
+                            {_usage_agg("evidence")}   AS evidence_ids
+                     FROM refs
+                     GROUP BY kind, media_id
+                 )
+            INSERT INTO media (kind, media_id, claim_ids, appearance_ids, article_ids,
+                               evidence_ids, indexed_at)
+            SELECT kind, media_id, claim_ids, appearance_ids, article_ids, evidence_ids,
+                   CURRENT_TIMESTAMP
+            FROM aggregated
+            ON CONFLICT (kind, media_id) DO UPDATE
+            SET claim_ids      = EXCLUDED.claim_ids,
+                appearance_ids = EXCLUDED.appearance_ids,
+                article_ids    = EXCLUDED.article_ids,
+                evidence_ids   = EXCLUDED.evidence_ids,
+                indexed_at     = EXCLUDED.indexed_at;
+            """
+
+        async with self._transaction() as conn:
+            await conn.execute(reset_query)
+            await conn.execute(index_query, MEDIA_REF_PATTERN)
+            return await conn.fetchval(f"SELECT COUNT(*) FROM media WHERE {MEDIA_IS_USED};")
+
+    async def get_media_index(self) -> dict[str, set[int]]:
+        """The IDs of all media that occur somewhere in VeriTaS, keyed by kind.
+
+        Media that are merely known to the table (e.g. because an embedding was
+        computed for them once) but occur nowhere are deliberately left out: this
+        is exactly the set of files the media cleanup keeps on disk.
+        """
+        query = f"SELECT kind, media_id FROM media WHERE {MEDIA_IS_USED};"
+        index: dict[str, set[int]] = {}
+        for row in await self._fetch(query):
+            index.setdefault(row["kind"], set()).add(row["media_id"])
+        return index
+
+    async def get_media_usage(self, kind: str, media_id: int) -> dict | None:
+        """Where a single medium is used, or None if it is unknown to the index."""
+        query = """
+                SELECT kind, media_id, claim_ids, appearance_ids, article_ids, evidence_ids,
+                       embedding IS NOT NULL AS has_embedding, indexed_at
+                FROM media
+                WHERE kind = $1 AND media_id = $2;
+                """
+        row = await self._fetchrow(query, kind, media_id)
+        return dict(row) if row else None
+
+    async def get_media_index_stats(self) -> dict:
+        """Counts describing the media index: media per kind, and how many
+        claims, appearances, articles and evidence items refer to media."""
+        per_kind_query = f"""
+            SELECT kind,
+                   COUNT(*)                                                AS n_media,
+                   COUNT(*) FILTER (WHERE {MEDIA_IS_USED})                 AS n_used,
+                   COUNT(*) FILTER (WHERE CARDINALITY(claim_ids) > 0)      AS n_in_claims,
+                   COUNT(*) FILTER (WHERE CARDINALITY(appearance_ids) > 0) AS n_in_appearances,
+                   COUNT(*) FILTER (WHERE CARDINALITY(article_ids) > 0)    AS n_in_articles,
+                   COUNT(*) FILTER (WHERE CARDINALITY(evidence_ids) > 0)   AS n_in_evidence,
+                   COUNT(*) FILTER (WHERE embedding IS NOT NULL)           AS n_with_embedding
+            FROM media
+            GROUP BY kind
+            ORDER BY kind;
+            """
+        sources_query = """
+            SELECT (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(claim_ids) FROM media) t)      AS n_claims,
+                   (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(appearance_ids) FROM media) t) AS n_appearances,
+                   (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(article_ids) FROM media) t)    AS n_articles,
+                   (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(evidence_ids) FROM media) t)   AS n_evidence;
+            """
+        per_kind = [dict(row) for row in await self._fetch(per_kind_query)]
+        sources = dict(await self._fetchrow(sources_query))
+        return {
+            "per_kind": per_kind,
+            "n_media": sum(row["n_media"] for row in per_kind),
+            "n_used": sum(row["n_used"] for row in per_kind),
+            "n_with_embedding": sum(row["n_with_embedding"] for row in per_kind),
+            "sources": sources,
+        }
+
 
 database, user, password, host, port = database.values()
 db = VeritasDB(database=database, user=user, password=password, host=host, port=port)
@@ -1683,8 +1967,11 @@ def _evidence_columns(evidence) -> tuple[list[str], list]:
         "proposition_hash": hash_int32(evidence.proposition),
         "source_name": evidence.source.name,
         "source_kind": evidence.source.kind.value,
+        # Both stay NULL for sources that are not publications (a tool without a
+        # page, offline evidence); see the uniqueness constraint on `evidence`.
         "source_locator": evidence.source.locator,
-        "source_locator_hash": hash_int32(evidence.source.locator),
+        "source_locator_hash": (hash_int32(evidence.source.locator)
+                                if evidence.source.locator else None),
         "source_proximity": evidence.source.proximity.value,
         "source_raw_content": evidence.source.raw_content,
         "available_since": evidence.available_since,
@@ -1700,8 +1987,6 @@ def _evidence_columns(evidence) -> tuple[list[str], list]:
         "faithfulness_justification": faithfulness.justification if faithfulness else None,
         "before_fact_check": temporal.before_fact_check if temporal else None,
         "before_claim": temporal.before_claim if temporal else None,
-        "professional_fact_check": temporal.professional_fact_check if temporal else None,
-        "concurrent_fact_check": temporal.concurrent_fact_check if temporal else None,
         "later_event": temporal.later_event if temporal else None,
         "temporal_reasoning": temporal.reasoning if temporal else None,
         "temporal_justification": temporal.justification if temporal else None,
@@ -1709,6 +1994,7 @@ def _evidence_columns(evidence) -> tuple[list[str], list]:
         "inadmissibility_reason": evidence.inadmissibility_reason,
         "dismissed": evidence.dismissed,
         "dismissed_reason": evidence.dismissed_reason,
+        "deferred_until": evidence.deferred_until,
         "full_evidence": to_jsonb(evidence),
     }
     return list(data.keys()), list(data.values())

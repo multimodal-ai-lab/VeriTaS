@@ -1,5 +1,6 @@
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import asyncpg
@@ -84,6 +85,14 @@ class Database:
         """Fetch a single value."""
         async with self.pool.acquire() as conn:
             return await conn.fetchval(query, *args)
+
+    @asynccontextmanager
+    async def _transaction(self):
+        """Yields a pooled connection wrapped in a transaction, so that a group of
+        statements either all take effect or none of them do."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
 
     async def _copy_records_to_table(self, *args, **kwargs):
         """Saves the provided data (`records`) to the specified table."""

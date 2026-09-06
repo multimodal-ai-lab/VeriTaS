@@ -8,6 +8,7 @@ pipeline's stage 3.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from urllib.parse import urlparse
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 import json_repair
 
 from veritas.common import Article, Claim, Prompt, Review
+from veritas.db import db
 from veritas.gold_evidence import (
     extraction_model,
     max_article_length,
@@ -22,13 +24,15 @@ from veritas.gold_evidence import (
     max_reviews_per_claim,
     reasoning_effort_extraction,
 )
-from veritas.gold_evidence.llm import resolve_model
+from veritas.gold_evidence.admissibility import UNRETRIEVABLE_KINDS
+from veritas.gold_evidence.llm import FATAL_ERRORS, resolve_model
 from veritas.gold_evidence.models import (
     Evidence,
     EvidenceRole,
     EvidenceSource,
     ProximityLevel,
     SourceKind,
+    to_naive,
 )
 from veritas.util import get_domain
 from veritas.util.parsing import detect_hallucinated_media_refs, extract_last_code_block
@@ -39,9 +43,19 @@ logger = logging.getLogger("VeriTaS")
 PROMPT_PATH = "veritas/gold_evidence/prompts/extract_evidence.md.j2"
 
 
-async def extract_evidence(claim: Claim) -> list[Evidence]:
+async def extract_evidence(claim: Claim, replace: bool = False) -> list[Evidence]:
     """Extracts and persists the candidate evidence for a claim, using up to
-    `max_reviews_per_claim` of its fact-checking articles."""
+    `max_reviews_per_claim` of its fact-checking articles.
+
+    `replace` drops the claim's previously stored evidence first. Without it, a
+    re-extraction that phrases a proposition differently would leave the earlier
+    item behind as an orphan that still enters the analysis."""
+    if replace:
+        deleted = await db.delete_evidence_for_claim(claim.id)
+        if deleted:
+            logger.debug(f"Dropped {deleted} previously stored evidence item(s) "
+                         f"of claim {claim.id} before re-extraction.")
+
     reviews = await _select_reviews(claim)
     if not reviews:
         logger.debug(f"Claim {claim.id} has no usable review for evidence extraction.")
@@ -64,7 +78,7 @@ async def extract_evidence(claim: Claim) -> list[Evidence]:
 async def _select_reviews(claim: Claim) -> list[Review]:
     """The non-dismissed reviews of a claim, earliest first, capped by config."""
     reviews = [r for r in await claim.reviews if r and not r.dismissed]
-    reviews.sort(key=lambda r: (r.published is None, r.published or datetime.max))
+    reviews.sort(key=lambda r: (to_naive(r.published) or datetime.max))
     return reviews[:max_reviews_per_claim]
 
 
@@ -74,13 +88,14 @@ async def extract_from_article(claim: Claim, review: Review, article: Article) -
     publisher_name = publisher.name if publisher else (review.raw_publisher_name or "the fact-checker")
     article_content = article.content
     article_str = str(article_content)[:max_article_length]
+    published = to_naive(review.published)
 
     prompt = Prompt(
         PROMPT_PATH,
         article=article_str,
         claim=claim.data,
         claim_date=claim.date_str or None,
-        fact_check_date=review.published.strftime("%B %d, %Y") if review.published else None,
+        fact_check_date=published.strftime("%B %d, %Y") if published else None,
         publisher_name=publisher_name,
         source_kinds=[kind.value for kind in SourceKind],
     )
@@ -88,6 +103,8 @@ async def extract_from_article(claim: Claim, review: Review, article: Article) -
     model = _resolve_model(prompt)
     try:
         response = await model.generate(prompt, reasoning_effort=reasoning_effort_extraction)
+    except FATAL_ERRORS:
+        raise
     except Exception as e:
         logger.warning(f"Evidence extraction failed for claim {claim.id}, review {review.id}: {e}")
         return []
@@ -97,6 +114,7 @@ async def extract_from_article(claim: Claim, review: Review, article: Article) -
 
     records = parse_extraction_response(str(response))
     excluded_domains = _excluded_domains(review, publisher)
+    resolved_locators = await resolve_locators(records)
 
     evidence: list[Evidence] = []
     for record in records:
@@ -107,6 +125,7 @@ async def extract_from_article(claim: Claim, review: Review, article: Article) -
             article=article,
             article_str=article_str,
             excluded_domains=excluded_domains,
+            resolved_locators=resolved_locators,
         )
         if item:
             evidence.append(item)
@@ -176,6 +195,20 @@ def parse_extraction_response(response: str) -> list[dict]:
     return [record for record in parsed if isinstance(record, dict)]
 
 
+async def resolve_locators(records: list[dict]) -> dict[str, str]:
+    """Maps every extracted locator to its unshortened form.
+
+    Resolving the whole article's locators in one gather overlaps the requests
+    instead of serializing them; `unshorten` returns non-shortened URLs without
+    touching the network at all."""
+    locators = list({str(record.get("source_locator") or "").strip() for record in records})
+    locators = [locator for locator in locators if locator]
+    if not locators:
+        return {}
+    resolved = await asyncio.gather(*(unshorten(locator) for locator in locators))
+    return dict(zip(locators, resolved))
+
+
 def build_evidence(
         record: dict,
         *,
@@ -184,12 +217,20 @@ def build_evidence(
         article: Article,
         article_str: str,
         excluded_domains: set[str],
+        resolved_locators: dict[str, str] | None = None,
 ) -> Evidence | None:
     """Validates one extracted record and turns it into an `Evidence` object.
-    Returns None if the record violates any of the extraction rules."""
+    Returns None if the record violates any of the extraction rules.
+
+    Tools and offline evidence may come without a locator: a phone call has no URL,
+    and not every tool has a public page. They are the only records for which the
+    locator guards below are skipped, precisely because there is nothing to point at."""
     proposition = str(record.get("proposition") or "").strip()
     locator = str(record.get("source_locator") or "").strip()
-    if not proposition or not locator:
+    kind = _parse_enum(record.get("source_kind"), SourceKind, SourceKind.OTHER)
+    if not proposition:
+        return None
+    if not locator and kind not in UNRETRIEVABLE_KINDS:
         return None
 
     # Guard 1: no hallucinated media references
@@ -199,30 +240,29 @@ def build_evidence(
         logger.debug(f"Dropping evidence with invalid media reference: {e}")
         return None
 
-    # Guard 2: the locator must literally occur in the article (same trick as
-    # stage 4's appearance extraction) - this rules out invented URLs.
-    if locator not in article_str:
-        logger.debug(f"Dropping evidence with locator not found in article: {locator}")
-        return None
+    domain = None
+    if locator:
+        # Guard 2: the locator must literally occur in the article (same trick as
+        # stage 4's appearance extraction) - this rules out invented URLs. Checked
+        # on the locator as written, before it is resolved to its long form.
+        if locator not in article_str:
+            logger.debug(f"Dropping evidence with locator not found in article: {locator}")
+            return None
 
-    # Guard 3: the locator must not point back at the fact-checker, unless it is a tool
-    kind = _parse_enum(record.get("source_kind"), SourceKind, SourceKind.OTHER)
-    try:
-        locator = unshorten(locator)
-    except Exception:
-        pass
-    host_keys = _host_keys(locator)
-    if kind != SourceKind.TOOL and host_keys & excluded_domains:
-        logger.debug(f"Dropping evidence pointing back at the fact-checker: {locator}")
-        return None
-    domain = get_domain(locator) or next(iter(host_keys), None)
-    if locator.rstrip("/") == str(review.url).rstrip("/"):
-        return None
+        # Guard 3: the locator must not point back at the fact-checker, unless it is a tool
+        locator = (resolved_locators or {}).get(locator) or locator
+        host_keys = _host_keys(locator)
+        if kind != SourceKind.TOOL and host_keys & excluded_domains:
+            logger.debug(f"Dropping evidence pointing back at the fact-checker: {locator}")
+            return None
+        domain = get_domain(locator) or next(iter(host_keys), None)
+        if locator.rstrip("/") == str(review.url).rstrip("/"):
+            return None
 
     source = EvidenceSource(
         name=str(record.get("source_name") or domain or "unknown").strip(),
         kind=kind,
-        locator=locator,
+        locator=locator or None,
         proximity=_parse_enum(record.get("source_proximity"), ProximityLevel,
                               ProximityLevel.SECONDARY),
     )
@@ -241,10 +281,14 @@ def build_evidence(
 
 def deduplicate(candidates: list[Evidence]) -> list[Evidence]:
     """Removes duplicates by (normalized locator, normalized proposition), keeping
-    the item with the higher extraction confidence. Sorted by role then confidence."""
+    the item with the higher extraction confidence. Sorted by role then confidence.
+
+    Items without a locator (tools, offline evidence) are deduplicated by their
+    proposition alone."""
     best: dict[tuple[str, str], Evidence] = {}
     for candidate in candidates:
-        key = (candidate.source.locator.rstrip("/").lower(),
+        locator = candidate.source.locator or ""
+        key = (locator.rstrip("/").lower(),
                " ".join(candidate.proposition.lower().split()))
         existing = best.get(key)
         if existing is None or candidate.extraction_confidence > existing.extraction_confidence:

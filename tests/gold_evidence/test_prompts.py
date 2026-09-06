@@ -41,11 +41,11 @@ def render_temporal(**overrides) -> str:
     kwargs = dict(
         claim="Someone claimed X.",
         claim_date="May 01, 2024",
+        proposition="The mayor signed the decree on 3 May.",
         source="An article about X.",
         source_name="Example News",
         source_url="https://example.org/a",
         available_since="May 10, 2024",
-        publisher_hint=None,
     )
     kwargs.update(overrides)
     return str(Prompt(f"{PROMPT_DIR}/validate_temporally.md.j2", **kwargs))
@@ -144,21 +144,27 @@ def test_temporal_prompt_sees_the_claim_but_asserts_no_verdict():
         assert word not in lowered
 
 
-def test_temporal_prompt_includes_the_registry_hint_when_given():
-    rendered = render_temporal(publisher_hint="'Snopes' is a known fact-checking organization.")
-    assert "Snopes" in rendered
-    assert "Registry note" in rendered
-    assert "Registry note" not in render_temporal()
-
-
-def test_temporal_prompt_asks_all_three_questions_in_one_call():
+def test_temporal_prompt_shows_the_proposition_it_judges():
+    """Without it the model would be asked about an empty proposition."""
     rendered = render_temporal()
-    assert re.search(r"^## A\.", rendered, re.MULTILINE)
-    assert re.search(r"^## B\.", rendered, re.MULTILINE)
-    assert re.search(r"^## C\.", rendered, re.MULTILINE)
-    assert "professional_fact_check" in rendered
-    assert "concurrent_fact_check" in rendered
-    assert "later_event" in rendered
+    assert "The mayor signed the decree on 3 May." in rendered
+    assert re.search(r"^## The Proposition$", rendered, re.MULTILINE)
+
+
+def test_temporal_prompt_without_source_content_says_so():
+    """Tools and offline evidence have no content to show; the model must know that
+    it is judging the proposition rather than an empty page."""
+    rendered = render_temporal(source="", source_url=None)
+    assert "cannot be retrieved" in rendered
+    assert "The mayor signed the decree on 3 May." in rendered
+
+
+def test_temporal_prompt_asks_for_the_later_event_judgement_directly():
+    """The model answers the field that is stored, so no answer gets inverted on
+    the way into `TemporalValidation`."""
+    rendered = render_temporal()
+    assert '"later_event"' in rendered
+    assert "true_at_t_c" not in rendered
 
 
 def test_assessment_prompt_forbids_recalling_the_fact_check():

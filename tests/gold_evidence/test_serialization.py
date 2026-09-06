@@ -51,16 +51,13 @@ def test_media_references_in_the_proposition_survive():
 def test_flat_columns_mirror_the_nested_fields():
     """The flat columns exist for querying; they must not drift from the blob."""
     evidence = make_evidence(available_since=datetime(2024, 4, 15),
-                             faithfulness=2 / 3, later_event=True,
-                             professional_fact_check=True, concurrent_fact_check=False)
+                             faithfulness=2 / 3, later_event=True)
     columns, values = _evidence_columns(evidence)
     row = dict(zip(columns, values))
 
     assert row["faithfulness_assessment"] == pytest.approx(2 / 3)
     assert row["before_claim"] is True
     assert row["later_event"] is True
-    assert row["professional_fact_check"] is True
-    assert row["concurrent_fact_check"] is False
     assert row["source_kind"] == SourceKind.NEWS_ARTICLE.value
     assert row["source_proximity"] == ProximityLevel.SECONDARY.value
     assert row["role"] == EvidenceRole.ESSENTIAL.value
@@ -92,6 +89,40 @@ def test_hashes_are_stable_and_distinguish_items():
     assert row_a["proposition_hash"] != row_b["proposition_hash"]
     # Deterministic across calls
     assert _evidence_columns(a)[1] == values_a
+
+
+def test_a_missing_locator_stays_null_in_the_columns():
+    """Both locator columns are nullable, so a source that is not a publication is
+    stored as what it is rather than as an empty string."""
+    from veritas.gold_evidence.models import SourceKind as Kind
+
+    evidence = make_evidence(locator=None, kind=Kind.OFFLINE, available_since=None)
+    columns, values = _evidence_columns(evidence)
+    row = dict(zip(columns, values))
+
+    assert row["source_locator"] is None
+    assert row["source_locator_hash"] is None
+    assert roundtrip(evidence).source.locator is None
+
+
+def test_a_present_locator_is_still_hashed():
+    evidence = make_evidence(locator="https://example.org/record/1")
+    columns, values = _evidence_columns(evidence)
+    row = dict(zip(columns, values))
+
+    assert row["source_locator"] == "https://example.org/record/1"
+    assert isinstance(row["source_locator_hash"], int)
+
+
+def test_the_deferral_window_is_flattened_and_restored():
+    from datetime import timedelta
+
+    evidence = make_evidence()
+    until = datetime.now() + timedelta(hours=24)
+    evidence.deferred_until = until
+    columns, values = _evidence_columns(evidence)
+    assert dict(zip(columns, values))["deferred_until"] == until
+    assert roundtrip(evidence).deferred_until == until
 
 
 # --- Claim columns ---------------------------------------------------------

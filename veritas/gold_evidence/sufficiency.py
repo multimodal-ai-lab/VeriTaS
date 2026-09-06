@@ -28,6 +28,7 @@ from veritas.gold_evidence import (
     proximity_threshold as default_threshold,
     reasoning_effort_sufficiency,
 )
+from veritas.gold_evidence.llm import FATAL_ERRORS
 from veritas.gold_evidence.closeness import (
     ENSEMBLE_MODES,
     MODE_FULL,
@@ -159,6 +160,9 @@ async def validate_sufficiency(
             predicted = await _predict_integrity(claim, evidence, result)
         else:
             predicted = await _predict_full(claim, evidence, result)
+    except FATAL_ERRORS:
+        # A degraded ensemble would silently reject the claim; abort the run instead.
+        raise
     except Exception as e:
         logger.warning(f"Sufficiency validation failed for claim {claim.id} "
                        f"({condition}): {type(e).__name__}: {e}")

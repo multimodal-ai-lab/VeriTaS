@@ -43,14 +43,35 @@ def is_domain_root(url: str | HttpUrl) -> bool:
         return False
 
 
-def unshorten(url: str) -> str:
+#: Domains whose URLs are mere redirects to the actual source.
+SHORTENER_DOMAINS = ["tinyurl.com", "bit.ly", "goo.gl", "youtu.be", "t.ly"]
+
+#: A shortener that does not answer promptly is not worth waiting for; the caller
+#: can still use the short URL, which resolves again when it is actually fetched.
+UNSHORTEN_TIMEOUT = 15
+
+
+async def unshorten(url: str, session: aiohttp.ClientSession | None = None) -> str:
     """If the URL is a TinyURL, returns the original (long) URL. Otherwise,
-    returns the input URL."""
-    domain = get_domain(url)
-    if domain in ["tinyurl.com", "bit.ly", "goo.gl", "youtu.be", "t.ly"]:
-        resp = requests.head(url, allow_redirects=True)
-        return resp.url
-    else:
+    returns the input URL.
+
+    Pass a `session` to reuse an open connection pool; without one, a short-lived
+    session is opened for the single request. A lookup that fails or times out
+    yields the input URL rather than raising: the short URL still points at the
+    same target, it just names it less explicitly."""
+    if get_domain(url) not in SHORTENER_DOMAINS:
+        return url
+
+    if session is None:
+        async with aiohttp.ClientSession(headers=HEADERS) as own_session:
+            return await unshorten(url, own_session)
+
+    try:
+        async with session.head(url, allow_redirects=True,
+                                timeout=aiohttp.ClientTimeout(total=UNSHORTEN_TIMEOUT)) as response:
+            return str(response.url)
+    except Exception as e:
+        logger.debug(f"Unable to unshorten {url}: {type(e).__name__}: {e}")
         return url
 
 

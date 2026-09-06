@@ -142,7 +142,7 @@ async def appearance_from_url(url: HttpUrl | str) -> Appearance | None:
     otherwise creates a new instance. If the URL is a web archive URL, resolves it to
     obtain the original URL. In that case, adds the archive URL to the Appearance."""
     # Ensure string is properly formatted/escaped and unshorten if it is a tinyurl
-    url_unshortened = unshorten(str(HttpUrl(url)))
+    url_unshortened = await unshorten(str(HttpUrl(url)))
 
     # Resolve archive URL
     if is_archiving_url(url_unshortened):

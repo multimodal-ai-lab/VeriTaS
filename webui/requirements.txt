@@ -1,0 +1,7 @@
+# Dependencies of the Gold Evidence web UI only. Deliberately independent of the
+# pipeline's requirements.txt: this service never imports `veritas`, so it needs
+# neither the LLM SDKs nor the scraping stack.
+fastapi~=0.121.0
+uvicorn[standard]~=0.41.0
+asyncpg~=0.31.0
+PyYAML~=6.0.2

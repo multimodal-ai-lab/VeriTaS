@@ -93,7 +93,6 @@ gold_evidence:
   max_reviews_per_claim: 2
   max_source_content_length: 30_000
   max_article_length: 50_000
-  concurrency: 20
   max_video_size:  # Null -> inherit pipeline.global.max_video_size
 
   # Reconstruction run (scripts/gold_evidence/run_reconstruction.py). The script
@@ -111,6 +110,14 @@ gold_evidence:
     skip_sufficiency: False  # Run Stages 1-2 only (useful to pre-fill the evidence table)
     dry_run: False  # Only report which claims would be processed
     log_level: "INFO"
+
+  # Concurrency. These nest: `claim_concurrency` claims run at once, and each
+  # filters up to `evidence_concurrency` of its evidence items at once, so the
+  # peak number of in-flight retrievals and LLM calls is their product.
+  claim_concurrency: 6       # claims reconstructed at once
+  evidence_concurrency: 8    # evidence items filtered at once within one claim
+  analysis_concurrency: 10   # claims processed at once by the temporal analysis
+
 
 api_secrets:
   openai:

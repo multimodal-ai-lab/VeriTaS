@@ -35,18 +35,13 @@ from datetime import datetime
 from veritas import globals, logger
 from veritas.db import db
 from veritas.gold_evidence import (
-    STATUS_EXTRACTED,
-    STATUS_FILTERED,
-    STATUS_PENDING,
+    RESUMABLE_STATUSES,
     ensemble_mode,
     proximity_threshold,
 )
 from veritas.gold_evidence.pipeline import reconstruct_claims, summarize
 from veritas.models import QuotaExceededError, RateLimitError
 from veritas.util.util import get_quarter_date_range
-
-#: Statuses that a re-run should pick up again (incomplete work).
-RESUMABLE_STATUSES = ["unprocessed", STATUS_PENDING, STATUS_EXTRACTED, STATUS_FILTERED]
 
 _cfg: dict = (globals.get("gold_evidence") or {}).get("reconstruction") or {}
 
@@ -68,7 +63,6 @@ include_unreleased: bool = bool(_get("include_unreleased", False))
 redo: bool = bool(_get("redo", False))
 re_extract: bool = bool(_get("re_extract", False))
 re_filter: bool = bool(_get("re_filter", False))
-skip_sufficiency: bool = bool(_get("skip_sufficiency", False))
 dry_run: bool = bool(_get("dry_run", False))
 log_level: str = _get("log_level", "INFO")
 
@@ -104,16 +98,21 @@ async def main() -> None:
 
     processed = 0
     all_outcomes = []
+    # Claims stay selectable while their status is resumable, and a claim that ends
+    # up deferred or errored keeps such a status. Excluding what this run already
+    # touched keeps the batches moving forward instead of re-serving the same rows.
+    handled: list[int] = []
     try:
         while processed < limit:
             this_batch_size = min(batch_size, limit - processed)
             claims = await db.get_claims_for_gold_evidence(
                 limit=this_batch_size, start_date=start_date, end_date=end_date,
                 statuses=statuses, released_first=not include_unreleased,
-                claim_ids=claim_ids)
+                claim_ids=claim_ids, exclude_claim_ids=handled)
             if not claims:
                 logger.info("No further claims to process.")
                 break
+            handled.extend(claim.id for claim in claims)
 
             outcomes = await reconstruct_claims(
                 claims,
@@ -121,16 +120,10 @@ async def main() -> None:
                 threshold=proximity_threshold,
                 re_extract=re_extract,
                 re_filter=re_filter,
-                skip_sufficiency=skip_sufficiency,
             )
             all_outcomes.extend(outcomes)
             processed += len(claims)
             logger.info(f"Processed {processed}/{limit} claims.")
-
-            if redo or claim_ids:
-                # These selections are not self-consuming, so stop after one batch
-                # to avoid processing the same claims again.
-                break
 
     except (QuotaExceededError, RateLimitError) as e:
         logger.error(f"Aborting run: {e}")

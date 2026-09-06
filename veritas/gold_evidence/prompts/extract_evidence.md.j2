@@ -44,10 +44,10 @@ Output a single fenced JSON code block containing a list of objects. Use exactly
 
 # Rules
 * **Do NOT extract** the fact-checker's own interpretation or reasoning, conclusions that are not backed by an external source, or the final verdict itself.
-* Every evidence item **must have an independently locatable source**. If you cannot name a locator that appears in the article, drop the item.
+* Every evidence item **must have an independently locatable source**, with the two exceptions below (tools and offline evidence). If you cannot name a locator that appears in the article, drop the item.
 * The source must be the **original source**, not the fact-check article quoting it. Never use {{ publisher_name }}'s own URL as a locator, and never use the article's own URL.
-* If the evidence originates from a **tool** used by the fact-checker, use the tool's webpage, documentation or source repository as the locator and set `source_kind` to `tool`.
-* If the evidence doesn't originate from the web (e.g., a phone call, interview, etc.), leave `source_locator` empty and set `source_kind` to `offline`.
+* If the evidence originates from a **tool** used by the fact-checker, use the tool's webpage, documentation or source repository as the locator and set `source_kind` to `tool`. If the tool has no such page, leave `source_locator` empty.
+* If the evidence doesn't originate from the web (e.g., a phone call, interview, etc.), leave `source_locator` empty and set `source_kind` to `offline`. Name who was spoken to in `source_name`.
 * `source_proximity`: `primary` = first-hand material produced by a party directly involved (the original post, an eyewitness recording, an official register, a tool's own output); `secondary` = reporting, analysis or aggregation of primary material; `tertiary` = compilations of secondary material (encyclopedia, etc.).
 * `role`: `essential` = the verdict does not hold without this evidence; `auxiliary` = it corroborates or refines essential evidence; `background` = context only, no probative weight on its own.
 * `confidence` is a number in [0, 1] expressing how certain you are that the fact-checker actually used this evidence for the verdict.

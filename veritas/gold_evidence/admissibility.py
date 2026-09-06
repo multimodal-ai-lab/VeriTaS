@@ -6,7 +6,7 @@ the headline numbers is fully unit-testable and auditable.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from enum import Enum
 from typing import Iterable
 
@@ -30,29 +30,37 @@ class InadmissibilityReason(str, Enum):
     UNDATED = "undated_source"  # §3.1 / §3.3, see `undated_policy`
     UNFAITHFUL = "unfaithful"  # §3.2
     AFTER_FACT_CHECK = "after_fact_check"  # §3.3 (1), t_e > t_f
-    VERDICT_LEAK = "concurrent_fact_check"  # §3.3 (2)
+    VERDICT_LEAK = "fact_check_source"  # §3.3 (2)
     LATER_EVENT = "later_event"  # §3.3 (3)
 
 
-#: Evaluation order. The first violated criterion becomes the recorded reason.
+#: Evaluation order. The first violated criterion becomes the recorded reason, so
+#: the reported reasons partition the rejected items rather than double-counting.
 REASON_ORDER = (
+    InadmissibilityReason.VERDICT_LEAK,  # decidable from the source alone
     InadmissibilityReason.NOT_FILTERED,
     InadmissibilityReason.LOW_CONFIDENCE,
     InadmissibilityReason.INACCESSIBLE,
     InadmissibilityReason.UNDATED,  # checked after the completeness re-check below
     InadmissibilityReason.UNFAITHFUL,
     InadmissibilityReason.AFTER_FACT_CHECK,
-    InadmissibilityReason.VERDICT_LEAK,
     InadmissibilityReason.LATER_EVENT,
 )
 
+#: Source kinds that are not publications at all, so §3.1 and §3.2 do not apply to
+#: them: a tool is an instrument, and offline evidence (a phone call, an interview)
+#: never went online. Neither has to carry a locator or a publication time; they are
+#: admitted on the extraction alone, subject to the dating policy below.
+UNRETRIEVABLE_KINDS = (SourceKind.TOOL, SourceKind.OFFLINE)
+
 #: How to treat sources without a determinable publication time (`t_e is None`).
-#: - "tool_only" (default): keep only sources of kind TOOL. Evidence that cannot be
-#:   dated cannot be shown to predate the cutoff, so keeping it would bias the
-#:   analysis towards "gold verdict recoverable". Tools are instruments rather than
-#:   observations and carry no meaningful release time, so they are exempt.
+#: - "tool_only" (default): keep only the `UNRETRIEVABLE_KINDS`. Evidence that cannot
+#:   be dated cannot be shown to predate the cutoff, so keeping it would bias the
+#:   analysis towards "gold verdict recoverable". Tools and offline evidence are
+#:   exempt because they are not publications and have no release time to find:
+#:   requiring one would discard them categorically rather than on the merits.
 #: - "permissive": keep all undated sources.
-#: - "strict": discard all undated sources, including tools.
+#: - "strict": discard all undated sources, including tools and offline evidence.
 UNDATED_POLICIES = ("tool_only", "permissive", "strict")
 
 
@@ -65,13 +73,13 @@ def keeps_undated(kind: SourceKind, undated_policy: str = None) -> bool:
         return True
     if undated_policy == "strict":
         return False
-    return kind == SourceKind.TOOL
+    return kind in UNRETRIEVABLE_KINDS
 
 
 def compute_temporal_bounds(
-        available_since: date | datetime | None,
-        t_c: date | datetime | None,
-        t_f: date | datetime | None,
+        available_since: datetime | None,
+        t_c: datetime | None,
+        t_f: datetime | None,
 ) -> tuple[bool, bool]:
     """Returns `(before_claim, before_fact_check)`, i.e. whether `t_e <= t_c` and
     `t_e <= t_f`. An unknown `t_e` (or an unknown reference time) is *not* counted
@@ -96,38 +104,51 @@ def determine_inadmissibility(
     admissible. Admissibility is evaluated against the *loose* cutoff `t_f`;
     the strict condition `E_claim` is a pure filter on `before_claim` afterwards
     (valid because `t_c <= t_f` always holds).
+
+    Items of an `UNRETRIEVABLE_KINDS` source skip the accessibility and faithfulness
+    criteria - there is nothing to retrieve and nothing to re-read - and are decided
+    by the extraction confidence and the dating policy alone.
     """
     if faithfulness_threshold is None:
         faithfulness_threshold = default_faithfulness_threshold
     if min_extraction_confidence is None:
         min_extraction_confidence = default_min_confidence
 
-    if evidence.accessible is None:
+    kind = evidence.source.kind
+    exempt = kind in UNRETRIEVABLE_KINDS
+
+    # A source that is itself a professional fact-check leaks the verdict, whether it
+    # was extracted as one or identified as one by the publisher registry (§3.3 (2)).
+    # This holds regardless of whether the item was ever filtered.
+    if kind == SourceKind.FACT_CHECK:
+        return InadmissibilityReason.VERDICT_LEAK
+
+    if not exempt and evidence.accessible is None:
         return InadmissibilityReason.NOT_FILTERED
 
     if evidence.extraction_confidence < min_extraction_confidence:
         return InadmissibilityReason.LOW_CONFIDENCE
 
-    if not evidence.accessible:
-        return InadmissibilityReason.INACCESSIBLE
+    if not exempt:
+        if not evidence.accessible:
+            return InadmissibilityReason.INACCESSIBLE
 
-    # An accessible item without these was interrupted mid-filtering; report that
-    # rather than a substantive reason it was never actually evaluated for.
-    if evidence.faithfulness is None or evidence.temporal_validation is None:
-        return InadmissibilityReason.NOT_FILTERED
+        # An accessible item without these was interrupted mid-filtering; report that
+        # rather than a substantive reason it was never actually evaluated for.
+        if evidence.faithfulness is None or evidence.temporal_validation is None:
+            return InadmissibilityReason.NOT_FILTERED
 
-    if evidence.available_since is None and not keeps_undated(evidence.source.kind, undated_policy):
+    if evidence.available_since is None and not keeps_undated(kind, undated_policy):
         return InadmissibilityReason.UNDATED
 
-    if evidence.faithfulness.assessment < faithfulness_threshold:
+    if not exempt and evidence.faithfulness.assessment < faithfulness_threshold:
         return InadmissibilityReason.UNFAITHFUL
 
     temporal = evidence.temporal_validation
-    if not temporal.before_fact_check:
+    if temporal is not None and not temporal.before_fact_check:
         return InadmissibilityReason.AFTER_FACT_CHECK
-    if temporal.leaks_verdict:
-        return InadmissibilityReason.VERDICT_LEAK
-    if temporal.later_event:
+
+    if temporal is not None and temporal.later_event:
         return InadmissibilityReason.LATER_EVENT
 
     return None
@@ -153,7 +174,11 @@ def in_condition(evidence: Evidence, condition: str) -> bool:
         return True
     if condition == CONDITION_CLAIM:
         temporal = evidence.temporal_validation
-        return bool(temporal and temporal.before_claim)
+        if temporal is not None:
+            return temporal.before_claim
+        # Items exempt from Stage 2 carry no temporal validation. An unknown t_e
+        # satisfies both cutoffs, exactly as `compute_temporal_bounds` treats it.
+        return evidence.available_since is None
     raise ValueError(f"Unknown condition: {condition}")
 
 

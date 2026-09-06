@@ -10,12 +10,16 @@ order is:
 4. only if step 2 found nothing, have a cheap LLM read a publication time off the
    converted content.
 
-scrapeMM's ``html`` format is only served by its Firecrawl and Decodo backends. For
-sources it handles through a dedicated API integration (social media, archiving
-services, video platforms) that request comes back unsuccessful, and the source is
-then retrieved through scrapeMM again in its default ``multimodal_sequence``
-format. That path yields no HTML, hence no meta tags, so its publication time is
-determined by step 4.
+scrapeMM's ``html`` format is only served by its Firecrawl and Decodo backends, and
+step 1 is restricted to those two accordingly. Sources that scrapeMM handles through
+a dedicated API integration (social media, archiving services, video platforms)
+therefore come back unsuccessful and are recorded as inaccessible - there is no
+second attempt in scrapeMM's default ``multimodal_sequence`` format.
+
+A source that merely rate-limited us is *not* inaccessible: the retrieval reports
+``rate_limited`` and the caller defers the item (see `filtering.filter_single`).
+An exhausted scrapeMM quota is a run-level condition and is raised as VeriTaS'
+``QuotaExceededError``.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import aiohttp
 from ezmm import MultimodalSequence
 from scrapemm import RateLimitError as ScrapeRateLimitError, retrieve
 from scrapemm.common import ScrapingResponse
+from scrapemm.common.exceptions import QuotaExceededError as ScrapeQuotaExceededError
 from scrapemm.retrieval import postprocess_media
 from scrapemm.util import preprocess_url, to_multimodal_sequence
 
@@ -39,7 +44,9 @@ from veritas.gold_evidence import (
     max_video_size,
     reasoning_effort_dating,
 )
-from veritas.gold_evidence.llm import resolve_model
+from veritas.gold_evidence.llm import FATAL_ERRORS, resolve_model
+from veritas.gold_evidence.models import to_naive
+from veritas.models import QuotaExceededError
 from veritas.pipeline.stage_3 import extract_date_meta
 from veritas.util.parsing import determine_date
 from veritas.util.scraping import HEADERS
@@ -90,7 +97,12 @@ async def retrieve_source(locator: str,
     try:
         result = await _retrieve_via_html(url, session)
     except ScrapeRateLimitError as e:
+        # Per-source condition: the item is deferred, not judged.
         return SourceRetrieval(accessible=False, error=str(e), rate_limited=True)
+    except ScrapeQuotaExceededError as e:
+        # Run-level condition: continuing would silently mark every remaining
+        # source inaccessible, so it aborts the run like any other quota error.
+        raise QuotaExceededError(f"scrapeMM quota exhausted: {e}") from e
     except Exception as e:
         logger.debug(f"Retrieval of evidence source {url} failed: {type(e).__name__}: {e}")
         return SourceRetrieval(accessible=False, error=f"{type(e).__name__}: {e}")
@@ -108,7 +120,8 @@ async def _retrieve_via_html(url: str, session: aiohttp.ClientSession) -> Source
     """Steps 1-3: scrapeMM's HTML format, its meta tags, and its HTML converter."""
     # Step 1
     response = await retrieve(url, show_progress=False, format="html",
-                              methods=HTML_METHODS, prioritize="completeness")
+                              methods=HTML_METHODS, prioritize="completeness",
+                              max_video_size=max_video_size)
     if not isinstance(response, ScrapingResponse):
         return SourceRetrieval(accessible=False, format="html",
                                error="scrapeMM did not return a ScrapingResponse.")
@@ -140,11 +153,16 @@ async def _retrieve_via_html(url: str, session: aiohttp.ClientSession) -> Source
 
 
 def _failed(response: ScrapingResponse, *, format: str) -> SourceRetrieval:
-    """Turns an unsuccessful scrapeMM response into a SourceRetrieval."""
+    """Turns an unsuccessful scrapeMM response into a SourceRetrieval.
+
+    scrapeMM reports most conditions inside the response rather than by raising, so
+    an exhausted quota is recognized here too and aborts the run either way."""
     error = None
     rate_limited = False
     if response.errors:
         first = list(response.errors.values())[0]
+        if isinstance(first, ScrapeQuotaExceededError):
+            raise QuotaExceededError(f"scrapeMM quota exhausted: {first}")
         error = str(first) or type(first).__name__
         rate_limited = isinstance(first, ScrapeRateLimitError)
     return SourceRetrieval(accessible=False, method=response.method, format=format,
@@ -157,7 +175,8 @@ async def _to_multimodal_sequence(html: str, url: str,
     the page are downloaded and inlined exactly as `scrapemm.retrieve` would.
 
     Only the arguments scrapeMM passes internally are used: any extra keyword would
-    be forwarded down to `aiohttp`'s `session.get`."""
+    be forwarded down to `aiohttp`'s `session.get`. `max_video_size` in particular
+    belongs to `retrieve` and is rejected here, so it is applied in step 1."""
     try:
         content = await to_multimodal_sequence(html, session=session, url=url)
     except Exception as e:
@@ -177,7 +196,7 @@ async def _to_multimodal_sequence(html: str, url: str,
 def _date_from_meta(html: str) -> datetime | None:
     """Step 2: publication time from the page's standard meta tags (reuses stage 3)."""
     try:
-        return extract_date_meta(html)
+        return to_naive(extract_date_meta(html))
     except Exception:
         return None
 
@@ -202,6 +221,8 @@ async def determine_publication_time_llm(url: str,
         response = await model.generate(prompt, extract="last_code_span",
                                         resolve_media=False,
                                         reasoning_effort=reasoning_effort_dating)
+    except FATAL_ERRORS:
+        raise
     except Exception as e:
         logger.debug(f"Could not determine publication time for {url}: {e}")
         return None
@@ -211,4 +232,4 @@ async def determine_publication_time_llm(url: str,
     answer = str(response).strip()
     if not answer or answer.lower() in ("none", "null", "unknown", "n/a"):
         return None
-    return determine_date(answer)
+    return to_naive(determine_date(answer))

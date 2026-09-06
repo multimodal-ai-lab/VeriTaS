@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Gold Evidence Viewer &middot; VeriTaS</title>
+    <meta name="description" content="Browse the evidence reconstructed by the VeriTaS Gold Evidence Reconstruction pipeline.">
+
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%235b5bd6'/><path d='M28 52l16 16 28-34' stroke='white' stroke-width='11' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet"
+          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+    <link rel="stylesheet"
+          href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+          crossorigin="anonymous" referrerpolicy="no-referrer">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="app">
+    <header class="topbar">
+        <a class="brand" href="#/">
+            <span class="mark"><i class="fa-solid fa-scale-balanced"></i></span>
+            <span>
+                <span class="name">Gold Evidence</span>
+                <span class="sub">VeriTaS reconstruction viewer</span>
+            </span>
+        </a>
+
+        <nav class="nav" id="nav">
+            <a href="#/" data-route="overview"><i class="fa-solid fa-chart-pie"></i><span>Overview</span></a>
+            <a href="#/claims" data-route="claims"><i class="fa-solid fa-list-check"></i><span>Claims</span></a>
+        </nav>
+
+        <div class="topbar-spacer"></div>
+
+        <div class="health" id="health" title="Backend status">
+            <span class="dot"></span><span class="text">connecting</span>
+        </div>
+        <button class="icon-btn" id="theme-toggle" title="Toggle light/dark theme" aria-label="Toggle theme">
+            <i class="fa-solid fa-moon"></i>
+        </button>
+    </header>
+
+    <main id="view" aria-live="polite"></main>
+
+    <footer>
+        <span><i class="fa-solid fa-database"></i> Read-only view of the VeriTaS database</span>
+        <span><i class="fa-solid fa-book"></i> See <code>veritas/gold_evidence/README.md</code> for the pipeline</span>
+        <span id="version"></span>
+    </footer>
+</div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

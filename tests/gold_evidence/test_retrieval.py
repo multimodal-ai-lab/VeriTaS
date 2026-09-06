@@ -2,7 +2,8 @@
 
 Everything goes through scrapeMM. The prescribed order is: HTML format -> meta-tag
 publication time -> scrapeMM's HTML-to-MultimodalSequence conversion -> LLM dating
-only if the meta tags carried nothing.
+only if the meta tags carried nothing. There is no second attempt in scrapeMM's
+default format: a source its HTML backends cannot serve is inaccessible.
 """
 
 from datetime import datetime
@@ -26,7 +27,6 @@ def scrapemm(monkeypatch):
         "calls": [],
         "html": "<html><head></head><body>page</body></html>",
         "html_response": None,       # set to override the html-format response
-        "sequence_response": None,   # set to override the default-format response
         "meta_date": None,
         "llm_date": None,
         "llm_calls": [],
@@ -38,14 +38,9 @@ def scrapemm(monkeypatch):
                             methods="auto", prioritize="completeness", **kwargs):
         state["calls"].append({"url": url, "format": format, "methods": methods,
                                "kwargs": kwargs})
-        if format == "html":
-            if state["html_response"] is not None:
-                return state["html_response"]
-            return ScrapingResponse(url=url, content=state["html"], method="firecrawl")
-        if state["sequence_response"] is not None:
-            return state["sequence_response"]
-        return ScrapingResponse(url=url, content=MultimodalSequence(PAGE),
-                                method="integrations")
+        if state["html_response"] is not None:
+            return state["html_response"]
+        return ScrapingResponse(url=url, content=state["html"], method="firecrawl")
 
     async def fake_convert(html, session=None, url=None):
         state["converted_from"] = html
@@ -137,62 +132,58 @@ async def test_media_are_postprocessed_into_the_ezmm_store(scrapemm):
     assert scrapemm["postprocessed"] == [scrapemm["converted"]]
 
 
-# --- Fallback to the default format ----------------------------------------
+# --- Sources the HTML backends cannot serve --------------------------------
 
 @pytest.mark.asyncio
-async def test_falls_back_when_html_is_unavailable(scrapemm):
+async def test_no_second_attempt_in_the_default_format(scrapemm):
     """Integration-served sources (social media, archives) cannot deliver HTML;
     scrapeMM reports that as an unsuccessful response, not an exception."""
     scrapemm["html_response"] = failed_response(
         AssertionError("'html' format is only compatible with 'firecrawl' and 'decodo'"))
     result = await retrieve_source("https://x.com/a/status/1")
 
-    assert result.accessible
-    assert result.format == "multimodal_sequence"
-    assert [call["format"] for call in scrapemm["calls"]] == ["html", "multimodal_sequence"]
+    assert result.accessible is False
+    assert [call["format"] for call in scrapemm["calls"]] == ["html"]
 
 
 @pytest.mark.asyncio
-async def test_fallback_is_dated_by_the_llm(scrapemm):
-    scrapemm["html_response"] = failed_response(AssertionError("no html"))
-    scrapemm["llm_date"] = datetime(2024, 5, 3)
-    result = await retrieve_source("https://x.com/a/status/1")
-
-    assert result.available_since == datetime(2024, 5, 3)
-    assert result.dating_method == "llm"
-
-
-@pytest.mark.asyncio
-async def test_inaccessible_when_both_formats_fail(scrapemm):
+async def test_the_failure_is_reported(scrapemm):
     scrapemm["html_response"] = failed_response(Exception("html failed"))
-    scrapemm["sequence_response"] = failed_response(Exception("sequence failed"))
     result = await retrieve_source("https://example.org/gone")
 
     assert result.accessible is False
     assert "html failed" in result.error
-    assert "sequence failed" in result.error
 
 
 @pytest.mark.asyncio
 async def test_insufficient_content_is_not_accessible(scrapemm):
     scrapemm["converted"] = MultimodalSequence("404")
-    scrapemm["sequence_response"] = failed_response(Exception("nothing there"))
     result = await retrieve_source("https://example.org/empty")
     assert result.accessible is False
 
 
 @pytest.mark.asyncio
-async def test_meta_date_survives_the_fallback(scrapemm):
+async def test_a_meta_date_is_kept_even_when_the_content_is_unusable(scrapemm):
     """HTML came back but converted to nothing usable; its meta date is still valid."""
     scrapemm["meta_date"] = datetime(2024, 5, 10)
     scrapemm["converted"] = MultimodalSequence("404")
     result = await retrieve_source("https://example.org/a")
 
-    assert result.accessible
-    assert result.format == "multimodal_sequence"
+    assert result.accessible is False
     assert result.available_since == datetime(2024, 5, 10)
     assert result.dating_method == "meta"
     assert scrapemm["llm_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_video_size_cap_is_forwarded(scrapemm):
+    """scrapeMM applies it while downloading the page's media."""
+    from veritas.gold_evidence import max_video_size
+
+    await retrieve_source("https://example.org/a")
+    kwargs = scrapemm["calls"][0]["kwargs"]
+    assert "max_video_size" in kwargs
+    assert kwargs["max_video_size"] == max_video_size
 
 
 # --- Rate limiting ---------------------------------------------------------
@@ -233,7 +224,19 @@ async def test_unexpected_errors_do_not_propagate(scrapemm, monkeypatch):
 @pytest.mark.asyncio
 async def test_non_response_return_value_is_handled(scrapemm):
     scrapemm["html_response"] = "not a ScrapingResponse"
-    scrapemm["sequence_response"] = "not a ScrapingResponse"
     result = await retrieve_source("https://example.org/a")
     assert result.accessible is False
     assert "ScrapingResponse" in result.error
+
+
+@pytest.mark.asyncio
+async def test_scrapemm_quota_aborts_the_run(scrapemm):
+    """Unlike a rate limit, an exhausted quota is not a per-source outcome - and
+    scrapeMM reports it inside the response rather than by raising."""
+    from scrapemm.common.exceptions import QuotaExceededError as ScrapeQuota
+
+    from veritas.models import QuotaExceededError
+
+    scrapemm["html_response"] = failed_response(ScrapeQuota("no credits left"))
+    with pytest.raises(QuotaExceededError):
+        await retrieve_source("https://example.org/a")

@@ -120,30 +120,39 @@ the dedicated field the provider's API returns it in (see §18). They are stored
 separately because they are different evidence about the judgement: the first is
 what the model claims, the second is how it got there.
 
-## 7. The three temporal judgements are one call
+## 7. Verdict leakage is decided by the registry, later events by one LLM call
 
-**Decision.** Whether the source is a professional fact-check, whether it addresses
-the same claim, and whether it reports a post-`t_c` later event are decided in a
-single LLM call per evidence item. The two purely temporal comparisons
-(`t_e <= t_c`, `t_e <= t_f`) are computed, not predicted. When an item already
-fails the cutoff, the call is skipped entirely.
+**Decision.** The two purely temporal comparisons (`t_e <= t_c`, `t_e <= t_f`) are
+computed, not predicted. Whether a source is a professional fact-check is decided by
+VeriTaS' own publisher registry: a locator whose publisher is an IFCN or EFCSN
+signatory is recorded as `SourceKind.FACT_CHECK` and rejected as a verdict leak. The
+one remaining judgement — does the source report a post-`t_c` event that changed the
+factual basis? — is a single LLM call, made only for items inside the studied
+interval `t_c < t_e <= t_f`, where the dates alone cannot rule that contamination out.
 
-**Rationale.** The three judgements share the same evidence and the same reading of
-it, so splitting them triples cost without adding independence — the same model
-would answer all three from the same context anyway. Computing the date
-comparisons rather than asking removes a needless source of model error.
+**Rationale.** The registry is a curated, auditable list, so the leakage criterion
+does not depend on a model's opinion about what counts as a fact-check. Restricting
+the LLM call to the interval also removes the cost for the majority of items: an
+item that already existed when the claim was made cannot report on anything that
+happened afterwards, and one that postdates `t_f` is out regardless.
 
-**Registry prior.** Where VeriTaS already knows the source's publisher, its
-IFCN/EFCSN signatory status is passed as a *hint*, not a hard rule: signatory
-status is strong positive evidence, but absence from the registry is uninformative
-because the registry only covers organizations VeriTaS has crawled.
+**Answer polarity.** The prompt asks for the field that is stored — `later_event` —
+rather than for its complement, so no answer is inverted between the model and the
+record. An unparseable answer leaves `later_event` at its default `false` and the
+item is decided by the remaining criteria.
+
+**Not asked: concurrency.** An earlier design also asked whether a fact-check
+addressed *the same* claim, and kept non-concurrent fact-checks. That judgement was
+dropped: every professional fact-check is now treated as a leak, whatever it covers
+and whenever it appeared. This is the conservative direction — it can only shrink
+the evidence sets — and it removes a model judgement that was hard to audit.
 
 ## 8. Admissibility is evaluated once, against the loose cutoff
 
 **Decision.** An item is admissible iff it is accessible, faithful above threshold,
-datable under the undated policy, available by `t_f`, not a concurrent professional
-fact-check of the same claim, and not a later-event report. `E_factcheck` is the
-admissible set; `E_claim` is the pure sub-filter `t_e <= t_c`.
+datable under the undated policy, available by `t_f`, not itself a professional
+fact-check, and not a later-event report. `E_factcheck` is the admissible set;
+`E_claim` is the pure sub-filter `t_e <= t_c`.
 
 **Rationale.** `t_c <= t_f` always, and the leakage and later-event criteria are
 anchored at `t_c` regardless of the cutoff, so the strict condition is a subset of
@@ -152,26 +161,53 @@ comparison in §13 would be uninterpretable otherwise — and halves the filteri
 cost, since no item is judged twice.
 
 **Reason ordering.** An item violating several criteria is attributed to the first
-in a fixed order (inaccessible → undated → unfaithful → after cutoff → verdict leak
+in a fixed order (verdict leak → inaccessible → undated → unfaithful → after cutoff
 → later event), so the reported rejection reasons partition the rejected items
 rather than double-counting them.
 
-## 9. Undated sources are excluded unless they are tools
+**Sources that cannot be retrieved.** Tools and offline evidence (a phone call, an
+interview) are not publications: they have nothing to re-read and need not carry a
+locator. Accessibility and faithfulness therefore do not apply to them, and they are
+admitted on the extraction alone. Judging them by criteria they cannot satisfy would
+have discarded every tool-derived finding and every fact-checker interview
+categorically, rather than on their merits.
+
+**But a known `t_e` is binding.** The temporal criteria are *not* waived: as soon as
+such an item carries a publication time, it is placed on the timeline like any other
+evidence — both cutoffs are computed from it, and an item inside the interval is
+asked the later-event question, with the proposition and the source metadata standing
+in for the content that cannot be retrieved. Only the *absence* of a date is
+tolerated (§9), never a date that violates the cutoff.
+
+## 9. Undated sources are excluded unless they are not publications
 
 **Decision.** Default policy `tool_only`: an item whose source has no determinable
-publication time is admissible only if its source kind is `TOOL`. Configurable to
-`permissive` (keep all) or `strict` (keep none).
+publication time is admissible only if its source kind is `TOOL` or `OFFLINE`.
+Configurable to `permissive` (keep all) or `strict` (keep none, including those two).
 
 **Rationale.** Evidence that cannot be dated cannot be shown to predate the cutoff.
 Keeping it would silently inflate both evidence sets and bias the analysis toward
 "gold verdict recoverable" — precisely the direction that would weaken the paper's
-central claim if it were an artefact. Tools are exempt because they are instruments
-rather than observations: a geolocation service has no meaningful release time, and
-its availability is not what the temporal analysis is about.
+central claim if it were an artefact. Tools and offline evidence are exempt because
+they are instruments and conversations rather than publications: a geolocation
+service has no meaningful release time, and neither has a phone call to an expert.
+For them, "undated" is not a gap in the record but a property of the source type,
+and excluding them would measure the source type rather than the evidence.
+
+**Consequence, and it cuts the other way.** An undated item counts as satisfying
+both cutoffs (§8), so exempted tools and offline evidence enter `E_claim` as well —
+including an interview the fact-checker conducted *during* the fact-checking period,
+which by construction did not exist at `t_c`. This applies only while such an item
+carries no date: as soon as one is known, the cutoffs are computed from it like for
+any other evidence (§8). It is nonetheless the one place where the default policy is
+generous towards `E_claim`, i.e. against finding that the fact-checking period was
+necessary. The `strict` policy removes exactly these items and is the sensitivity
+analysis to report alongside.
 
 **Reporting.** The exports carry `n_undated` per claim and `undated_source` as a
 rejection reason, so the size of this decision is quantified. Re-running with
-`permissive` gives a one-flag sensitivity analysis; reporting both is advisable.
+`permissive` or `strict` gives a one-flag sensitivity analysis; reporting the
+default and `strict` is advisable.
 
 ## 10. Publication time is read from the page, not inferred
 
@@ -199,15 +235,20 @@ exactly the same stack — anti-bot handling, archive resolution, media download
 that the benchmark already uses for claim appearances, so accessibility here is
 comparable to accessibility there rather than being a different measurement.
 
-**Platform fallback.** scrapeMM serves its `html` format only through the Firecrawl
-and Decodo backends; sources it handles through a dedicated API integration
-(social media, archiving services, video platforms) return an unsuccessful
-response for that request. Those are then retrieved through scrapeMM again in its
-default `multimodal_sequence` format. This is not a mere optimization detail:
-fact-checks cite social-media posts heavily, and scoring them "inaccessible"
-because they cannot emit HTML would bias the accessibility statistics against
-exactly the source type the benchmark cares about most. Such sources yield no meta
-tags, so their publication time comes from the LLM step.
+**No platform fallback.** scrapeMM serves its `html` format only through the
+Firecrawl and Decodo backends; sources it handles through a dedicated API
+integration (social media, archiving services, video platforms) return an
+unsuccessful response and are recorded as inaccessible. There is no second attempt
+in scrapeMM's default `multimodal_sequence` format. Since fact-checks cite
+social-media posts heavily, this biases the accessibility statistics against
+exactly that source type, and the `inaccessible` rejection rate must be read with
+that in mind (see the limitations below).
+
+**Rate limits are not inaccessibility.** A source that only throttled us is left
+entirely unjudged and retried after `defer_hours`; the claim it belongs to is put on
+status `deferred` rather than rejected. Recording a temporary condition as a
+permanent one would inflate the reported `inaccessible` share and reject instances
+on an incomplete evidence set.
 
 **Media are downloaded.** Images and video referenced by an evidence source are
 retrieved and inlined, so the sufficiency validator sees what the fact-checker saw.
@@ -307,8 +348,8 @@ undated count, per-condition evidence-set sizes, per-condition recoverability an
 maximum property distance, gold scores, status and rejection reason.
 
 Per evidence item: source name, type, proximity, role, locator, `t_e`, `t_e − t_c`,
-`t_e − t_f`, in-window flag, modality, faithfulness, all temporal flags,
-admissibility and rejection reason.
+`t_e − t_f`, in-window flag, modality, faithfulness, the temporal flags,
+admissibility, rejection reason and whether the item is currently deferred.
 
 Aggregate: share of claims with post-claim/pre-fact-check evidence; number and
 fraction of items in the interval; distributions of `t_e − t_c`, `t_e − t_f`,
@@ -368,7 +409,12 @@ items, so the call-level trace cannot be attributed to an individual item.
    metadata as stored in `reviews.published`; silent post-publication edits are
    not visible, and claims whose reviews carry no publication time are excluded
    (§5), which may not be missing at random across outlets.
-6. **Later-event judgement is the hardest call.** Distinguishing "the source
+6. **Sources that cannot deliver HTML are lost.** Retrieval is HTML-only (§11), so
+   social-media posts, archiving services and video platforms count as inaccessible
+   even when scrapeMM could reach them through an API integration. This depresses
+   the admissible share for exactly the source type fact-checks cite most, and
+   `inaccessible` therefore mixes genuine link rot with this backend restriction.
+7. **Later-event judgement is the hardest call.** Distinguishing "the source
    describes pre-existing facts, published later" from "the source reports a new
    event that settles the claim" requires world knowledge; the stored reasoning
    makes this auditable, and a manual audit of a sample is recommended.

@@ -8,7 +8,7 @@ from enum import Enum
 from ezmm import MultimodalSequence
 from pydantic import BaseModel, Field
 
-from veritas.common.base_model import VeritasBaseModel, Dismissable
+from veritas.common.base_model import Deferrable, Dismissable, VeritasBaseModel
 from veritas.util import get_domain
 
 
@@ -57,11 +57,14 @@ class EvidenceRole(str, Enum):
 
 
 class EvidenceSource(BaseModel):
-    """The independently locatable publication an evidence item stems from."""
+    """Where an evidence item comes from: an independently locatable publication,
+    or - for tools and offline evidence - a named origin without a locator."""
 
     name: str  # Name of the publishing organization or person
     kind: SourceKind = SourceKind.OTHER
-    locator: str | None  # URL or equivalent stable locator
+    #: URL or equivalent stable locator. None only for sources that are not
+    #: publications - a tool without a page, or offline evidence such as a phone call.
+    locator: str | None
     proximity: ProximityLevel = ProximityLevel.SECONDARY
     raw_content: str | None = None  #: The source's content as scraped with scrapeMM
 
@@ -104,17 +107,12 @@ class TemporalValidation(BaseModel):
     later_event: bool = False
     #: The model's own reasoning trace, as reported by the provider's API.
     reasoning: str | None = None
-    #: The short justification the model stated alongside its three judgements.
+    #: The short justification the model stated alongside its judgement.
     justification: str | None = None
     rater: str | None = None
 
-    @property
-    def leaks_verdict(self) -> bool:
-        """A concurrent professional fact-check leaks the verdict."""
-        return bool(self.professional_fact_check and self.concurrent_fact_check)
 
-
-class Evidence(Dismissable, VeritasBaseModel):
+class Evidence(Dismissable, Deferrable, VeritasBaseModel):
     """An atomic piece of factual information that the professional fact-check
     used to establish its verdict, together with its source and pipeline metadata."""
 
@@ -155,7 +153,13 @@ class Evidence(Dismissable, VeritasBaseModel):
 
     @property
     def is_multimodal(self) -> bool:
-        seq = self.proposition_sequence
+        """Whether the proposition carries media. False if the media it references
+        have meanwhile left the ezMM store, so that a cleaned-up medium cannot take
+        down a whole analysis export."""
+        try:
+            seq = self.proposition_sequence
+        except (ValueError, AssertionError):
+            return False
         return seq.has_images() or seq.has_videos()
 
     @property
@@ -163,21 +167,29 @@ class Evidence(Dismissable, VeritasBaseModel):
         """True once Stage 2 has run to completion on this item."""
         return self.admissible is not None
 
-    def time_to_claim(self, t_c: date | datetime | None) -> float | None:
+    def time_to_claim(self, t_c: datetime | None) -> float | None:
         """(t_e - t_c) in days. None if either timestamp is unknown."""
         return _delta_days(self.available_since, t_c)
 
-    def time_to_fact_check(self, t_f: date | datetime | None) -> float | None:
+    def time_to_fact_check(self, t_f: datetime | None) -> float | None:
         """(t_e - t_f) in days. None if either timestamp is unknown."""
         return _delta_days(self.available_since, t_f)
 
     def __str__(self) -> str:
+        # Tools and offline evidence may have no locator at all.
+        origin = f"{self.source.name} ({self.source.kind.value})"
+        if self.source.locator:
+            origin += f", {self.source.locator}"
         return (f"[{self.role.value}/{self.source.proximity.value}] {self.proposition}\n"
-                f"  -- {self.source.name} ({self.source.kind.value}), {self.source.locator}")
+                f"  -- {origin}")
 
 
 def to_naive(value: date | datetime | None) -> datetime | None:
-    """Normalizes dates/datetimes to naive UTC datetimes, matching the DB columns."""
+    """Normalizes dates/datetimes to naive UTC datetimes, matching the DB columns.
+
+    Every timestamp entering the reconstruction passes through here, so the rest of
+    the package works on naive `datetime` objects only; plain `date` values are
+    widened to midnight rather than compared against datetimes."""
     if value is None:
         return None
     if isinstance(value, datetime):

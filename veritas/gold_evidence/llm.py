@@ -14,11 +14,20 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
+# Imported from the defining module rather than the package, whose `__init__`
+# constructs the model singletons at import time.
+from veritas.models.base import QuotaExceededError, RateLimitError
+
 if TYPE_CHECKING:
     from veritas.models import Model
 
 #: Config value meaning "let the stage pick a sensible default".
 AUTO = "auto"
+
+#: Run-level conditions, never a verdict on the item that happened to hit them.
+#: Every stage lets these through instead of recording a rejection, so that an
+#: outage aborts the run rather than silently rejecting the claims it touched.
+FATAL_ERRORS = (QuotaExceededError, RateLimitError)
 
 
 @lru_cache(maxsize=None)

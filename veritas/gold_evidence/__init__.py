@@ -60,6 +60,10 @@ faithfulness_threshold: float = float(_get("faithfulness_threshold", 1 / 3))
 #: Minimum extraction confidence for a candidate to enter Stage 2.
 min_extraction_confidence: float = float(_get("min_extraction_confidence", 0.0))
 
+#: How long an evidence item waits before it is retried after its source rate-limited
+#: us. A throttled source is a temporary condition, not a verdict on the item.
+defer_hours: int = int(_get("defer_hours", 24))
+
 #: How to treat evidence whose source has no determinable publication time (t_e).
 #: See `veritas.gold_evidence.admissibility.UNDATED_POLICIES`. The default keeps
 #: only tools, because evidence that cannot be dated cannot be shown to predate
@@ -97,8 +101,15 @@ if max_video_size is None:
 STATUS_PENDING = "pending"
 STATUS_EXTRACTED = "extracted"
 STATUS_FILTERED = "filtered"
+STATUS_DEFERRED = "deferred"
 STATUS_ACCEPTED = "accepted"
 STATUS_REJECTED = "rejected"
+
+#: Statuses a re-run picks up again, i.e. work that is incomplete rather than
+#: decided. `deferred` is among them: the claim waits for a rate-limited source,
+#: it was not rejected.
+RESUMABLE_STATUSES = ["unprocessed", STATUS_PENDING, STATUS_EXTRACTED,
+                      STATUS_FILTERED, STATUS_DEFERRED]
 
 #: The two evidence cutoff conditions studied in the temporal analysis.
 CONDITION_CLAIM = "claim"  # t_e <= t_c

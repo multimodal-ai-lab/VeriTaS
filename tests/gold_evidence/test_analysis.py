@@ -23,7 +23,8 @@ def claim_record(**overrides) -> ClaimRecord:
     base = dict(
         claim_id=1, t_c=T_C, t_f=T_F, status="accepted", reason=None, released=True,
         is_rectified=False, language="en", n_candidates=5, n_admissible=4,
-        n_in_window=1, n_undated=0, n_evidence_claim=3, n_evidence_fact_check=4,
+        n_in_window=1, n_undated=0, n_deferred=0, n_evidence_claim=3,
+        n_evidence_fact_check=4,
         gold_integrity=-1.0, gold_veracity=-1.0, gold_context_coverage=None,
         has_media=False,
     )

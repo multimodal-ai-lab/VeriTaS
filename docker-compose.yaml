@@ -11,5 +11,36 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql
 
+  # Read-only web UI for the Gold Evidence Reconstruction results.
+  #   docker compose up webui   ->   http://localhost:8080
+  # Override the defaults in a `.env` file next to this one; see webui/README.md.
+  webui:
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${WEBUI_PORT:-8080}:8080"
+    environment:
+      # Defaults point at the database on the Docker host, which is where the
+      # pipeline usually runs. `config.yaml` fills in anything left unset.
+      VERITAS_DB_HOST: ${VERITAS_DB_HOST:-host.docker.internal}
+      VERITAS_DB_PORT: ${VERITAS_DB_PORT:-5432}
+      VERITAS_DB_NAME: ${VERITAS_DB_NAME:-}
+      VERITAS_DB_USER: ${VERITAS_DB_USER:-}
+      VERITAS_DB_PASSWORD: ${VERITAS_DB_PASSWORD:-}
+      # Where the ezMM media registry is mounted inside the container.
+      EZMM_PATH: /media
+    volumes:
+      # Read-only: the UI reads the database credentials from here and never
+      # writes. Keep it read-only so the secrets in it cannot be modified.
+      - ./config.yaml:/app/config.yaml:ro
+      # The ezMM item registry (item_registry.db plus the image/ and video/
+      # directories). Without it the UI works but cannot render any media.
+      - ${EZMM_HOST_PATH:-./ezmm}:/media:ro
+    extra_hosts:
+      # Lets `host.docker.internal` resolve on Linux, too.
+      - "host.docker.internal:host-gateway"
+
 volumes:
   pgdata:

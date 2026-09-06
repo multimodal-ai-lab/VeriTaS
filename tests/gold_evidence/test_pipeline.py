@@ -15,7 +15,6 @@ from veritas.gold_evidence import (
     CONDITION_CLAIM,
     CONDITION_FACT_CHECK,
     STATUS_ACCEPTED,
-    STATUS_FILTERED,
     STATUS_REJECTED,
 )
 from veritas.gold_evidence import pipeline as pipeline_module
@@ -65,6 +64,7 @@ def wired(monkeypatch):
         "db": FakeDB(),
         "gold": make_gold_verdict(veracity=-1.0),
         "extracted": [],
+        "extract_calls": [],
         "close": {CONDITION_CLAIM: True, CONDITION_FACT_CHECK: True},
         "sufficiency_calls": [],
         "t_c": datetime(2024, 5, 1),
@@ -78,7 +78,8 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(Claim, "current_verdict", property(fake_current_verdict))
 
-    async def fake_extract(claim):
+    async def fake_extract(claim, **kwargs):
+        state["extract_calls"].append(kwargs)
         state["db"].evidence = state["extracted"]
         return list(state["extracted"])
 
@@ -264,16 +265,6 @@ async def test_the_claim_is_never_dismissed(wired):
 
 
 @pytest.mark.asyncio
-async def test_skip_sufficiency_stops_after_filtering(wired):
-    wired["extracted"] = [make_evidence(filtered=False)]
-    outcome = await reconstruct_claim(make_claim(), skip_sufficiency=True)
-
-    assert outcome.status == STATUS_FILTERED
-    assert wired["sufficiency_calls"] == []
-    assert wired["db"].saved_results == []
-
-
-@pytest.mark.asyncio
 async def test_stored_evidence_is_reused_without_re_extraction(wired, monkeypatch):
     stored = [make_evidence()]
     apply_admissibility(stored[0])
@@ -281,7 +272,7 @@ async def test_stored_evidence_is_reused_without_re_extraction(wired, monkeypatc
 
     called = []
 
-    async def fake_extract(claim):
+    async def fake_extract(claim, **kwargs):
         called.append(claim.id)
         return []
 
@@ -290,6 +281,16 @@ async def test_stored_evidence_is_reused_without_re_extraction(wired, monkeypatc
 
     assert called == []  # Stage 1 was skipped
     assert outcome.n_candidates == 1
+
+
+@pytest.mark.asyncio
+async def test_re_extraction_replaces_the_stored_evidence(wired):
+    """Otherwise items the new run no longer produces survive as orphans."""
+    wired["db"].evidence = [make_evidence()]
+    wired["extracted"] = [make_evidence(filtered=False)]
+    await reconstruct_claim(make_claim(), re_extract=True)
+
+    assert wired["extract_calls"] == [{"replace": True}]
 
 
 # --- Summary ---------------------------------------------------------------

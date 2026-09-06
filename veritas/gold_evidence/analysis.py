@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 
 from veritas.gold_evidence import CONDITION_CLAIM, CONDITION_FACT_CHECK
 from veritas.gold_evidence.admissibility import in_window
@@ -43,6 +43,7 @@ class ClaimRecord:
     n_admissible: int
     n_in_window: int
     n_undated: int
+    n_deferred: int
     n_evidence_claim: int
     n_evidence_fact_check: int
     gold_integrity: float | None
@@ -75,7 +76,7 @@ class ClaimRecord:
 
 
 def build_claim_record(*, claim, gold, evidence: list[Evidence],
-                       t_c: date | datetime | None, t_f: date | datetime | None,
+                       t_c: datetime | None, t_f: datetime | None,
                        results: dict[str, dict] | None = None) -> ClaimRecord:
     """Assembles the claim-level row from the stored objects."""
     from veritas.gold_evidence.admissibility import select
@@ -102,6 +103,7 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
         n_admissible=len(admissible),
         n_in_window=sum(1 for e in admissible if in_window(e)),
         n_undated=sum(1 for e in evidence if e.available_since is None),
+        n_deferred=sum(1 for e in evidence if e.deferred),
         n_evidence_claim=len(claim_set),
         n_evidence_fact_check=len(fact_check_set),
         gold_integrity=_score(_safe(lambda: gold.integrity)) if gold else None,
@@ -116,8 +118,8 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
 
 
 def build_evidence_record(evidence: Evidence, *, claim_id: int,
-                          t_c: date | datetime | None,
-                          t_f: date | datetime | None) -> dict:
+                          t_c: datetime | None,
+                          t_f: datetime | None) -> dict:
     """One evidence-level row of the analysis export."""
     temporal = evidence.temporal_validation
     faithfulness = evidence.faithfulness
@@ -142,11 +144,10 @@ def build_evidence_record(evidence: Evidence, *, claim_id: int,
         "faithfulness": faithfulness.assessment if faithfulness else None,
         "before_claim": temporal.before_claim if temporal else None,
         "before_fact_check": temporal.before_fact_check if temporal else None,
-        "professional_fact_check": temporal.professional_fact_check if temporal else None,
-        "concurrent_fact_check": temporal.concurrent_fact_check if temporal else None,
         "later_event": temporal.later_event if temporal else None,
         "admissible": evidence.admissible,
         "inadmissibility_reason": evidence.inadmissibility_reason,
+        "deferred": evidence.deferred,
     }
 
 
@@ -176,6 +177,7 @@ def aggregate(claim_records: list[ClaimRecord],
         "n_evidence_candidates": len(evidence_records),
         "n_evidence_admissible": len(admissible_records),
         "n_evidence_in_window": len(window_records),
+        "n_evidence_deferred": sum(1 for e in evidence_records if e.get("deferred")),
 
         # Proportion of claims containing post-claim / pre-fact-check evidence
         "share_claims_with_window_evidence": _share(

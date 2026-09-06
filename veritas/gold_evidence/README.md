@@ -18,7 +18,7 @@ their rationale.
 | Stage | Module | What it does |
 | --- | --- | --- |
 | 1 | `extraction.py` | An MLLM reads the stored fact-check article and returns candidate `Evidence` items: an atomic proposition plus an independently locatable source. |
-| 2 | `filtering.py`, `retrieval.py` | Per item: re-retrieve the source through scrapeMM and date it (§3.1), check the source still supports the proposition (§3.2), check the cutoff, verdict leakage and later-event contamination (§3.3). |
+| 2 | `filtering.py`, `retrieval.py` | Per item: re-retrieve the source through scrapeMM and date it (§3.1), check the source still supports the proposition (§3.2), check the cutoff, verdict leakage and later-event contamination (§3.3). Tools and offline evidence skip retrieval and faithfulness, but are still validated temporally once they carry a `t_e`; a rate-limited source defers the item. |
 | 3 | `sufficiency.py`, `closeness.py` | A cross-family ensemble predicts a verdict from claim + retained evidence only, and `is_close` compares it to the gold verdict. |
 | — | `analysis.py` | Aggregation for the temporal analysis, including the paired recoverability test. |
 
@@ -46,23 +46,22 @@ All retrieval runs through scrapeMM — nothing fetches a URL on its own:
 4. only if step 2 found nothing: a cheap model reads a stated publication time off
    the converted content, and returns nothing rather than guessing
 
-scrapeMM serves `format="html"` only through Firecrawl and Decodo. Sources it
-handles through an API integration (social media, archiving services, video
-platforms) come back unsuccessful from step 1 and are then retrieved through
-scrapeMM again in its default `multimodal_sequence` format; those have no meta
-tags, so step 4 dates them.
+scrapeMM serves `format="html"` only through Firecrawl and Decodo, and step 1 is
+restricted to those two. Sources it handles through an API integration (social
+media, archiving services, video platforms) come back unsuccessful and are recorded
+as inaccessible — there is no second attempt in the default `multimodal_sequence`
+format. See the limitations in `DESIGN_DECISIONS.md`.
+
+A source that only *rate-limited* us is not inaccessible: the item is deferred for
+`defer_hours` and its claim ends on status `deferred`, which a later run picks up
+again. An exhausted scrapeMM quota, like an exhausted model quota, aborts the run
+instead of being recorded against the claim that hit it.
 
 ## Running it
 
 ```bash
-# Stages 1-3 over a quarter range, released claims first
-python -m scripts.gold_evidence.run_reconstruction --start 2024 1 --end 2024 4 --limit 200
-
-# Specific claims, full property cascade instead of integrity only
-python -m scripts.gold_evidence.run_reconstruction --claim-ids 1234 5678 --mode full
-
-# See what would be processed, without spending any API calls
-python -m scripts.gold_evidence.run_reconstruction --start 2024 1 --limit 20 --dry-run
+# Stages 1-3; range, limit and batch size come from gold_evidence.reconstruction
+python -m scripts.gold_evidence.run_reconstruction
 
 # Export claim-level and evidence-level results plus aggregate tables
 python -m scripts.gold_evidence.run_temporal_analysis
@@ -71,9 +70,14 @@ python -m scripts.gold_evidence.run_temporal_analysis
 python -m scripts.gold_evidence.plot_temporal_analysis exports/gold_evidence/<timestamp>
 ```
 
-The reconstruction is resumable: evidence already stored in the DB is reused, and
-claims are picked up again while their status is incomplete. `--re-extract` and
-`--re-filter` force the corresponding stage to run again.
+The reconstruction has no command-line interface: it reads
+`gold_evidence.reconstruction` from `config.yaml` (`start`, `end`, `limit`,
+`batch_size`, `claim_ids`, `dry_run`, ...). It is resumable — evidence already
+stored in the DB is reused and claims are picked up again while their status is
+incomplete (`pending`, `extracted`, `filtered`, `deferred`) — and `re_extract` /
+`re_filter` force the corresponding stage to run again. `re_extract` drops the
+claim's stored evidence first, so nothing survives that the new run no longer
+produces.
 
 ## Reasoning traces
 
@@ -97,21 +101,37 @@ Two settings change the reported numbers and should be stated in any write-up:
 
 - `proximity_threshold` (default `0.3`) — how close the predicted verdict must be.
 - `undated_policy` (default `tool_only`) — how sources without a determinable
-  publication time are treated. Re-running with `permissive` gives a one-flag
-  sensitivity analysis.
+  publication time are treated. The default keeps the source kinds that are not
+  publications at all (`tool`, `offline`), which need neither a locator nor a
+  timestamp; `permissive` keeps every undated source and `strict` keeps none.
+  Re-running with `strict` gives a one-flag sensitivity analysis.
 
 ## Database
 
 Additive only:
 
 - `evidence` — one row per reconstructed evidence item, with flat columns for
-  querying and a `full_evidence` JSONB blob as the authoritative representation.
+  querying (including `deferred_until`) and a `full_evidence` JSONB blob as the
+  authoritative representation.
 - `gold_evidence_results` — one row per (claim, condition, ensemble mode), holding
   the predicted verdict, every ensemble member's rating, stated justification,
   reasoning trace and answer text, the property distances and the closeness
   decision.
 - `claims.gold_evidence_status` / `_reason` / `_updated_at` — the per-instance
   outcome.
+
+## Browsing the results
+
+A read-only web UI shows the processed claims, every stored detail of each
+reconstructed evidence item (with its media rendered inline) and the aggregate
+statistics:
+
+```bash
+docker compose up webui   # -> http://localhost:8080
+```
+
+It is a separate service that never imports this package and never writes to the
+database. See [`webui/README.md`](../../webui/README.md).
 
 ## Tests
 
@@ -122,5 +142,6 @@ pytest tests/gold_evidence
 These are pure: no database, no network, no LLM calls. They cover the
 admissibility rule, the closeness function, response parsing for all three LLM
 stages, DB round-tripping, prompt rendering (including that the faithfulness
-prompt cannot see the claim or the verdict), the aggregation, and the pipeline's
-accept/reject logic.
+prompt cannot see the claim or the verdict), the aggregation, the retrieval order,
+deferral of rate-limited sources, the propagation of quota and rate-limit errors,
+and the pipeline's accept/reject logic.

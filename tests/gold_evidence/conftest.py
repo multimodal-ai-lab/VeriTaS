@@ -63,7 +63,7 @@ def make_evidence(
         *,
         claim_id: int = 1,
         proposition: str = "The mayor signed the decree on 3 May.",
-        locator: str = "https://example.org/record/1",
+        locator: str | None = "https://example.org/record/1",
         kind: SourceKind = SourceKind.NEWS_ARTICLE,
         proximity: ProximityLevel = ProximityLevel.SECONDARY,
         role: EvidenceRole = EvidenceRole.ESSENTIAL,
@@ -73,8 +73,6 @@ def make_evidence(
         available_since=datetime(2024, 4, 15),
         before_claim: bool = True,
         before_fact_check: bool = True,
-        professional_fact_check: bool = False,
-        concurrent_fact_check: bool | None = None,
         later_event: bool = False,
         filtered: bool = True,
 ) -> Evidence:
@@ -94,8 +92,6 @@ def make_evidence(
         evidence.temporal_validation = TemporalValidation(
             before_fact_check=before_fact_check,
             before_claim=before_claim,
-            professional_fact_check=professional_fact_check,
-            concurrent_fact_check=concurrent_fact_check,
             later_event=later_event,
         )
     return evidence
