@@ -36,4 +36,3 @@ sankeyflow
 language_data
 scikit-learn
 tabulate
-seleniumbase

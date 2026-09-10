@@ -11,11 +11,13 @@ import pytest
 
 from veritas.util.media_store import (
     KINDS,
+    STAGING_DIR_NAME,
     TO_DELETE_DIR_NAME,
     execute_plan,
     format_plan,
     format_size,
     free_destination,
+    measure_directory,
     parse_media_file_name,
     plan_cleanup,
     resolve_to_delete_dir,
@@ -208,6 +210,13 @@ def test_quarantine_inside_a_kind_directory_is_rejected(tmp_path, relative):
         resolve_to_delete_dir(tmp_path, tmp_path / relative)
 
 
+def test_quarantine_inside_the_staging_directory_is_rejected(tmp_path):
+    """ezMM writes in-flight downloads there; quarantining into it would put the
+    orphans straight back into the store."""
+    with pytest.raises(ValueError):
+        resolve_to_delete_dir(tmp_path, tmp_path / STAGING_DIR_NAME)
+
+
 def test_quarantine_is_checked_against_every_kind_not_just_the_scanned_ones(tmp_path):
     """A run restricted to images must still not quarantine inside `video/`:
     the next, unrestricted run would pick those files up again."""
@@ -356,6 +365,57 @@ def test_format_plan_states_the_numbers_that_matter(store):
     assert "3 of 6" in report  # unreferenced of total
     for kind in KINDS:
         assert kind in report
+
+
+def test_staging_directory_is_measured_but_never_touched(store):
+    """ezMM copies a staged download into `<kind>/` instead of moving it, so the
+    staging directory grows without bound. The cleanup reports it and stops there."""
+    staging = store / STAGING_DIR_NAME
+    staging.mkdir()
+    (staging / "2026-09-07_12-00-00-000000.jpg").write_bytes(b"x" * 400)
+    (staging / "2026-09-07_12-00-01-000000.mp4").write_bytes(b"y" * 600)
+
+    plan = plan_cleanup(scan_media_store(store), {})
+    execute_plan(plan)
+
+    assert plan.staging.exists
+    assert plan.staging.n_files == 2
+    assert plan.staging.n_bytes == 1000
+    # Not counted as store content, and still there after the move.
+    assert plan.n_bytes == 100 + 200 + 300 + 1000 + 2000 + 50
+    assert sorted(path.name for path in staging.iterdir()) == [
+        "2026-09-07_12-00-00-000000.jpg", "2026-09-07_12-00-01-000000.mp4",
+    ]
+
+
+def test_staging_directory_is_mentioned_in_the_report(store):
+    staging = store / STAGING_DIR_NAME
+    staging.mkdir()
+    (staging / "2026-09-07_12-00-00-000000.jpg").write_bytes(b"x" * 400)
+
+    report = format_plan(plan_cleanup(scan_media_store(store), {}))
+
+    assert STAGING_DIR_NAME in report
+    assert "400 B" in report
+
+
+def test_a_missing_staging_directory_is_not_an_error(store):
+    plan = plan_cleanup(scan_media_store(store), {})
+
+    assert plan.staging.exists is False
+    assert plan.staging.n_files == 0
+    assert STAGING_DIR_NAME not in format_plan(plan)
+
+
+def test_measure_directory_adds_up_nested_files(tmp_path):
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "one").write_bytes(b"x" * 10)
+    (tmp_path / "a" / "b" / "two").write_bytes(b"y" * 25)
+
+    usage = measure_directory(tmp_path / "a")
+
+    assert (usage.exists, usage.n_files, usage.n_bytes) == (True, 2, 35)
+    assert measure_directory(tmp_path / "nope").exists is False
 
 
 def test_plan_serializes_to_json_friendly_statistics(store):

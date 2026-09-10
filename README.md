@@ -63,6 +63,21 @@ VeriTaS is organized in quarterly splits, extended dynamically in the future wit
 6. **Create backup**: Run `python -m scripts.export.create_backup` to create a backup of the entire pipeline data.
 
 
+## Cleaning Up the Media Store
+The ezMM store keeps every medium the pipeline ever downloaded, including those of dismissed reviews, re-scraped appearances and articles that never made it into a claim. To reclaim that space:
+
+```bash
+python -m scripts.cleanup_media           # report only, touches no file
+python -m scripts.cleanup_media --apply   # move the unreferenced files
+```
+
+The script first rebuilds the `media` table from every `<image:42>`-style reference in the claims, appearances, articles and gold evidence, recording for each medium the IDs it occurs under. It then compares that index against the store and **moves** — never deletes — every unreferenced file into `<ezmm_path>/to-delete`, mirroring its path below the store root, so a cleanup can be undone by moving the files back. Both steps report statistics (media per kind, files and bytes kept and freed, broken references); `--report <path>` additionally writes them as JSON.
+
+Note that the ezMM registry (`item_registry.db`) is deliberately left untouched, so its rows for quarantined media become dangling until the files are deleted for good.
+
+The report also states the size of ezMM's staging directory `<ezmm_path>/items`. ezMM stages every download there and then *copies* — rather than moves — it into `image/`, `video/` or `audio/`, so that directory holds a duplicate of nearly every medium. The script does not touch it: a file there may still be in flight, and an item that was never relocated has its registered path pointing at it. Freeing that space needs a separate, registry-aware pass.
+
+
 ## Gold Evidence Reconstruction
 A separate analysis pipeline reconstructs the evidence the original professional fact-check used, filters invalid and leaked evidence, and validates whether the remainder suffices to recover the VeriTaS gold verdict. It answers whether evidence that only became available *during* the fact-checking period is necessary for that reconstruction.
 
@@ -72,6 +87,15 @@ python -m scripts.gold_evidence.run_temporal_analysis
 ```
 
 It runs independently of the 7-stage benchmark pipeline and never modifies existing data — see [`veritas/gold_evidence/README.md`](veritas/gold_evidence/README.md) for usage and [`veritas/gold_evidence/DESIGN_DECISIONS.md`](veritas/gold_evidence/DESIGN_DECISIONS.md) for the methodological choices.
+
+### Web UI
+A read-only web interface for browsing the reconstructed evidence — including its images and videos — and the aggregate statistics:
+
+```bash
+docker compose up webui   # -> http://localhost:8080
+```
+
+See [`webui/README.md`](webui/README.md) for configuration.
 
 
 ## Required Services
