@@ -36,6 +36,10 @@ A claim missing either time is rejected before Stage 1 (`no_claim_time` /
 `no_fact_check_time`): without `t_f` there is no evidence cutoff, and without
 `t_c` the two conditions collapse into the same set.
 
+Claims with `t_f > t_c` are reconstructed first, ahead of released ones: they are
+the only claims with a non-empty interval `t_c < t_e <= t_f`, and hence the only
+ones whose outcome can differ between the two conditions.
+
 ## Source retrieval
 
 All retrieval runs through scrapeMM — nothing fetches a URL on its own:
@@ -93,9 +97,14 @@ Each judgement therefore stores two distinct things:
 ## Configuration
 
 All knobs live under `gold_evidence:` in `config.yaml` — models, ensemble members
-and mode, reasoning effort per task, thresholds, the undated-source policy, and
-the per-claim budgets. Every key has a default, so an un-updated `config.yaml`
-still works.
+and mode, reasoning effort per task, thresholds, the undated-source policy, the
+per-claim budgets and the concurrency limits. Every key has a default, so an
+un-updated `config.yaml` still works.
+
+The concurrency limits nest: `claim_concurrency` claims are reconstructed at once
+and each filters up to `evidence_concurrency` of its evidence items at once, so the
+peak number of in-flight retrievals and LLM calls is their product.
+`analysis_concurrency` is separate and applies to the temporal-analysis script.
 
 Two settings change the reported numbers and should be stated in any write-up:
 

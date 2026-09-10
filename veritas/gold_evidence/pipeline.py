@@ -23,7 +23,7 @@ from veritas.gold_evidence import (
     STATUS_FILTERED,
     STATUS_PENDING,
     STATUS_REJECTED,
-    concurrency,
+    claim_concurrency,
     ensemble_mode as default_ensemble_mode,
     proximity_threshold as default_threshold,
 )
@@ -182,7 +182,7 @@ async def reconstruct_claims(claims: list[Claim], **kwargs) -> list[ClaimOutcome
                          f"{type(e).__name__}: {e}", exc_info=True)
             return None
 
-    outcomes = await run_with_semaphore([_run(c) for c in claims], limit=concurrency,
+    outcomes = await run_with_semaphore([_run(c) for c in claims], limit=claim_concurrency,
                                         show_progress=True,
                                         progress_description="Reconstructing gold evidence")
     return [o for o in outcomes if o is not None]

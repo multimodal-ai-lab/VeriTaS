@@ -26,8 +26,8 @@ from veritas.common import Claim, Prompt, Review
 from veritas.db import db
 from veritas.gold_evidence import (
     CONDITION_FACT_CHECK,
-    concurrency,
     defer_hours,
+    evidence_concurrency,
     filtering_model,
     max_source_content_length,
     reasoning_effort_faithfulness,
@@ -81,7 +81,7 @@ async def filter_evidence(claim: Claim, evidence: list[Evidence]) -> list[Eviden
         tasks = [filter_single(item, claim=claim, t_c=t_c, t_f=t_f, session=session)
                  for item in evidence]
         try:
-            await run_with_semaphore(tasks, limit=concurrency)
+            await run_with_semaphore(tasks, limit=evidence_concurrency)
         finally:
             # Persist whatever was decided before the failure; otherwise a single
             # failing item would discard the whole claim's filtering work.

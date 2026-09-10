@@ -84,9 +84,13 @@ gold_evidence:
   faithfulness_threshold: 0.334 # 1/3 = "entailed (rather uncertain)"
   min_extraction_confidence: 0.0
 
-  # How to treat evidence whose source has no determinable publication time:
-  # 'tool_only' (default) | 'permissive' | 'strict'
+  # How to treat evidence whose source has no determinable publication time.
+  # 'tool_only' (default) keeps the kinds that are not publications (tool, offline),
+  # 'permissive' keeps all undated sources, 'strict' keeps none of them.
   undated_policy: "tool_only"
+
+  # How long an evidence item waits after its source rate-limited us
+  defer_hours: 24
 
   # Budgets
   max_evidence_per_claim: 20
@@ -107,7 +111,6 @@ gold_evidence:
     redo: False  # Process claims regardless of their current status
     re_extract: False  # Re-run Stage 1 even if evidence is already stored
     re_filter: False  # Re-run Stage 2 for evidence that was already filtered
-    skip_sufficiency: False  # Run Stages 1-2 only (useful to pre-fill the evidence table)
     dry_run: False  # Only report which claims would be processed
     log_level: "INFO"
 

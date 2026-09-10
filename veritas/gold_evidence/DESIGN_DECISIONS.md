@@ -329,17 +329,31 @@ valid gold verdict; it is only unusable *for this analysis*. Keeping the two
 judgements in separate columns preserves the benchmark and lets the analysis be
 re-run under different thresholds without any destructive step.
 
-## 16. Claim selection: released first
+## 16. Claim selection: a non-empty interval first, then released
 
 **Decision.** Candidates are non-dismissed claims with a current verdict whose
-reviews completed the verdict stage (6, or 7 for rectified claims). Released claims
-are processed first; once none remain in the requested range, the remaining
-verdict-complete claims follow. The date range is user-specified.
+reviews completed the verdict stage (6, or 7 for rectified claims). They are
+processed in this order: claims whose fact-check appeared *after* the claim
+(`t_f > t_c`) first, then released claims, then by claim ID. The date range is
+user-specified.
 
-**Rationale.** Released claims are the published benchmark, so results on them are
-externally checkable and directly citable. Requiring a completed verdict stage
-excludes claims whose gold verdict is not yet final, which would otherwise be
+**Rationale.** A claim with `t_f = t_c` has an empty interval `t_c < t_e <= t_f`, so
+no evidence can fall into it and `E_claim = E_factcheck` by construction: the claim
+contributes a concordant pair to the paired test no matter what the evidence says,
+and reconstructing it cannot change the headline result. Spending the API budget on
+claims with a non-empty interval therefore buys information, while the others only
+buy denominator. Claims whose stored `t_f` *precedes* `t_c` are treated like the
+empty case, since §5 clamps them to `t_c`.
+
+Released claims come second because they are the published benchmark, so results on
+them are externally checkable and directly citable. Requiring a completed verdict
+stage excludes claims whose gold verdict is not yet final, which would otherwise be
 compared against a moving target.
+
+**Not applied to the analysis.** The temporal-analysis script switches this priority
+off. It reads what the reconstruction stored, and with a `--limit` the priority would
+select precisely the claims that carry window evidence — an artefact in every share
+the analysis reports.
 
 ## 17. Reported statistics
 

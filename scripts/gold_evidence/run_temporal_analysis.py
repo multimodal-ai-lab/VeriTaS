@@ -28,6 +28,7 @@ from veritas import logger
 from veritas.db import db
 from veritas.gold_evidence import (
     CONDITIONS,
+    analysis_concurrency,
     ensemble_mode as default_ensemble_mode,
     proximity_threshold as default_threshold,
 )
@@ -53,15 +54,20 @@ def parse_args() -> argparse.Namespace:
                         help="Analyze at most this many claims")
     parser.add_argument("--revalidate", action="store_true",
                         help="Re-run the sufficiency validator for both conditions")
-    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--concurrency", type=int, default=analysis_concurrency,
+                        help="Claims processed at once "
+                             "(default: gold_evidence.analysis_concurrency)")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
 
 async def collect(args) -> tuple[list, list[dict]]:
     """Builds the claim-level and evidence-level rows."""
+    # The reconstruction's processing priority (claims with `t_f > t_c` first) must
+    # not reorder the analysis sample: with `--limit`, it would silently select
+    # exactly the claims that carry window evidence.
     claims = await db.get_claims_for_gold_evidence(
-        limit=args.limit, statuses=None, released_first=True)
+        limit=args.limit, statuses=None, released_first=True, window_first=False)
     claims = [c for c in claims if c.gold_evidence_status]
     logger.info(f"Analyzing {len(claims)} claims with reconstruction results.")
 

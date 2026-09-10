@@ -1151,13 +1151,23 @@ class VeritasDB(Database):
             released_first: bool = True,
             claim_ids: list[int] | None = None,
             exclude_claim_ids: list[int] | None = None,
+            window_first: bool = True,
     ) -> list[Claim]:
         """Returns candidate claims for the Gold Evidence Reconstruction.
 
         A candidate is a non-dismissed claim with a current verdict whose reviews
         completed at least stage 6 (7 for rectified claims), i.e. the gold verdict
-        is final. Released claims are processed first; if none are left, the
-        remaining verdict-complete claims follow.
+        is final.
+
+        Ordering, in this precedence:
+
+        1. `window_first`: claims whose fact-check appeared *strictly after* the claim, i.e.
+           `t_f > t_c`. They are the only ones with a non-empty interval
+           `t_c < t_e <= t_f`, so they are the only ones that can answer the
+           question the analysis asks - and therefore the ones worth spending API
+           calls on first.
+        2. `released_first`: released claims before the remaining ones.
+        3. Claim ID, so a run is reproducible.
 
         `statuses` filters on `gold_evidence_status`; pass `[None]`-like values via
         the string 'unprocessed' to select claims that were never processed.
@@ -1173,20 +1183,38 @@ class VeritasDB(Database):
         wants_unprocessed = bool(statuses) and "unprocessed" in statuses
         concrete_statuses = [s for s in (statuses or []) if s != "unprocessed"] or None
 
-        # Both flags are ordered separately rather than as `a OR b`: with
-        # SELECT DISTINCT, PostgreSQL only accepts ORDER BY expressions that appear
-        # in the select list, and this yields the same released-first grouping.
-        order = ("c.released_quarter DESC, c.released_longitudinal DESC, c.id"
-                 if released_first else "c.id")
+        # `t_f` is the latest publication time among the claim's non-dismissed
+        # reviews, exactly as `filtering.get_reference_times` computes it. A claim
+        # without either timestamp is rejected by the pipeline before Stage 1, and a
+        # `t_f` that precedes `t_c` is clamped to `t_c` there, which leaves the
+        # interval empty as well - hence `>` rather than `<>`.
+        keys = []
+        if window_first:
+            keys.append("(tf.t_f IS NOT NULL AND c.date IS NOT NULL AND tf.t_f > c.date) DESC")
+        if released_first:
+            keys.append("(c.released_quarter OR c.released_longitudinal) DESC NULLS LAST")
+        order = ", ".join(keys + ["c.id"])
 
+        # The review conditions are `EXISTS` rather than a join, so that no claim is
+        # returned twice and the ordering is not restricted to select-list
+        # expressions the way `SELECT DISTINCT` would restrict it.
         query = f"""
-                SELECT DISTINCT c.*
+                SELECT c.*
                 FROM claims c
-                         JOIN verdicts v ON v.claim_id = c.id AND v.is_current
-                         JOIN reviews r ON r.id = ANY (c.review_ids)
+                         LEFT JOIN LATERAL (SELECT MAX(r.published) AS t_f
+                                            FROM reviews r
+                                            WHERE r.id = ANY (c.review_ids)
+                                              AND r.dismissed = FALSE) tf ON TRUE
                 WHERE c.dismissed = FALSE
-                  AND r.dismissed = FALSE
-                  AND r.stage >= CASE WHEN c.is_rectified THEN 7 ELSE 6 END
+                  AND EXISTS (SELECT 1
+                              FROM verdicts v
+                              WHERE v.claim_id = c.id
+                                AND v.is_current)
+                  AND EXISTS (SELECT 1
+                              FROM reviews r
+                              WHERE r.id = ANY (c.review_ids)
+                                AND r.dismissed = FALSE
+                                AND r.stage >= CASE WHEN c.is_rectified THEN 7 ELSE 6 END)
                   AND ($2::timestamp IS NULL OR c.date >= $2)
                   AND ($3::timestamp IS NULL OR c.date <= $3)
                   AND ($4::text[] IS NULL OR c.gold_evidence_status = ANY ($4)

@@ -86,7 +86,22 @@ max_evidence_per_claim: int = int(_get("max_evidence_per_claim", 20))
 max_reviews_per_claim: int = int(_get("max_reviews_per_claim", 2))
 max_source_content_length: int = int(_get("max_source_content_length", 30_000))
 max_article_length: int = int(_get("max_article_length", 50_000))
-concurrency: int = int(_get("concurrency", 20))
+
+# --- Concurrency --------------------------------------------------------------
+# The first two nest: `claim_concurrency` claims are reconstructed at once, and each
+# of them filters up to `evidence_concurrency` of its evidence items at once, so the
+# peak number of in-flight source retrievals and LLM calls is their product.
+
+#: Claims reconstructed simultaneously (`pipeline.reconstruct_claims`).
+claim_concurrency: int = int(_get("claim_concurrency", 6))
+
+#: Evidence items of one claim filtered simultaneously (`filtering.filter_evidence`).
+evidence_concurrency: int = int(_get("evidence_concurrency", 8))
+
+#: Claims the temporal analysis processes simultaneously. Independent of the two
+#: above: the analysis reads the stored results and only re-runs the sufficiency
+#: ensemble when asked to (`scripts/gold_evidence/run_temporal_analysis.py`).
+analysis_concurrency: int = int(_get("analysis_concurrency", 10))
 
 #: Passed to scrapeMM when downloading evidence source media. Falls back to the
 #: main pipeline's limit. Read from the config directly rather than importing
