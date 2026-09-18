@@ -24,15 +24,30 @@
     --accent: #5b5bd6;
     --accent-hover: #4a4ac4;
     --accent-soft: #ecebff;
-    --ok: #0f9d76;
-    --ok-soft: #e2f6ef;
-    --warn: #c67c05;
-    --warn-soft: #fdf1dc;
-    --bad: #d9455f;
-    --bad-soft: #fdeaee;
-    --info: #0e8aa8;
-    --info-soft: #e0f4f9;
+    /* Value colours. These are the VeriTaS plotting palette from
+       `scripts/stats/common.py`, so a chart in the UI and a figure in the paper
+       speak the same language. The `*-ink` variants are the same hues darkened
+       (or lightened, in dark mode) to stay legible as text; the base values are
+       used for fills - bars, dots, swatches, chart marks. */
+    --ok: #09C479;            /* common.py: positive */
+    --ok-ink: #05784a;
+    --ok-soft: color-mix(in srgb, var(--ok) 14%, var(--surface));
+    --bad: #E03440;           /* common.py: negative */
+    --bad-ink: #b21f29;
+    --bad-soft: color-mix(in srgb, var(--bad) 13%, var(--surface));
+    --neutral: #a1a1a1;       /* common.py: neutral */
+    --neutral-ink: #6a6a6a;
+    --neutral-soft: color-mix(in srgb, var(--neutral) 16%, var(--surface));
+    --warn: #F5A300;          /* common.py: light_orange (TUDa secondary) */
+    --warn-ink: #8f6000;
+    --warn-soft: color-mix(in srgb, var(--warn) 16%, var(--surface));
+    --info: #0083CC;          /* common.py: blue (TUDa quaternary) */
+    --info-ink: #00628f;
+    --info-soft: color-mix(in srgb, var(--info) 12%, var(--surface));
+    --tuda-orange: #EC6500;   /* common.py: orange (TUDa primary) */
+    --tuda-darkblue: #004E73; /* common.py: darkblue (TUDa tertiary) */
     --violet: #8b5cf6;
+    --violet-ink: #6d3fe0;
     --violet-soft: #f2ecff;
 
     /* Shape + motion */
@@ -68,15 +83,27 @@ html[data-theme="dark"] {
     --accent: #8b8bf0;
     --accent-hover: #a0a0f7;
     --accent-soft: #21213f;
-    --ok: #35d0a0;
-    --ok-soft: #10322a;
-    --warn: #efb045;
-    --warn-soft: #33280f;
-    --bad: #f4718a;
-    --bad-soft: #381a22;
-    --info: #45c4e0;
-    --info-soft: #102c36;
+    /* The same palette hues; only the text variants are re-tuned for contrast
+       on a dark ground, and the soft tints are mixed into the dark surface. */
+    --ok: #09C479;
+    --ok-ink: #3ce5a2;
+    --ok-soft: color-mix(in srgb, var(--ok) 20%, var(--surface));
+    --bad: #E03440;
+    --bad-ink: #ff7b84;
+    --bad-soft: color-mix(in srgb, var(--bad) 22%, var(--surface));
+    --neutral: #a1a1a1;
+    --neutral-ink: #b5b5b5;
+    --neutral-soft: color-mix(in srgb, var(--neutral) 18%, var(--surface));
+    --warn: #F5A300;
+    --warn-ink: #ffc248;
+    --warn-soft: color-mix(in srgb, var(--warn) 20%, var(--surface));
+    --info: #0083CC;
+    --info-ink: #57c4f5;
+    --info-soft: color-mix(in srgb, var(--info) 24%, var(--surface));
+    --tuda-orange: #EC6500;
+    --tuda-darkblue: #4a9ec2;
     --violet: #b18cff;
+    --violet-ink: #c4a6ff;
     --violet-soft: #251a3d;
 
     --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px -14px rgba(0, 0, 0, .7);
@@ -86,6 +113,11 @@ html[data-theme="dark"] {
 /* ========================================================================= */
 
 *, *::before, *::after { box-sizing: border-box; }
+
+/* Several bodies below set `display: grid`, which outranks the user agent's
+   `[hidden] { display: none }`. Collapsing relies on the attribute, so make it
+   win everywhere. */
+[hidden] { display: none !important; }
 
 html, body { height: 100%; }
 
@@ -240,6 +272,7 @@ footer {
 .card-body { padding: 16px 18px; }
 
 .grid { display: grid; gap: 16px; align-items: start; }
+.grid.cols-1 { grid-template-columns: minmax(0, 1fr); }
 .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
 .grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
@@ -279,12 +312,12 @@ footer {
 }
 .badge i { font-size: .85em; }
 .badge.accent { background: var(--accent-soft); color: var(--accent); }
-.badge.ok     { background: var(--ok-soft);     color: var(--ok); }
-.badge.warn   { background: var(--warn-soft);   color: var(--warn); }
-.badge.bad    { background: var(--bad-soft);    color: var(--bad); }
-.badge.info   { background: var(--info-soft);   color: var(--info); }
-.badge.violet { background: var(--violet-soft); color: var(--violet); }
-.badge.plain  { background: transparent; border-color: var(--border); color: var(--muted); }
+.badge.ok     { background: var(--ok-soft);     color: var(--ok-ink); }
+.badge.warn   { background: var(--warn-soft);   color: var(--warn-ink); }
+.badge.bad    { background: var(--bad-soft);    color: var(--bad-ink); }
+.badge.info   { background: var(--info-soft);   color: var(--info-ink); }
+.badge.violet { background: var(--violet-soft); color: var(--violet-ink); }
+.badge.plain  { background: transparent; border-color: var(--border); color: var(--neutral-ink); }
 
 .chips { display: flex; flex-wrap: wrap; gap: 7px; }
 
@@ -414,7 +447,7 @@ select { cursor: pointer; }
     font-family: var(--mono);
 }
 .timeline-marker.tf { background: var(--violet); }
-.timeline-marker.tf::after { color: var(--violet); }
+.timeline-marker.tf::after { color: var(--violet-ink); }
 .timeline-dot {
     position: absolute; top: 33px; width: 13px; height: 13px; margin-left: -6.5px;
     border-radius: 99px; border: 2px solid var(--surface); cursor: pointer;
@@ -484,7 +517,7 @@ select { cursor: pointer; }
     background: var(--accent); color: #fff; transform: translateY(-1px);
     box-shadow: 0 4px 12px -4px color-mix(in srgb, var(--accent) 70%, transparent);
 }
-.ref.missing { background: var(--bad-soft); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 30%, transparent); }
+.ref.missing { background: var(--bad-soft); color: var(--bad-ink); border-color: color-mix(in srgb, var(--bad) 30%, transparent); }
 .ref.missing:hover, .ref.missing.hot { background: var(--bad); color: #fff; }
 
 /* Media gallery */
@@ -525,6 +558,34 @@ select { cursor: pointer; }
 .media-figure.wide video, .media-figure.wide img { object-fit: contain; }
 
 /* =========================================================================
+   Evidence browser
+   ========================================================================= */
+
+/* The second toolbar row holds the narrower facets; it reads as a continuation
+   of the first, so it sits closer and its controls are a touch smaller. */
+.toolbar.filters { margin-top: -8px; font-size: .86rem; }
+.toolbar.filters select { font-size: .86rem; }
+
+.evidence-card { transition: transform var(--base), box-shadow var(--base), border-color var(--base); }
+.evidence-card:hover { transform: translateY(-2px); border-color: var(--border-strong); box-shadow: var(--shadow-lg); }
+
+/* The claim an item was reconstructed for: context, not the subject of the
+   card, so it is set apart at the foot rather than competing with the
+   proposition. */
+.evidence-claim {
+    display: block; margin: 4px 16px 14px; padding: 10px 12px;
+    background: var(--surface-2); border-radius: var(--radius-sm);
+    color: var(--muted); font-size: .82rem;
+}
+.evidence-claim:hover { text-decoration: none; background: var(--surface-3); color: var(--text-soft); }
+.evidence-claim .label { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--text-soft); }
+.evidence-claim .label .when { margin-left: auto; font-weight: 500; color: var(--muted); }
+.evidence-claim .text {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; margin-top: 5px; line-height: 1.5;
+}
+
+/* =========================================================================
    Disclosure sections
    ========================================================================= */
 
@@ -553,10 +614,10 @@ details.disclose > .content { padding: 4px 16px 16px; animation: rise 320ms var(
     background: var(--surface-2); border-radius: var(--radius-sm);
     padding: 12px 14px; max-height: 460px; overflow: auto; white-space: pre;
 }
-.raw-json .k { color: var(--violet); }
-.raw-json .s { color: var(--ok); }
-.raw-json .n { color: var(--info); }
-.raw-json .b { color: var(--warn); }
+.raw-json .k { color: var(--violet-ink); }
+.raw-json .s { color: var(--ok-ink); }
+.raw-json .n { color: var(--info-ink); }
+.raw-json .b { color: var(--warn-ink); }
 .raw-json .z { color: var(--muted); }
 
 /* Field table for the "all stored fields" inspector */
@@ -604,7 +665,7 @@ details.disclose > .content { padding: 4px 16px 16px; animation: rise 320ms var(
 .matrix > div { background: var(--surface); padding: 11px 13px; font-size: .85rem; }
 .matrix .h { background: var(--surface-2); color: var(--muted); font-size: .76rem; font-weight: 600; }
 .matrix .cell { font-family: var(--mono); font-size: 1.05rem; font-weight: 600; }
-.matrix .cell.hi { color: var(--ok); }
+.matrix .cell.hi { color: var(--ok-ink); }
 .matrix .cell.lo { color: var(--muted); }
 
 /* =========================================================================
@@ -624,7 +685,7 @@ details.disclose > .content { padding: 4px 16px 16px; animation: rise 320ms var(
     border: 1px dashed var(--border-strong); border-radius: var(--radius);
 }
 .empty i, .error i { font-size: 1.9rem; opacity: .6; }
-.error { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: var(--bad-soft); }
+.error { color: var(--bad-ink); border-color: color-mix(in srgb, var(--bad) 40%, transparent); background: var(--bad-soft); }
 .error code { color: inherit; }
 
 .spinner { display: inline-block; width: 15px; height: 15px; border-radius: 99px;
@@ -667,3 +728,374 @@ details.disclose > .content { padding: 4px 16px 16px; animation: rise 320ms var(
 .spacer { flex: 1; }
 
 @keyframes grow-y { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+
+/* =========================================================================
+   MathJax
+   ========================================================================= */
+
+/* Until MathJax renders it, a math span shows its plain-text fallback; give
+   both forms the same rhythm so nothing jumps when typesetting completes. */
+.math { white-space: nowrap; font-family: var(--mono); font-size: .94em; }
+.math mjx-container { font-family: inherit; }
+mjx-container[jax="CHTML"] { line-height: inherit; }
+mjx-container[jax="CHTML"][display="true"] { margin: 0; }
+.card-head .math, .stat .foot .math, .chart-note .math { font-size: .96em; }
+
+/* =========================================================================
+   Axes and chart frames
+   ========================================================================= */
+
+.chart { width: 100%; }
+.histogram { width: 100%; height: auto; overflow: visible; }
+.histogram .grid { stroke: var(--border); stroke-width: 1; stroke-dasharray: 2 4; }
+.histogram .axis { stroke: var(--border-strong); stroke-width: 1; }
+.histogram .zero { stroke: var(--text-soft); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.histogram .col { transition: opacity var(--fast); }
+.histogram .col:hover { opacity: .75; }
+.histogram .tick { fill: var(--muted); font-size: 9.5px; font-family: var(--mono); }
+.histogram .axis-title { fill: var(--muted); font-size: 9.5px; letter-spacing: .04em; }
+
+.chart-note {
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+    color: var(--muted); font-size: .78rem; margin-top: 4px;
+}
+.chart-note span { display: inline-flex; align-items: center; gap: 7px; }
+.chart-note .swatch { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+
+.hist-panel { display: grid; gap: 14px; }
+.hist-summary { border-top: 1px solid var(--border); padding-top: 12px; }
+.hist-summary .kv { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 4px 20px; }
+
+.sub-label { color: var(--muted); font-size: .78rem; font-weight: 560; margin-bottom: 6px; }
+
+.note { color: var(--muted); font-size: .8rem; margin: 10px 0 0; line-height: 1.6; }
+.note code { color: var(--text-soft); }
+.warn-note { color: var(--warn-ink); display: flex; gap: 8px; align-items: flex-start; }
+
+.scroll-y { max-height: 320px; overflow-y: auto; padding-right: 4px; }
+
+/* =========================================================================
+   Horizontal stacked bars
+   ========================================================================= */
+
+.stack-rows { display: grid; gap: 6px; }
+.stack-row {
+    display: grid; grid-template-columns: minmax(78px, max-content) 1fr max-content;
+    gap: 12px; align-items: center;
+    animation: rise 380ms var(--ease) both; animation-delay: calc(var(--i, 0) * 22ms);
+}
+.stack-row .lbl { color: var(--text-soft); font-family: var(--mono); font-size: .76rem; white-space: nowrap; }
+.stack-row .num { font-family: var(--mono); font-size: .76rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stack-row:hover .lbl { color: var(--text); }
+.stack-track {
+    display: flex; height: 12px; border-radius: 99px; overflow: hidden;
+    background: var(--surface-3);
+}
+.stack-seg {
+    display: block; height: 100%; transform-origin: left;
+    animation: grow-x 560ms var(--ease) both; animation-delay: calc(var(--i, 0) * 22ms);
+    transition: filter var(--fast);
+}
+.stack-seg:hover { filter: brightness(1.15); }
+
+/* =========================================================================
+   Reconstruction funnel
+   ========================================================================= */
+
+.funnel { display: grid; gap: 7px; }
+.funnel-stage {
+    display: grid; grid-template-columns: minmax(150px, 28%) 1fr max-content 52px;
+    gap: 14px; align-items: center;
+    animation: rise 420ms var(--ease) both; animation-delay: calc(var(--i, 0) * 55ms);
+}
+.funnel-stage .lbl { color: var(--text-soft); font-size: .84rem; }
+.funnel-stage.terminal .lbl { color: var(--text); font-weight: 600; }
+.funnel-track {
+    position: relative; display: flex; height: 22px;
+    border-radius: var(--radius-sm); overflow: hidden; background: var(--surface-3);
+}
+.funnel-fill {
+    display: block; height: 100%; transform-origin: left;
+    animation: grow-x 640ms var(--ease) both; animation-delay: calc(var(--i, 0) * 55ms);
+    transition: filter var(--fast);
+}
+.funnel-fill:hover { filter: brightness(1.12); }
+.funnel-loss {
+    display: block; height: 100%;
+    background: repeating-linear-gradient(
+        135deg, color-mix(in srgb, var(--bad) 42%, transparent) 0 5px,
+        transparent 5px 10px);
+    border-left: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
+}
+.funnel-stage .num { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.15; }
+.funnel-stage .num strong { font-family: var(--mono); font-size: .92rem; font-variant-numeric: tabular-nums; }
+.funnel-stage .num small { color: var(--muted); font-size: .7rem; }
+.funnel-stage .drop {
+    font-family: var(--mono); font-size: .76rem; color: var(--bad-ink); text-align: right;
+}
+.funnel-stage .drop.none { color: var(--muted); opacity: .45; }
+
+@media (max-width: 720px) {
+    .funnel-stage { grid-template-columns: 1fr max-content; gap: 6px 10px; }
+    .funnel-stage .funnel-track { grid-column: 1 / -1; }
+    .funnel-stage .drop { display: none; }
+}
+
+/* =========================================================================
+   Media strip (list previews)
+   ========================================================================= */
+
+.media-strip { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 11px; }
+.media-thumb {
+    width: 58px; height: 44px; flex: none; border-radius: 7px; overflow: hidden;
+    display: grid; place-items: center;
+    background: var(--surface-3); border: 1px solid var(--border);
+    color: var(--muted); font-size: .82rem;
+    animation: rise 380ms var(--ease) both; animation-delay: calc(var(--i, 0) * 45ms);
+    transition: border-color var(--base), transform var(--base);
+}
+.claim-card:hover .media-thumb, .evidence-card:hover .media-thumb { border-color: var(--border-strong); }
+.media-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.media-thumb.missing { color: var(--bad-ink); background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 28%, transparent); }
+.media-thumb.more {
+    font-family: var(--mono); font-size: .74rem; font-weight: 600;
+    color: var(--text-soft); background: var(--surface-2);
+}
+
+/* One source inside its evidence item. The left rule carries the source's own
+   admissibility, so a lost source is visible without hiding that the item it
+   belongs to may well have survived through another one. */
+.evidence-source-block {
+    margin: 12px 16px 0;
+    border-left: 3px solid var(--neutral);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+}
+.evidence-source-block[data-admissible="true"] { border-left-color: var(--ok); }
+.evidence-source-block[data-admissible="false"] { border-left-color: var(--bad); }
+.evidence-source-block .evidence-source { margin: 0; background: transparent; }
+.evidence-source-block .evidence-facts { padding: 4px 12px 10px; }
+.evidence-source-block .evidence-foot { padding: 0 12px 12px; }
+
+/* =========================================================================
+   Collapsible cards
+   ========================================================================= */
+
+.collapsible { overflow: hidden; transition: background var(--fast); }
+
+/* Closed, the card *is* the button: the whole surface reacts and the cursor
+   says so everywhere, including over its text. `cursor` inherits, so this
+   reaches the proposition without having to enumerate what is inside it. */
+.collapsible:not(.open) { cursor: pointer; }
+.collapsible:not(.open):hover { background: var(--surface-2); }
+
+/* Open, only the header folds it away again; the body is ordinary content, with
+   the ordinary cursor and selectable text. */
+.collapsible.open > .collapsible-head:hover { background: var(--surface-2); }
+
+.collapsible-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 13px 16px; cursor: pointer; user-select: none;
+    transition: background var(--fast);
+}
+.collapsible-head:focus-visible { outline: none; background: var(--surface-2); }
+.collapsible-head .chev {
+    margin-left: auto; color: var(--muted); font-size: .8rem; padding-left: 4px;
+    transition: transform var(--base), color var(--fast);
+}
+.collapsible.open > .collapsible-head .chev { transform: rotate(90deg); color: var(--accent); }
+.collapsible-head .preview {
+    color: var(--muted); font-size: .82rem; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 46ch; min-width: 0;
+}
+.collapsible-head .name { font-weight: 600; font-size: .86rem; }
+.collapsible-head .kind { color: var(--accent); }
+/* A nested card has its own highlight, so the card around it must not light up
+   at the same time. */
+.collapsible:not(.open):has(.collapsible:hover) { background: transparent; }
+
+/* The body animates from a zero-height grid row to its own height, so nothing
+   has to be measured - which matters because bodies are filled in lazily. */
+.collapsible-body {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows var(--base);
+}
+.collapsible.open > .collapsible-body { grid-template-rows: 1fr; }
+.collapsible-clip { overflow: hidden; min-height: 0; padding: 0; }
+/* Once the row has settled, let tooltips and scroll areas out of the clip. */
+.collapsible-body[data-settled] > .collapsible-clip { overflow: visible; }
+
+.collapsible:not(.open) input,
+.collapsible:not(.open) textarea,
+.collapsible:not(.open) select { cursor: auto; }
+
+.icon-btn.small { width: 28px; height: 28px; border-radius: 8px; }
+.icon-btn.small i { font-size: .74rem; }
+
+.loading-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 18px 16px; color: var(--muted); font-size: .85rem;
+}
+
+/* --- evidence item ---------------------------------------------------- */
+
+/* The proposition sits between header and body, so a collapsed card still says
+   what it asserts. */
+.evidence > .collapsible-head { padding-bottom: 6px; }
+.evidence-tags { display: flex; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.evidence .proposition { padding: 2px 16px 14px; }
+.evidence .media-gallery { padding: 0 16px 14px; }
+.evidence-body { display: grid; gap: 2px; padding-bottom: 6px; }
+.evidence-body > .evidence-facts {
+    border-top: 1px solid var(--border); margin: 0 16px; padding: 11px 0;
+}
+
+.source-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px 8px; color: var(--muted);
+    font-size: .74rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+}
+.source-head i { color: var(--accent); }
+
+/* Two columns of sources inside one evidence item, one when there is no room. */
+.source-grid {
+    display: grid; gap: 12px; padding: 0 16px 14px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+}
+@media (max-width: 1020px) {
+    .source-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* --- source card ------------------------------------------------------- */
+
+.evidence-source-card { background: var(--surface-2); min-width: 0; }
+.evidence-source-card[data-admissible="true"]  { border-left: 3px solid var(--ok); }
+.evidence-source-card[data-admissible="false"] { border-left: 3px solid var(--bad); }
+.evidence-source-card[data-admissible="null"]  { border-left: 3px solid var(--warn); }
+.evidence-source-card > .collapsible-head { padding: 11px 14px; }
+.evidence-source-card .card-body { padding: 2px 14px 14px; display: grid; gap: 11px; }
+.evidence-source-card .evidence-facts { padding: 0; gap: 7px 16px; }
+.evidence-source-card details.disclose > summary { padding: 9px 0; }
+.evidence-source-card details.disclose > .content { padding: 2px 0 12px; }
+.evidence-source-card .locator { font-size: .8rem; }
+
+/* The locator as a button: it is the one thing a reader acts on most. */
+.btn.source-link {
+    justify-content: flex-start; gap: 9px; width: 100%; min-width: 0;
+    padding: 9px 12px; font-size: .84rem;
+    background: var(--surface); border-color: var(--border-strong);
+}
+.btn.source-link:hover {
+    border-color: var(--accent); color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+}
+.btn.source-link i { color: var(--accent); flex: none; }
+.btn.source-link .host { font-weight: 600; flex: none; }
+.btn.source-link .path {
+    color: var(--muted); font-family: var(--mono); font-size: .74rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+
+@media (max-width: 720px) {
+    .collapsible-head .preview { display: none; }
+}
+
+/* Verdict rationale */
+.rationale-reasoning { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 13px; }
+.rationale-reasoning h4 {
+    color: var(--muted); font-size: .78rem; font-weight: 600; margin-bottom: 7px;
+}
+.prose-text { line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* =========================================================================
+   Rendered Markdown (retrieved source content)
+   ========================================================================= */
+
+.source-content {
+    max-height: 460px; overflow: auto;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 10px 14px;
+}
+/* The gallery belongs inside the box with the text it illustrates. */
+.source-content .media-gallery { padding: 10px 0 2px; }
+.source-content .media-figure { width: 150px; }
+.markdown { font-size: .87rem; line-height: 1.7; overflow-wrap: anywhere; min-width: 0; }
+.markdown > *:first-child { margin-top: 0; }
+.markdown > *:last-child { margin-bottom: 0; }
+.markdown p { margin: 0 0 .85em; }
+.markdown h3, .markdown h4, .markdown h5, .markdown h6 {
+    margin: 1.1em 0 .45em; line-height: 1.35; color: var(--text);
+}
+.markdown h3 { font-size: 1rem; }
+.markdown h4 { font-size: .92rem; }
+.markdown h5, .markdown h6 { font-size: .86rem; color: var(--text-soft); }
+.markdown ul, .markdown ol { margin: 0 0 .85em; padding-left: 1.4em; }
+.markdown li { margin: .2em 0; }
+.markdown blockquote {
+    margin: 0 0 .85em; padding: .1em 0 .1em .9em;
+    border-left: 2px solid var(--border-strong); color: var(--text-soft);
+}
+.markdown pre {
+    margin: 0 0 .85em; padding: 10px 12px; overflow-x: auto;
+    background: var(--surface-2); border-radius: var(--radius-sm);
+}
+.markdown pre code { white-space: pre; }
+.markdown code {
+    background: var(--surface-2); padding: .1em .35em; border-radius: 4px;
+    font-size: .88em; overflow-wrap: anywhere;
+}
+.markdown hr { border: 0; border-top: 1px solid var(--border); margin: 1.1em 0; }
+.markdown a { overflow-wrap: anywhere; }
+.markdown img { max-width: 100%; }
+.markdown table { width: 100%; border-collapse: collapse; margin: 0 0 .85em; }
+
+/* Media inside a card must never push it wider. */
+.multimodal, .multimodal > * { min-width: 0; }
+.multimodal .media-gallery { max-width: 100%; }
+
+/* =========================================================================
+   Hover tooltip
+   ========================================================================= */
+
+.tip { position: relative; cursor: help; border-bottom: 1px dotted currentColor; }
+.tip::after {
+    content: attr(data-tip);
+    position: absolute; left: 0; top: calc(100% + 7px); z-index: 60;
+    min-width: 180px; max-width: min(46ch, 78vw); width: max-content;
+    padding: 8px 11px; border-radius: var(--radius-sm);
+    background: var(--text); color: var(--surface);
+    font-family: var(--font); font-size: .78rem; font-weight: 500;
+    line-height: 1.5; text-align: left; white-space: normal; text-transform: none;
+    letter-spacing: 0; box-shadow: var(--shadow-lg);
+    opacity: 0; visibility: hidden; transform: translateY(-3px);
+    transition: opacity var(--fast), transform var(--fast), visibility var(--fast);
+}
+.tip:hover::after, .tip:focus-visible::after {
+    opacity: 1; visibility: visible; transform: none;
+}
+/* Near the right edge, grow leftwards instead of off-screen. */
+.tip.right::after { left: auto; right: 0; }
+
+.toast.selectable {
+    user-select: all; cursor: text; max-width: min(90vw, 70ch);
+    font-family: var(--mono); font-size: .78rem; word-break: break-all; text-align: center;
+}
+
+/* Info icon beside a heading: the explanation is one hover away, and the
+   heading stays a heading. */
+.info-tip {
+    color: var(--muted); font-size: .82rem; cursor: help;
+    border: 0; margin-left: 2px; transition: color var(--fast);
+}
+.info-tip:hover, .info-tip:focus-visible { color: var(--accent); }
+.section > h2 .info-tip, .card-head .info-tip { margin-left: 0; }
+/* A hint slot holding only an icon should not stretch to the right edge. */
+.section > h2 > .hint:has(> .info-tip:only-child),
+.card-head > .hint:has(> .info-tip:only-child) { margin-left: 0; }
+
+/* Source cards already sit on `--surface-2`, so the generic hover would be a
+   no-op on them; they step one shade further instead. */
+.evidence-source-card:not(.open):hover { background: var(--surface-3); }
+.evidence-source-card.open > .collapsible-head:hover { background: var(--surface-3); }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 import asyncio
 
@@ -18,6 +19,28 @@ from veritas.models.base import Generation, Model, THINKING_BUDGETS
 from veritas.common.prompt import Prompt
 
 logging.getLogger("anthropic").setLevel(logging.WARNING)
+
+#: First Claude version that thinks adaptively. From here on, the model itself
+#: decides how much to think and the depth is steered by an effort level; the
+#: explicit `budget_tokens` of the older models is rejected with a 400.
+ADAPTIVE_THINKING_SINCE = (4, 6)
+
+#: Matches the version in both specifier layouts Anthropic has used:
+#: "claude-opus-4-6" / "claude-opus-5" and the older "claude-3-5-sonnet-...".
+#: The minor version is at most two digits, so that the date suffix of
+#: "claude-sonnet-4-20250514" is not mistaken for one.
+VERSION_PATTERN = re.compile(r"claude-(?:[a-z]+-)?(\d+)(?:-(\d{1,2})(?!\d))?")
+
+
+def uses_adaptive_thinking(specifier: str) -> bool:
+    """Whether the model takes `thinking={"type": "adaptive"}` plus an effort
+    level instead of an explicit thinking budget. Unrecognized specifiers are
+    assumed to be new models, i.e. adaptive."""
+    match = VERSION_PATTERN.match(specifier)
+    if not match:
+        return True
+    version = (int(match.group(1)), int(match.group(2) or 0))
+    return version >= ADAPTIVE_THINKING_SINCE
 
 
 def _format_image_anthropic(b64: str) -> dict:
@@ -91,12 +114,26 @@ class Claude(Model):
     ) -> Generation | None:
         messages = await to_anthropic_payload(prompt)
 
-        # Anthropic has no `reasoning_effort` parameter; it takes an explicit
-        # thinking budget instead. Without this mapping, passing the parameter
-        # (as the ensemble does) would drop Claude out of every call.
+        # Anthropic has no `reasoning_effort` parameter. Without this mapping,
+        # passing the parameter (as the ensemble does) would drop Claude out of
+        # every call. How the effort is expressed depends on the model, see
+        # `uses_adaptive_thinking`.
         if reasoning_effort:
-            budget = THINKING_BUDGETS.get(reasoning_effort.lower())
-            if budget:
+            effort = reasoning_effort.lower()
+            if uses_adaptive_thinking(self.specifier):
+                if effort == "none":
+                    kwargs["thinking"] = dict(type="disabled")
+                else:
+                    # `display="summarized"` because thinking blocks come back
+                    # with empty text otherwise (the default is "omitted" from
+                    # Claude 4.7 on), and `_extract_reasoning` reads the stored
+                    # reasoning traces off exactly those blocks.
+                    kwargs["thinking"] = dict(type="adaptive", display="summarized")
+                    kwargs["output_config"] = dict(effort=effort)
+                    # Thinking tokens count towards `max_tokens`; keep the
+                    # headroom the explicit budgets used to provide.
+                    max_tokens = max(max_tokens, THINKING_BUDGETS.get(effort, 0) + 1024)
+            elif budget := THINKING_BUDGETS.get(effort):
                 kwargs["thinking"] = dict(type="enabled", budget_tokens=budget)
                 # `max_tokens` must exceed the thinking budget.
                 max_tokens = max(max_tokens, budget + 1024)

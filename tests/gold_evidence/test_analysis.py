@@ -5,11 +5,10 @@ from datetime import datetime
 import pytest
 
 from tests.gold_evidence.conftest import make_evidence
-from veritas.gold_evidence.admissibility import apply_admissibility
 from veritas.gold_evidence.analysis import (
     ClaimRecord,
     aggregate,
-    build_evidence_record,
+    build_evidence_records,
     describe,
     mcnemar_exact,
     recoverability,
@@ -23,7 +22,8 @@ def claim_record(**overrides) -> ClaimRecord:
     base = dict(
         claim_id=1, t_c=T_C, t_f=T_F, status="accepted", reason=None, released=True,
         is_rectified=False, language="en", n_candidates=5, n_admissible=4,
-        n_in_window=1, n_undated=0, n_deferred=0, n_evidence_claim=3,
+        n_sources=5, n_in_window=1, n_undated=0, n_deferred=0, n_rationales=1,
+        n_essential=2, n_essential_lost=0, n_evidence_claim=3,
         n_evidence_fact_check=4,
         gold_integrity=-1.0, gold_veracity=-1.0, gold_context_coverage=None,
         has_media=False,
@@ -47,8 +47,7 @@ def test_claim_record_serializes_derived_fields():
 def test_evidence_record_carries_both_time_differences():
     evidence = make_evidence(available_since=datetime(2024, 5, 11),
                              before_claim=False, before_fact_check=True)
-    apply_admissibility(evidence)
-    row = build_evidence_record(evidence, claim_id=1, t_c=T_C, t_f=T_F)
+    row = build_evidence_records(evidence, claim_id=1, t_c=T_C, t_f=T_F)[0]
 
     assert row["t_e_minus_t_c_days"] == pytest.approx(10.0)
     assert row["t_e_minus_t_f_days"] == pytest.approx(-10.0)
@@ -58,9 +57,8 @@ def test_evidence_record_carries_both_time_differences():
 
 
 def test_evidence_record_of_an_undated_source():
-    evidence = make_evidence(available_since=None, kind=make_evidence().source.kind)
-    apply_admissibility(evidence)
-    row = build_evidence_record(evidence, claim_id=1, t_c=T_C, t_f=T_F)
+    evidence = make_evidence(available_since=None)
+    row = build_evidence_records(evidence, claim_id=1, t_c=T_C, t_f=T_F)[0]
     assert row["available_since"] is None
     assert row["t_e_minus_t_c_days"] is None
     assert row["in_window"] is False
@@ -84,8 +82,7 @@ def evidence_rows() -> list[dict]:
         evidence = make_evidence(locator=f"https://example.org/{i}",
                                  available_since=t_e, before_claim=before_claim,
                                  **kwargs)
-        apply_admissibility(evidence)
-        rows.append(build_evidence_record(evidence, claim_id=1, t_c=T_C, t_f=T_F))
+        rows.extend(build_evidence_records(evidence, claim_id=1, t_c=T_C, t_f=T_F))
     return rows
 
 
@@ -95,8 +92,8 @@ def test_aggregate_reports_the_window_quantities():
     result = aggregate(records, rows)
 
     assert result["n_evidence_candidates"] == 6
-    assert result["n_evidence_admissible"] == 4
-    assert result["n_evidence_in_window"] == 2
+    assert result["n_sources_admissible"] == 4
+    assert result["n_sources_in_window"] == 2
     assert result["share_evidence_in_window"] == pytest.approx(0.5)
     assert result["share_claims_with_window_evidence"] == pytest.approx(1.0)
     assert result["share_evidence_rejected"] == pytest.approx(2 / 6)
@@ -120,13 +117,38 @@ def test_aggregate_reports_instance_rejections():
     records = [
         claim_record(claim_id=1, status="accepted", reason=None),
         claim_record(claim_id=2, status="rejected", reason="insufficient_evidence"),
-        claim_record(claim_id=3, status="rejected", reason="no_admissible_evidence"),
+        claim_record(claim_id=3, status="rejected", reason="essential_evidence_lost"),
         claim_record(claim_id=4, status="rejected", reason="insufficient_evidence"),
     ]
     result = aggregate(records, [])
     assert result["instance_statuses"] == {"accepted": 1, "rejected": 3}
     assert result["share_instances_rejected_insufficient"] == pytest.approx(0.5)
-    assert result["share_instances_rejected_no_admissible"] == pytest.approx(0.25)
+    assert result["share_instances_rejected_essential_lost"] == pytest.approx(0.25)
+
+
+def test_aggregate_reports_rationales_and_evidence_free_instances():
+    """An empty evidence set is a category to report, not a rejection to count."""
+    records = [
+        claim_record(claim_id=1, n_admissible=0, n_rationales=1),
+        claim_record(claim_id=2, n_admissible=3, n_rationales=1),
+        claim_record(claim_id=3, n_admissible=2, n_rationales=0),
+    ]
+    result = aggregate(records, [])
+
+    assert result["share_claims_with_rationale"] == pytest.approx(2 / 3)
+    assert result["share_claims_without_admissible_evidence"] == pytest.approx(1 / 3)
+
+
+def test_aggregate_reports_how_redundantly_the_fact_checks_cite():
+    rows = [
+        {"claim_id": 1, "evidence_id": 1},
+        {"claim_id": 1, "evidence_id": 1},
+        {"claim_id": 1, "evidence_id": 2},
+    ]
+    sizes = aggregate([claim_record()], rows)["sources_per_evidence"]
+
+    assert sizes["n"] == 2          # one item with two sources, one with a single
+    assert sizes["max"] == 2.0
 
 
 def test_aggregate_on_empty_input_does_not_crash():
@@ -148,9 +170,9 @@ def test_contingency_counts_the_four_cells():
     ]
     result = recoverability(records)
     assert result["contingency"] == {
-        "both": 1, "only_E_claim": 1, "only_E_factcheck": 2, "neither": 1}
-    assert result["recoverable_from_E_claim"] == 2
-    assert result["recoverable_from_E_factcheck"] == 3
+        "both": 1, "only_E_c": 1, "only_E_f": 2, "neither": 1}
+    assert result["recoverable_from_E_c"] == 2
+    assert result["recoverable_from_E_f"] == 3
     assert result["gain_from_fact_check_period"] == pytest.approx(0.2)
 
 

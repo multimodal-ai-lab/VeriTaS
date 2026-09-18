@@ -19,6 +19,9 @@ ITEM_REF_REGEX = re.compile(rf"<(?:{'|'.join(KINDS)}):[0-9]+>")
 #: Same, but capturing kind and identifier separately.
 ITEM_KIND_ID_REGEX = re.compile(rf"<({'|'.join(KINDS)}):([0-9]+)>")
 
+#: Per-kind reference patterns, so images and videos can be filtered separately.
+KIND_REF_REGEX = {kind: re.compile(rf"<{kind}:[0-9]+>") for kind in KINDS}
+
 
 def parse_reference(reference: str) -> tuple[str, int] | None:
     """Splits `<image:42>` into `("image", 42)`. None if it is not a reference."""
@@ -46,6 +49,14 @@ def unique_references(text: str | None) -> list[str]:
 
 def has_media(text: str | None) -> bool:
     return bool(find_references(text))
+
+
+def has_kind(text: str | None, kind: str) -> bool:
+    """Whether the text references at least one item of that kind."""
+    pattern = KIND_REF_REGEX.get(kind)
+    if pattern is None or not text:
+        return False
+    return pattern.search(text) is not None
 
 
 def segment(text: str | None) -> list[dict]:

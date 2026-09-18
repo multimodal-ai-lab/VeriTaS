@@ -135,3 +135,41 @@ def test_a_cached_item_is_re_resolved_when_its_file_disappears(store):
     assert registry.get("image", 42).exists is True
     path.unlink()  # e.g. quarantined by scripts/cleanup_media.py
     assert registry.get("image", 42).exists is False
+
+
+def test_resolution_never_lists_the_media_directory(store, monkeypatch):
+    """The store holds hundreds of thousands of files in one directory per kind.
+    Listing or globbing it once per reference dominated the response time, so
+    resolution must be `stat`-only."""
+    calls = []
+    for name in ("glob", "rglob", "iterdir"):
+        monkeypatch.setattr(Path, name,
+                            lambda self, *a, _n=name, **k: calls.append(_n) or iter(()))
+
+    (store / "image" / "42.webp").write_bytes(b"webp")
+    register(store, "image", 42, "/gone/42.webp")
+    registry = registry_for(store)
+
+    assert registry.get("image", 42).file_path.name == "42.webp"
+    assert registry.get("image", 99).exists is False   # a miss must not scan either
+    assert calls == []
+
+
+def test_a_missing_item_is_only_probed_once(store):
+    registry = registry_for(store)
+    assert registry.get("image", 404).exists is False
+    # The second call is served from the cache rather than re-probing every
+    # extension against the filesystem.
+    assert registry.get("image", 404) is registry.get("image", 404)
+
+
+@pytest.mark.parametrize("name", ["7.jpg", "7.png", "7.webp", "7.gif", "7.avif"])
+def test_common_image_extensions_are_probed(store, name):
+    (store / "image" / name).write_bytes(b"data")
+    assert registry_for(store).get("image", 7).file_path.name == name
+
+
+@pytest.mark.parametrize("name", ["3.mp4", "3.webm", "3.mov", "3.mkv"])
+def test_common_video_extensions_are_probed(store, name):
+    (store / "video" / name).write_bytes(b"data")
+    assert registry_for(store).get("video", 3).file_path.name == name

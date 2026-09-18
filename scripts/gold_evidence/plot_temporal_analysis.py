@@ -93,7 +93,7 @@ def plot_composition(aggregates: dict, out_dir: str, fmt: str) -> None:
 
 
 def plot_recoverability(aggregates: dict, out_dir: str, fmt: str) -> None:
-    """The central comparison: recoverability from E_claim vs E_factcheck."""
+    """The central comparison: recoverability from E_c vs E_f."""
     import matplotlib.pyplot as plt
 
     recoverability = aggregates.get("recoverability", {})
@@ -103,8 +103,8 @@ def plot_recoverability(aggregates: dict, out_dir: str, fmt: str) -> None:
 
     fig, (ax_bar, ax_matrix) = plt.subplots(1, 2, figsize=(12, 4.5), dpi=300)
 
-    rates = [recoverability.get("rate_E_claim") or 0.0,
-             recoverability.get("rate_E_factcheck") or 0.0]
+    rates = [recoverability.get("rate_E_c") or 0.0,
+             recoverability.get("rate_E_f") or 0.0]
     ax_bar.bar(["$E_{claim}$", "$E_{factcheck}$"], rates,
                color=[COLORS["blue"], COLORS["orange"]], width=0.55)
     for i, rate in enumerate(rates):
@@ -115,8 +115,8 @@ def plot_recoverability(aggregates: dict, out_dir: str, fmt: str) -> None:
     ax_bar.spines[["top", "right"]].set_visible(False)
 
     matrix = [
-        [contingency.get("both", 0), contingency.get("only_E_claim", 0)],
-        [contingency.get("only_E_factcheck", 0), contingency.get("neither", 0)],
+        [contingency.get("both", 0), contingency.get("only_E_c", 0)],
+        [contingency.get("only_E_f", 0), contingency.get("neither", 0)],
     ]
     image = ax_matrix.imshow(matrix, cmap="Oranges")
     ax_matrix.set_xticks([0, 1], ["recoverable", "not recoverable"])

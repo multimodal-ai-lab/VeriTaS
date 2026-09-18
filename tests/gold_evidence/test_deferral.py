@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from tests.gold_evidence.conftest import make_evidence
+from tests.gold_evidence.conftest import make_evidence, make_source
 from veritas.gold_evidence import filtering as filtering_module
 from veritas.gold_evidence.retrieval import SourceRetrieval
 
@@ -24,7 +24,7 @@ def retrieval(monkeypatch):
                                        error="slow down"),
              "saves": []}
 
-    async def fake_retrieve(locator, session=None, determine_time=True):
+    async def fake_retrieve(locator, determine_time=True):
         return state["result"]
 
     async def fake_save(self):
@@ -35,45 +35,66 @@ def retrieval(monkeypatch):
     return state
 
 
+async def filter_one(**kwargs):
+    """Filters a single source and returns it together with its evidence item."""
+    evidence = make_evidence(decided=False, **kwargs)
+    source = evidence.sources[0]
+    await filtering_module.filter_source(source, evidence=evidence, claim=None,
+                                         t_c=T_C, t_f=T_F)
+    return evidence, source
+
+
 @pytest.mark.asyncio
 async def test_rate_limited_source_is_deferred_not_rejected(retrieval):
-    evidence = make_evidence(filtered=False)
-    await filtering_module.filter_single(evidence, claim=None, t_c=T_C, t_f=T_F)
+    evidence, source = await filter_one()
 
-    assert evidence.deferred is True
-    assert evidence.deferred_until > datetime.now()
+    assert source.deferred is True
+    assert source.deferred_until > datetime.now()
     # Deliberately left unjudged, so a later run evaluates it properly.
+    assert source.admissible is None
+    assert source.accessible is None
+    assert source.filtered is False
+    # The item waits with it: it is not decided while a source is still pending.
+    assert evidence.deferred is True
     assert evidence.admissible is None
-    assert evidence.accessible is None
-    assert evidence.filtered is False
 
 
 @pytest.mark.asyncio
 async def test_deferral_window_is_configurable(retrieval, monkeypatch):
     monkeypatch.setattr(filtering_module, "defer_hours", 2)
-    evidence = make_evidence(filtered=False)
-    await filtering_module.filter_single(evidence, claim=None, t_c=T_C, t_f=T_F)
+    _, source = await filter_one()
 
-    assert evidence.deferred_until <= datetime.now() + timedelta(hours=2, minutes=1)
+    assert source.deferred_until <= datetime.now() + timedelta(hours=2, minutes=1)
 
 
 @pytest.mark.asyncio
 async def test_a_plain_failure_is_still_recorded_as_inaccessible(retrieval):
     retrieval["result"] = SourceRetrieval(accessible=False, error="404 not found")
-    evidence = make_evidence(filtered=False)
-    await filtering_module.filter_single(evidence, claim=None, t_c=T_C, t_f=T_F)
+    evidence, source = await filter_one()
 
-    assert evidence.deferred is False
-    assert evidence.accessible is False
-    assert evidence.admissible is False
-    assert evidence.inadmissibility_reason == "inaccessible"
+    assert source.deferred is False
+    assert source.accessible is False
+    assert source.admissible is False
+    assert source.inadmissibility_reason == "inaccessible"
+    assert evidence.admissible is False  # its only source is gone
 
 
 @pytest.mark.asyncio
 async def test_an_expired_deferral_no_longer_counts(retrieval):
-    evidence = make_evidence(filtered=False)
-    evidence.deferred_until = datetime.now() - timedelta(hours=1)
-    assert evidence.deferred is False
+    source = make_source(filtered=False)
+    source.deferred_until = datetime.now() - timedelta(hours=1)
+    assert source.deferred is False
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_source_does_not_hold_up_a_surviving_item(retrieval):
+    """Only the deferred source waits; the item is still carried by the other one."""
+    evidence = make_evidence(sources=[make_source(locator="https://a/1"),
+                                      make_source(locator="https://a/2", filtered=False)])
+    evidence.sources[1].defer(hours=24)
+
+    assert evidence.deferred is True          # a source is still pending ...
+    assert evidence.admissible is True        # ... but the proposition already holds
 
 
 # --- Pipeline level -----------------------------------------------------------
@@ -92,6 +113,9 @@ async def test_a_claim_with_deferred_evidence_is_not_rejected(monkeypatch):
         async def get_evidence_for_claim(self, claim_id, admissible_only=False):
             return []
 
+        async def get_verdict_rationales_for_claim(self, claim_id):
+            return []
+
         async def set_gold_evidence_status(self, claim_id, status, reason=None):
             self.status_writes.append((status, reason))
 
@@ -99,11 +123,13 @@ async def test_a_claim_with_deferred_evidence_is_not_rejected(monkeypatch):
             raise AssertionError("Stage 3 must not run on an incomplete evidence set")
 
     fake_db = FakeDB()
-    deferred_item = make_evidence(filtered=False)
-    deferred_item.deferred_until = datetime.now() + timedelta(hours=24)
+    deferred_item = make_evidence(decided=False)
+    deferred_item.sources[0].deferred_until = datetime.now() + timedelta(hours=24)
 
     async def fake_extract(claim, **kwargs):
-        return [deferred_item]
+        from veritas.gold_evidence.extraction import Extraction
+
+        return Extraction(evidence=[deferred_item])
 
     async def fake_filter(claim, evidence, **kwargs):
         return []

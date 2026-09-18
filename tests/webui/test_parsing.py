@@ -4,6 +4,7 @@ import pytest
 
 from webui.parsing import (
     describe_multimodal,
+    has_kind,
     domain_of,
     find_references,
     has_media,
@@ -100,3 +101,23 @@ def test_describe_multimodal_on_text_only():
 ])
 def test_domain_of(url, expected):
     assert domain_of(url) == expected
+
+
+@pytest.mark.parametrize("text,kind,expected", [
+    ("a <image:1> b", "image", True),
+    ("a <image:1> b", "video", False),
+    ("a <video:9> b", "video", True),
+    ("a <video:9> b", "image", False),
+    ("<audio:3>", "audio", True),
+    ("plain text", "image", False),
+    (None, "image", False),
+    ("<image:1>", "pdf", False),
+])
+def test_has_kind(text, kind, expected):
+    assert has_kind(text, kind) is expected
+
+
+def test_has_kind_does_not_match_a_prefix_of_another_kind():
+    # `<video:1>` must not satisfy a search for images just because both are media.
+    assert has_kind("<video:1>", "image") is False
+    assert has_media("<video:1>") is True

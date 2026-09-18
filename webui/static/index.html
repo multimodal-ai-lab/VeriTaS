@@ -16,6 +16,22 @@
           href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
           crossorigin="anonymous" referrerpolicy="no-referrer">
     <link rel="stylesheet" href="/static/css/style.css">
+
+    <!-- MathJax renders the notation the pipeline's documentation uses (t_c, t_f,
+         t_e, E_c, E_f). Typesetting is driven from js/math.js, never on load, so
+         nothing is typeset twice and the page still reads correctly when the CDN
+         is unreachable. -->
+    <script>
+        window.MathJax = {
+            tex: {inlineMath: [['\\(', '\\)']], displayMath: []},
+            options: {enableMenu: false, skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']},
+            startup: {typeset: false},
+            chtml: {scale: 1, displayAlign: 'left'}
+        };
+    </script>
+    <script id="MathJax-script" async
+            src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js"
+            crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </head>
 <body>
 <div class="app">
@@ -31,6 +47,7 @@
         <nav class="nav" id="nav">
             <a href="#/" data-route="overview"><i class="fa-solid fa-chart-pie"></i><span>Overview</span></a>
             <a href="#/claims" data-route="claims"><i class="fa-solid fa-list-check"></i><span>Claims</span></a>
+            <a href="#/evidence" data-route="evidence"><i class="fa-solid fa-layer-group"></i><span>Evidence</span></a>
         </nav>
 
         <div class="topbar-spacer"></div>

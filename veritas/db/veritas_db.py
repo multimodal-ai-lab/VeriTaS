@@ -343,49 +343,39 @@ class VeritasDB(Database):
             """
         )
 
-        # Reconstructed gold evidence
+        # Reconstructed gold evidence. `evidence` is the aggregation layer - one
+        # proposition and the role it plays - while `evidence_sources` holds the
+        # places that proposition can be read and everything Stage 2 decides about
+        # them. An item survives as long as one of its sources does.
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS evidence
             (
-                id                      SERIAL PRIMARY KEY,
-                claim_id                INT     NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
-                review_id               INT,
-                article_id              INT,
-                proposition             TEXT    NOT NULL,
-                proposition_hash        INTEGER NOT NULL,
-                source_name             TEXT,
-                source_kind             TEXT,
-                -- NULL for sources that are not publications: a tool without a
-                -- page, or offline evidence such as an interview.
-                source_locator          TEXT,
-                source_locator_hash     INTEGER,
-                source_proximity        TEXT,
-                source_raw_content      TEXT,
-                available_since         TIMESTAMP,
-                role                    TEXT,
-                accessed_at             TIMESTAMP,
-                extraction_reasoning    TEXT,
-                extraction_confidence   FLOAT,
-                accessible              BOOLEAN,
-                faithfulness_assessment FLOAT,
-                faithfulness_reasoning  TEXT,
-                faithfulness_justification TEXT,
-                before_fact_check       BOOLEAN,
-                before_claim            BOOLEAN,
-                later_event             BOOLEAN,
-                temporal_reasoning      TEXT,
-                temporal_justification  TEXT,
-                admissible              BOOLEAN,
-                inadmissibility_reason  TEXT,
-                dismissed               BOOLEAN   DEFAULT FALSE,
-                dismissed_reason        TEXT      DEFAULT NULL,
-                deferred_until          TIMESTAMP,
-                full_evidence           JSONB,
-                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_evidence
-                    UNIQUE (claim_id, source_locator_hash, proposition_hash)
+                id                    SERIAL PRIMARY KEY,
+                claim_id              INT     NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                review_id             INT,
+                article_id            INT,
+                proposition           TEXT    NOT NULL,
+                proposition_hash      INTEGER NOT NULL,
+                role                  TEXT,
+                extraction_reasoning  TEXT,
+                extraction_confidence FLOAT,
+                -- Derived from the sources, stored for querying and aggregation.
+                admissible            BOOLEAN,
+                inadmissibility_reason TEXT,
+                -- §3.3 (3), judged for the proposition rather than per source
+                later_event           BOOLEAN,
+                later_event_reasoning TEXT,
+                later_event_justification TEXT,
+                later_event_rater     TEXT,
+                n_sources             INT       DEFAULT 0,
+                n_admissible_sources  INT       DEFAULT 0,
+                available_since       TIMESTAMP,
+                dismissed             BOOLEAN   DEFAULT FALSE,
+                dismissed_reason      TEXT      DEFAULT NULL,
+                full_evidence         JSONB,
+                created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS evidence_claim_id_idx
                 ON evidence (claim_id);
@@ -394,50 +384,124 @@ class VeritasDB(Database):
             CREATE INDEX IF NOT EXISTS evidence_available_since_idx
                 ON evidence (available_since);
 
-            -- Optional helper index for checking deferral windows on evidence
-            CREATE INDEX IF NOT EXISTS evidence_deferred_until_idx
-                ON evidence (deferred_until);
-
-            -- Migrations for tables created by an earlier version
-            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS deferred_until TIMESTAMP;
-            ALTER TABLE evidence DROP COLUMN IF EXISTS professional_fact_check;
-            ALTER TABLE evidence DROP COLUMN IF EXISTS concurrent_fact_check;
-            ALTER TABLE evidence ALTER COLUMN source_locator DROP NOT NULL;
-            ALTER TABLE evidence ALTER COLUMN source_locator_hash DROP NOT NULL;
+            CREATE TABLE IF NOT EXISTS evidence_sources
+            (
+                id                      SERIAL PRIMARY KEY,
+                evidence_id             INT     NOT NULL REFERENCES evidence (id) ON DELETE CASCADE,
+                claim_id                INT     NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                name                    TEXT,
+                kind                    TEXT,
+                -- NULL for sources that are not publications: a tool without a
+                -- page, or offline evidence such as an interview. The key hash
+                -- falls back to the name, so it is never NULL and the uniqueness
+                -- constraint covers those sources too.
+                locator                 TEXT,
+                source_key_hash         INTEGER NOT NULL,
+                proximity               TEXT,
+                raw_content             TEXT,
+                available_since         TIMESTAMP,
+                accessed_at             TIMESTAMP,
+                accessible              BOOLEAN,
+                faithfulness_assessment FLOAT,
+                faithfulness_reasoning  TEXT,
+                faithfulness_justification TEXT,
+                before_fact_check       BOOLEAN,
+                before_claim            BOOLEAN,
+                admissible              BOOLEAN,
+                inadmissibility_reason  TEXT,
+                deferred_until          TIMESTAMP,
+                dismissed_reason        TEXT,
+                full_source             JSONB,
+                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_evidence_source UNIQUE (evidence_id, source_key_hash)
+            );
+            CREATE INDEX IF NOT EXISTS evidence_sources_evidence_idx
+                ON evidence_sources (evidence_id);
+            CREATE INDEX IF NOT EXISTS evidence_sources_claim_idx
+                ON evidence_sources (claim_id);
+            CREATE INDEX IF NOT EXISTS evidence_sources_admissible_idx
+                ON evidence_sources (claim_id, admissible);
+            CREATE INDEX IF NOT EXISTS evidence_sources_available_since_idx
+                ON evidence_sources (available_since);
+            CREATE INDEX IF NOT EXISTS evidence_sources_deferred_until_idx
+                ON evidence_sources (deferred_until);
             """
         )
 
-        # A missing locator must not defeat the uniqueness constraint: by default
-        # PostgreSQL treats NULLs as distinct, so two extractions of the same
-        # offline source would insert twice instead of upserting. NULLS NOT
-        # DISTINCT fixes that from PostgreSQL 15 on; older servers keep the plain
-        # constraint, where locator-less rows are simply not covered by it.
+        # Sources used to be columns on `evidence`, one per item. Those columns
+        # and the uniqueness constraint built on them are simply dropped: the
+        # reconstruction is re-run rather than migrated, so there is nothing to
+        # carry over. Everything here is a no-op on a database created since.
         await self._execute(
             """
-            DO
-            $$
-                DECLARE
-                    nulls_are_distinct BOOLEAN;
-                BEGIN
-                    IF current_setting('server_version_num')::INT < 150000 THEN
-                        RETURN;
-                    END IF;
-                    EXECUTE 'SELECT EXISTS (SELECT 1
-                                            FROM pg_constraint c
-                                                     JOIN pg_index i ON i.indexrelid = c.conindid
-                                            WHERE c.conrelid = ''evidence''::REGCLASS
-                                              AND c.conname = ''unique_evidence''
-                                              AND NOT i.indnullsnotdistinct)'
-                        INTO nulls_are_distinct;
-                    IF nulls_are_distinct THEN
-                        ALTER TABLE evidence DROP CONSTRAINT unique_evidence;
-                        EXECUTE 'ALTER TABLE evidence
-                            ADD CONSTRAINT unique_evidence
-                                UNIQUE NULLS NOT DISTINCT (claim_id, source_locator_hash,
-                                                           proposition_hash)';
-                    END IF;
-                END
-            $$;
+            ALTER TABLE evidence
+                DROP CONSTRAINT IF EXISTS unique_evidence,
+                DROP COLUMN IF EXISTS source_name,
+                DROP COLUMN IF EXISTS source_kind,
+                DROP COLUMN IF EXISTS source_locator,
+                DROP COLUMN IF EXISTS source_locator_hash,
+                DROP COLUMN IF EXISTS source_proximity,
+                DROP COLUMN IF EXISTS source_raw_content,
+                DROP COLUMN IF EXISTS corroboration_group,
+                DROP COLUMN IF EXISTS accessed_at,
+                DROP COLUMN IF EXISTS accessible,
+                DROP COLUMN IF EXISTS faithfulness_assessment,
+                DROP COLUMN IF EXISTS faithfulness_reasoning,
+                DROP COLUMN IF EXISTS faithfulness_justification,
+                DROP COLUMN IF EXISTS before_fact_check,
+                DROP COLUMN IF EXISTS before_claim,
+                DROP COLUMN IF EXISTS later_event,
+                DROP COLUMN IF EXISTS temporal_reasoning,
+                DROP COLUMN IF EXISTS temporal_justification,
+                DROP COLUMN IF EXISTS deferred_until,
+                DROP COLUMN IF EXISTS professional_fact_check,
+                DROP COLUMN IF EXISTS concurrent_fact_check;
+
+            -- Columns the aggregation layer gained.
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS n_sources INT DEFAULT 0;
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS n_admissible_sources INT DEFAULT 0;
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS available_since TIMESTAMP;
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS later_event BOOLEAN;
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS later_event_reasoning TEXT;
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS later_event_justification TEXT;
+            ALTER TABLE evidence ADD COLUMN IF NOT EXISTS later_event_rater TEXT;
+
+            -- The later-event judgement moved to the item it is about.
+            ALTER TABLE evidence_sources
+                DROP COLUMN IF EXISTS later_event,
+                DROP COLUMN IF EXISTS temporal_reasoning,
+                DROP COLUMN IF EXISTS temporal_justification;
+
+            -- One item per proposition and claim; `insert_evidence` upserts on it.
+            CREATE UNIQUE INDEX IF NOT EXISTS evidence_claim_proposition_idx
+                ON evidence (claim_id, proposition_hash);
+
+            -- A compatibility view from the transition to `evidence_sources`.
+            DROP VIEW IF EXISTS evidence_sources_view;
+            """
+        )
+
+        # The reasoning that bridges evidence and verdict, one per fact-checking
+        # article. Kept apart from `evidence`: it asserts no externally verifiable
+        # fact of its own, so none of the Stage-2 criteria apply to it.
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS verdict_rationales
+            (
+                id                   SERIAL PRIMARY KEY,
+                claim_id             INT  NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                review_id            INT,
+                article_id           INT,
+                rationale            TEXT NOT NULL,
+                extraction_reasoning TEXT,
+                full_rationale       JSONB,
+                created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_verdict_rationale UNIQUE (claim_id, review_id)
+            );
+            CREATE INDEX IF NOT EXISTS verdict_rationales_claim_idx
+                ON verdict_rationales (claim_id);
             """
         )
 
@@ -451,6 +515,8 @@ class VeritasDB(Database):
                 condition         TEXT NOT NULL,
                 ensemble_mode     TEXT NOT NULL,
                 n_evidence        INT       DEFAULT 0,
+                -- Whether the ensemble also saw a verdict rationale (§19)
+                with_rationale    BOOLEAN   DEFAULT FALSE,
                 predicted_verdict JSONB,
                 member_responses  JSONB,
                 property_diffs    JSONB,
@@ -466,6 +532,10 @@ class VeritasDB(Database):
             );
             CREATE INDEX IF NOT EXISTS gold_evidence_results_claim_idx
                 ON gold_evidence_results (claim_id);
+
+            -- Migration for tables created by an earlier version
+            ALTER TABLE gold_evidence_results
+                ADD COLUMN IF NOT EXISTS with_rationale BOOLEAN DEFAULT FALSE;
             """
         )
 
@@ -996,42 +1066,71 @@ class VeritasDB(Database):
     # ------------------------------------------------------------------
 
     async def insert_evidence(self, evidence: "Evidence") -> int:
-        """Adds a reconstructed evidence item to the database and returns its ID.
-        If an identical item (same claim, locator and proposition) already exists,
-        that row is updated instead and its ID returned.
+        """Adds a reconstructed evidence item and its sources, and returns its ID.
 
-        Items without a locator match each other on claim and proposition alone,
-        which is what `UNIQUE NULLS NOT DISTINCT` on `evidence` provides. On
-        PostgreSQL below 15 they are not covered by the constraint and a repeated
-        insert adds a second row; nothing in the pipeline does that, because
-        extraction deduplicates in memory and re-extraction deletes first."""
+        One item per claim and proposition: a second extraction of the same
+        proposition updates the stored item and contributes its sources to it,
+        which is how redundancy across two fact-checking articles is collected."""
         columns, values = _evidence_columns(evidence)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
         updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns
-                            if c not in ("claim_id", "proposition", "proposition_hash",
-                                         "source_locator", "source_locator_hash"))
+                            if c not in ("claim_id", "proposition", "proposition_hash"))
         query = f"""
                 INSERT INTO evidence ({", ".join(columns)})
                 VALUES ({placeholders})
-                ON CONFLICT ON CONSTRAINT unique_evidence DO UPDATE
+                ON CONFLICT (claim_id, proposition_hash) DO UPDATE
                     SET {updates}, updated_at = CURRENT_TIMESTAMP
                 RETURNING id;
                 """
-        return await self._fetchval(query, *values)
+        evidence_id = await self._fetchval(query, *values)
+        await self._save_evidence_sources(evidence, evidence_id)
+        return evidence_id
 
     async def update_evidence(self, evidence: "Evidence") -> None:
-        """Updates an existing evidence item."""
+        """Updates an existing evidence item and its sources."""
         assert evidence.id is not None, "Evidence must have an ID."
         columns, values = _evidence_columns(evidence)
         assignments = ", ".join(f"{c} = ${i + 1}" for i, c in enumerate(columns))
         query = (f"UPDATE evidence SET {assignments}, updated_at = CURRENT_TIMESTAMP "
                  f"WHERE id = ${len(values) + 1};")
         await self._execute(query, *values, evidence.id)
+        await self._save_evidence_sources(evidence, evidence.id)
+
+    async def _save_evidence_sources(self, evidence: "Evidence", evidence_id: int) -> None:
+        """Writes the item's sources and removes the ones it no longer carries.
+
+        Sources are upserted rather than replaced, so their IDs - and with them any
+        link the UI holds - survive a re-filtering. One transaction, so an item is
+        never left with a half-written set of sources."""
+        keys = [_source_key_hash(source) for source in evidence.sources]
+        async with self._transaction() as conn:
+            for source, key in zip(evidence.sources, keys):
+                source.evidence_id = evidence_id
+                columns, values = _source_columns(source, evidence_id, evidence.claim_id)
+                placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
+                updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns
+                                    if c not in ("evidence_id", "source_key_hash"))
+                source.id = await conn.fetchval(
+                    f"""
+                    INSERT INTO evidence_sources ({", ".join(columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT ON CONSTRAINT unique_evidence_source DO UPDATE
+                        SET {updates}, updated_at = CURRENT_TIMESTAMP
+                    RETURNING id;
+                    """,
+                    *values)
+            await conn.execute(
+                "DELETE FROM evidence_sources "
+                # An empty key list deletes every source, which is what an item
+                # that lost all of them should end up with.
+                "WHERE evidence_id = $1 AND NOT (source_key_hash = ANY($2::INT[]));",
+                evidence_id, keys)
 
     async def get_evidence_by_id(self, evidence_id: int) -> "Evidence | None":
         row = await self._fetchrow("SELECT id, full_evidence FROM evidence WHERE id = $1", evidence_id)
         if row:
-            return row_to_evidence(row)
+            items = await self._attach_sources([row_to_evidence(row)])
+            return items[0]
 
     async def get_evidence_for_claim(self, claim_id: int,
                                      admissible_only: bool = False) -> list["Evidence"]:
@@ -1041,7 +1140,7 @@ class VeritasDB(Database):
             query += " AND admissible IS TRUE"
         query += " ORDER BY id;"
         rows = await self._fetch(query, claim_id)
-        return [row_to_evidence(row) for row in rows]
+        return await self._attach_sources([row_to_evidence(row) for row in rows])
 
     async def get_evidence_for_claims(self, claim_ids: list[int]) -> dict[int, list["Evidence"]]:
         """Bulk variant of `get_evidence_for_claim` for the analysis scripts."""
@@ -1052,14 +1151,33 @@ class VeritasDB(Database):
             claim_ids,
         )
         result: dict[int, list] = {claim_id: [] for claim_id in claim_ids}
-        for row in rows:
-            result[row["claim_id"]].append(row_to_evidence(row))
+        items = await self._attach_sources([row_to_evidence(row) for row in rows])
+        for row, item in zip(rows, items):
+            result[row["claim_id"]].append(item)
         return result
+
+    async def _attach_sources(self, evidence: list["Evidence"]) -> list["Evidence"]:
+        """Loads the sources of the given items. They live in their own table, so
+        that Stage 2 can decide each of them separately and the UI can query them."""
+        ids = [item.id for item in evidence if item.id is not None]
+        if not ids:
+            return evidence
+        rows = await self._fetch(
+            "SELECT id, evidence_id, full_source FROM evidence_sources "
+            "WHERE evidence_id = ANY($1) ORDER BY id;",
+            ids)
+        by_evidence: dict[int, list] = {}
+        for row in rows:
+            by_evidence.setdefault(row["evidence_id"], []).append(row_to_evidence_source(row))
+        for item in evidence:
+            item.sources = by_evidence.get(item.id, [])
+        return evidence
 
     async def delete_evidence_for_claim(self, claim_id: int) -> int:
         """Removes all reconstructed evidence of a claim and returns how many rows
         were deleted. Used before a re-extraction, so that items the new run no
-        longer produces do not survive as orphans."""
+        longer produces do not survive as orphans. The sources follow the items
+        through `ON DELETE CASCADE`."""
         result = await self._execute("DELETE FROM evidence WHERE claim_id = $1;", claim_id)
         try:
             return int(str(result).split()[-1])
@@ -1068,6 +1186,62 @@ class VeritasDB(Database):
 
     async def count_evidence_for_claim(self, claim_id: int) -> int:
         return await self._fetchval("SELECT COUNT(*) FROM evidence WHERE claim_id = $1", claim_id)
+
+    # -- Verdict rationales -------------------------------------------------
+
+    async def insert_verdict_rationale(self, rationale: "VerdictRationale") -> int:
+        """Adds a verdict rationale and returns its ID. A second extraction of the
+        same article updates the stored row instead of adding another one."""
+        columns, values = _rationale_columns(rationale)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns
+                            if c not in ("claim_id", "review_id"))
+        query = f"""
+                INSERT INTO verdict_rationales ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT ON CONSTRAINT unique_verdict_rationale DO UPDATE
+                    SET {updates}, updated_at = CURRENT_TIMESTAMP
+                RETURNING id;
+                """
+        return await self._fetchval(query, *values)
+
+    async def update_verdict_rationale(self, rationale: "VerdictRationale") -> None:
+        assert rationale.id is not None, "Verdict rationale must have an ID."
+        columns, values = _rationale_columns(rationale)
+        assignments = ", ".join(f"{c} = ${i + 1}" for i, c in enumerate(columns))
+        query = (f"UPDATE verdict_rationales SET {assignments}, updated_at = CURRENT_TIMESTAMP "
+                 f"WHERE id = ${len(values) + 1};")
+        await self._execute(query, *values, rationale.id)
+
+    async def get_verdict_rationales_for_claim(self, claim_id: int) -> list["VerdictRationale"]:
+        """The claim's verdict rationales, oldest ID first."""
+        rows = await self._fetch(
+            "SELECT id, full_rationale FROM verdict_rationales WHERE claim_id = $1 ORDER BY id;",
+            claim_id)
+        return [row_to_verdict_rationale(row) for row in rows]
+
+    async def get_verdict_rationales_for_claims(
+            self, claim_ids: list[int]) -> dict[int, list["VerdictRationale"]]:
+        """Bulk variant of `get_verdict_rationales_for_claim` for the analysis scripts."""
+        if not claim_ids:
+            return {}
+        rows = await self._fetch(
+            "SELECT id, claim_id, full_rationale FROM verdict_rationales "
+            "WHERE claim_id = ANY($1) ORDER BY id;",
+            claim_ids)
+        result: dict[int, list] = {claim_id: [] for claim_id in claim_ids}
+        for row in rows:
+            result[row["claim_id"]].append(row_to_verdict_rationale(row))
+        return result
+
+    async def delete_verdict_rationales_for_claim(self, claim_id: int) -> int:
+        """Removes the claim's rationales and returns how many rows were deleted."""
+        result = await self._execute(
+            "DELETE FROM verdict_rationales WHERE claim_id = $1;", claim_id)
+        try:
+            return int(str(result).split()[-1])
+        except (ValueError, IndexError, TypeError):
+            return 0
 
     async def set_gold_evidence_status(self, claim_id: int, status: str,
                                        reason: str | None = None) -> None:
@@ -1090,12 +1264,13 @@ class VeritasDB(Database):
         (claim, condition, ensemble_mode) triple."""
         query = """
                 INSERT INTO gold_evidence_results (claim_id, condition, ensemble_mode, n_evidence,
-                                                   predicted_verdict, member_responses, property_diffs,
-                                                   max_property_diff, is_close, threshold,
-                                                   model_specifiers, error)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                                   with_rationale, predicted_verdict, member_responses,
+                                                   property_diffs, max_property_diff, is_close,
+                                                   threshold, model_specifiers, error)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT ON CONSTRAINT unique_gold_evidence_result DO UPDATE
                     SET n_evidence        = EXCLUDED.n_evidence,
+                        with_rationale    = EXCLUDED.with_rationale,
                         predicted_verdict = EXCLUDED.predicted_verdict,
                         member_responses  = EXCLUDED.member_responses,
                         property_diffs    = EXCLUDED.property_diffs,
@@ -1113,6 +1288,7 @@ class VeritasDB(Database):
             result["condition"],
             result["ensemble_mode"],
             result.get("n_evidence", 0),
+            bool(result.get("with_rationale")),
             to_jsonb(result.get("predicted_verdict")),
             to_jsonb(result.get("member_responses")),
             to_jsonb(result.get("property_diffs")),
@@ -1231,11 +1407,13 @@ class VeritasDB(Database):
 
     async def insert(self, instance: VeritasBaseModel) -> int:
         """Inserts any (compatible) object into the database and returns the assigned ID."""
-        from veritas.gold_evidence.models import Evidence
+        from veritas.gold_evidence.models import Evidence, VerdictRationale
 
         match instance:
             case Evidence():
                 return await self.insert_evidence(instance)
+            case VerdictRationale():
+                return await self.insert_verdict_rationale(instance)
             case Review():
                 return await self.insert_review(instance)
             case Publisher():
@@ -1253,12 +1431,14 @@ class VeritasDB(Database):
 
     async def update(self, instance: VeritasBaseModel):
         """Updates any (compatible) object into the database."""
-        from veritas.gold_evidence.models import Evidence
+        from veritas.gold_evidence.models import Evidence, VerdictRationale
 
         assert instance.id is not None, "Object must have an ID."
         match instance:
             case Evidence():
                 return await self.update_evidence(instance)
+            case VerdictRationale():
+                return await self.update_verdict_rationale(instance)
             case Review():
                 return await self.update_review(instance)
             case Publisher():
@@ -1948,6 +2128,95 @@ database, user, password, host, port = database.values()
 db = VeritasDB(database=database, user=user, password=password, host=host, port=port)
 
 
+def row_to_evidence_source(row):
+    """Reconstructs an EvidenceSource from its JSONB round-trip blob."""
+    from veritas.gold_evidence.models import EvidenceSource
+
+    row = dict(row)
+    source = EvidenceSource.model_validate(row["full_source"])
+    if row.get("id") is not None:
+        source.id = row["id"]
+    if row.get("evidence_id") is not None:
+        source.evidence_id = row["evidence_id"]
+    return source
+
+
+def _source_key_hash(source) -> int:
+    """Identifies a source within its evidence item. Falls back to the name for
+    sources that have no locator (a tool without a page, an interview), so that the
+    uniqueness constraint covers those too."""
+    return hash_int32((source.locator or source.name or "").strip().lower())
+
+
+def _source_columns(source, evidence_id: int, claim_id: int) -> tuple[list[str], list]:
+    """Flattens an EvidenceSource into (column names, values) for SQL.
+
+    The flat columns exist for querying and aggregation; `full_source` is the
+    authoritative round-trip representation (same pattern as `verdicts`)."""
+    faithfulness = source.faithfulness
+    temporal = source.temporal_validation
+    data = {
+        "evidence_id": evidence_id,
+        "claim_id": claim_id,
+        "name": source.name,
+        "kind": source.kind.value,
+        "locator": source.locator,
+        "source_key_hash": _source_key_hash(source),
+        "proximity": source.proximity.value,
+        "raw_content": source.raw_content,
+        "available_since": source.available_since,
+        "accessed_at": source.accessed_at,
+        "accessible": source.accessible,
+        "faithfulness_assessment": faithfulness.assessment if faithfulness else None,
+        # `reasoning` is the provider's reasoning trace, `justification` the
+        # short reason the model was asked to state.
+        "faithfulness_reasoning": faithfulness.reasoning if faithfulness else None,
+        "faithfulness_justification": faithfulness.justification if faithfulness else None,
+        "before_fact_check": temporal.before_fact_check if temporal else None,
+        "before_claim": temporal.before_claim if temporal else None,
+        "admissible": source.admissible,
+        "inadmissibility_reason": source.inadmissibility_reason,
+        "deferred_until": source.deferred_until,
+        "dismissed_reason": source.dismissed_reason,
+        "full_source": to_jsonb(source),
+    }
+    return list(data.keys()), list(data.values())
+
+
+def _evidence_columns(evidence) -> tuple[list[str], list]:
+    """Flattens an Evidence item into (column names, values) for SQL.
+
+    The sources are written separately into `evidence_sources` and are therefore
+    excluded from `full_evidence`: keeping a second copy of every scraped source
+    inside the item's blob would duplicate the bulk of the table."""
+    later_event = evidence.later_event
+    data = {
+        "claim_id": evidence.claim_id,
+        "review_id": evidence.review_id,
+        "article_id": evidence.article_id,
+        "proposition": evidence.proposition,
+        "proposition_hash": hash_int32(evidence.proposition),
+        "role": evidence.role.value,
+        "extraction_reasoning": evidence.extraction_reasoning,
+        "extraction_confidence": evidence.extraction_confidence,
+        # Derived from the sources, stored so that the UI and the analysis can
+        # filter and count without loading every source.
+        "admissible": evidence.admissible,
+        "inadmissibility_reason": evidence.inadmissibility_reason,
+        "later_event": later_event.change_detected if later_event else None,
+        "later_event_reasoning": later_event.reasoning if later_event else None,
+        "later_event_justification": later_event.justification if later_event else None,
+        "later_event_rater": later_event.rater if later_event else None,
+        "n_sources": len(evidence.sources),
+        "n_admissible_sources": len(evidence.admissible_sources),
+        "available_since": evidence.available_since,
+        "dismissed": evidence.dismissed,
+        "dismissed_reason": evidence.dismissed_reason,
+        "full_evidence": to_jsonb(evidence.model_dump(mode="json", exclude={"sources"})),
+    }
+    return list(data.keys()), list(data.values())
+
+
 def to_jsonb(obj):
     """Format when saved into the database."""
     if isinstance(obj, BaseModel):
@@ -1970,59 +2239,41 @@ def row_to_verdict(row) -> Verdict:
 
 
 def row_to_evidence(row):
-    """Reconstructs an Evidence object from its JSONB round-trip blob."""
+    """Reconstructs an Evidence object from its JSONB round-trip blob.
+
+    The returned item has no sources yet - they live in `evidence_sources` and are
+    attached by `_attach_sources`."""
     from veritas.gold_evidence.models import Evidence
 
     row = dict(row)
     evidence = Evidence.model_validate(row["full_evidence"])
+    evidence.sources = []
     if row.get("id") is not None:
         evidence.id = row["id"]
     return evidence
 
 
-def _evidence_columns(evidence) -> tuple[list[str], list]:
-    """Flattens an Evidence object into (column names, values) for SQL.
+def row_to_verdict_rationale(row):
+    """Reconstructs a VerdictRationale from its JSONB round-trip blob."""
+    from veritas.gold_evidence.models import VerdictRationale
 
-    The flat columns exist for querying/aggregation; `full_evidence` is the
-    authoritative round-trip representation (same pattern as `verdicts`)."""
-    faithfulness = evidence.faithfulness
-    temporal = evidence.temporal_validation
+    row = dict(row)
+    rationale = VerdictRationale.model_validate(row["full_rationale"])
+    if row.get("id") is not None:
+        rationale.id = row["id"]
+    return rationale
+
+
+def _rationale_columns(rationale) -> tuple[list[str], list]:
+    """Flattens a VerdictRationale into (column names, values) for SQL."""
     data = {
-        "claim_id": evidence.claim_id,
-        "review_id": evidence.review_id,
-        "article_id": evidence.article_id,
-        "proposition": evidence.proposition,
-        "proposition_hash": hash_int32(evidence.proposition),
-        "source_name": evidence.source.name,
-        "source_kind": evidence.source.kind.value,
-        # Both stay NULL for sources that are not publications (a tool without a
-        # page, offline evidence); see the uniqueness constraint on `evidence`.
-        "source_locator": evidence.source.locator,
-        "source_locator_hash": (hash_int32(evidence.source.locator)
-                                if evidence.source.locator else None),
-        "source_proximity": evidence.source.proximity.value,
-        "source_raw_content": evidence.source.raw_content,
-        "available_since": evidence.available_since,
-        "role": evidence.role.value,
-        "accessed_at": evidence.accessed_at,
-        "extraction_reasoning": evidence.extraction_reasoning,
-        "extraction_confidence": evidence.extraction_confidence,
-        "accessible": evidence.accessible,
-        "faithfulness_assessment": faithfulness.assessment if faithfulness else None,
-        # `reasoning` is the provider's reasoning trace, `justification` the
-        # short reason the model was asked to state.
-        "faithfulness_reasoning": faithfulness.reasoning if faithfulness else None,
-        "faithfulness_justification": faithfulness.justification if faithfulness else None,
-        "before_fact_check": temporal.before_fact_check if temporal else None,
-        "before_claim": temporal.before_claim if temporal else None,
-        "later_event": temporal.later_event if temporal else None,
-        "temporal_reasoning": temporal.reasoning if temporal else None,
-        "temporal_justification": temporal.justification if temporal else None,
-        "admissible": evidence.admissible,
-        "inadmissibility_reason": evidence.inadmissibility_reason,
-        "dismissed": evidence.dismissed,
-        "dismissed_reason": evidence.dismissed_reason,
-        "deferred_until": evidence.deferred_until,
-        "full_evidence": to_jsonb(evidence),
+        "claim_id": rationale.claim_id,
+        "review_id": rationale.review_id,
+        "article_id": rationale.article_id,
+        "rationale": rationale.rationale,
+        "extraction_reasoning": rationale.extraction_reasoning,
+        "full_rationale": to_jsonb(rationale),
     }
     return list(data.keys()), list(data.values())
+
+

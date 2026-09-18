@@ -12,3 +12,25 @@ import pytest_asyncio
 async def db():
     """Overrides the DB fixture from the parent conftest: these tests need no DB."""
     yield None
+
+
+class FakeRegistry:
+    """Stands in for the ezMM registry: `missing` references resolve to nothing."""
+
+    def __init__(self, missing=()):
+        self.missing = set(missing)
+
+    def describe(self, references):
+        return [
+            {
+                "reference": reference,
+                "kind": reference.strip("<>").split(":")[0],
+                "id": int(reference.strip("<>").split(":")[1]),
+                "exists": reference not in self.missing,
+                "url": f"/api/media/{reference.strip('<>').replace(':', '/')}",
+            }
+            for reference in references
+        ]
+
+    def get_by_reference(self, reference):
+        return None

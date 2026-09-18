@@ -7,7 +7,7 @@ must let them through.
 
 import pytest
 
-from tests.gold_evidence.conftest import make_evidence
+from tests.gold_evidence.conftest import make_evidence, make_source
 from veritas.gold_evidence import extraction as extraction_module
 from veritas.gold_evidence import filtering as filtering_module
 from veritas.gold_evidence import retrieval as retrieval_module
@@ -35,21 +35,21 @@ async def test_faithfulness_propagates_fatal_errors(monkeypatch, error_cls):
     monkeypatch.setattr(filtering_module, "_resolve_filtering_model",
                         lambda: ExplodingModel(error_cls("out of budget")))
     with pytest.raises(error_cls):
-        await filtering_module.assess_faithfulness(make_evidence(), "source text")
+        await filtering_module.assess_faithfulness("a proposition", "source text")
 
 
 @pytest.mark.asyncio
 async def test_faithfulness_still_tolerates_ordinary_failures(monkeypatch):
     monkeypatch.setattr(filtering_module, "_resolve_filtering_model",
                         lambda: ExplodingModel(RuntimeError("bad request")))
-    assert await filtering_module.assess_faithfulness(make_evidence(), "source") is None
+    assert await filtering_module.assess_faithfulness("a proposition", "source") is None
 
 
 # --- Stage 2: temporal validation --------------------------------------------
 
 @pytest.mark.parametrize("error_cls", FATAL)
 @pytest.mark.asyncio
-async def test_temporal_validation_propagates_fatal_errors(monkeypatch, error_cls):
+async def test_the_later_event_check_propagates_fatal_errors(monkeypatch, error_cls):
     from datetime import datetime
 
     from veritas.common import Claim
@@ -59,34 +59,35 @@ async def test_temporal_validation_propagates_fatal_errors(monkeypatch, error_cl
     claim = Claim(id=1, data="A claim", date=datetime(2024, 5, 1),
                   appearance_ids=set(), review_ids={1})
 
-    # Only items inside the studied interval reach the model at all.
-    evidence = make_evidence(available_since=datetime(2024, 5, 10))
+    # Only evidence that appeared after the claim reaches the model at all.
+    evidence = make_evidence(available_since=datetime(2024, 5, 10), before_claim=False)
     with pytest.raises(error_cls):
-        await filtering_module.validate_temporally(
-            evidence, claim=claim, source_str="source",
-            t_c=datetime(2024, 5, 1), t_f=datetime(2024, 5, 21))
+        await filtering_module.check_later_event(
+            evidence, claim=claim, t_c=datetime(2024, 5, 1))
 
 
 # --- Stage 2: the item-level wrapper -----------------------------------------
 
 @pytest.mark.parametrize("error_cls", FATAL)
 @pytest.mark.asyncio
-async def test_filter_single_propagates_fatal_errors(monkeypatch, error_cls):
+async def test_filter_source_propagates_fatal_errors(monkeypatch, error_cls):
     from datetime import datetime
 
     async def exploding_retrieve(*a, **k):
         raise error_cls("out of budget")
 
     monkeypatch.setattr(filtering_module, "retrieve_source", exploding_retrieve)
-    evidence = make_evidence(filtered=False)
+    evidence = make_evidence(decided=False)
+    source = evidence.sources[0]
 
     with pytest.raises(error_cls):
-        await filtering_module.filter_single(
-            evidence, claim=None, t_c=datetime(2024, 5, 1), t_f=datetime(2024, 5, 21))
+        await filtering_module.filter_source(
+            source, evidence=evidence, claim=None,
+            t_c=datetime(2024, 5, 1), t_f=datetime(2024, 5, 21))
 
-    # Nothing was recorded about the item, so a later run still evaluates it.
-    assert evidence.admissible is None
-    assert evidence.filtered is False
+    # Nothing was recorded about the source, so a later run still evaluates it.
+    assert source.admissible is None
+    assert source.filtered is False
 
 
 # --- Stage 1 ------------------------------------------------------------------

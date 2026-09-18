@@ -1,45 +1,64 @@
 # Task
-The Proposition below was taken from the Evidence shown above it. Both became available only *after* time *t_c = {{ claim_date }}*, which is when the Claim was made. Determine whether the Evidence reports a **later event**, i.e. something that happened after t_c and changed the factual basis the Proposition states.
+Determine whether the Evidence below relies on a change in the world state that occurred only *after* time *t_c = {{ claim_date }}*, when the Claim was made.
+
+The purpose of this check is to distinguish:
+
+1. **A later change in the world** that affects the Claim's validity, from
+2. **Later reporting about an earlier world state:** the Evidence became available after t_c, but the factual state it describes already held at t_c.
+
+## The Claim
+{{ claim }}
 
 ## The Evidence
-{% if source_name %}Source: {{ source_name }}{% endif %}
-{% if source_url %}URL: {{ source_url }}{% endif %}
-{% if available_since %}Available since: {{ available_since }}{% endif %}
-
-{% if source %}
-{{ source }}
-{% else %}
-*This source cannot be retrieved — it is a tool or something the fact-checker obtained offline, such as an interview. Judge from the Proposition and the details above.*
-{% endif %}
-
-## The Proposition
 {{ proposition }}
 
-{% if claim %}
-## The Claim (for context only)
-{{ claim }}
+## The Sources Reporting It
+{% for source in sources %}
+### {{ loop.index }}. {{ source.name }}
+Type: {{ source.kind }}{% if source.available_since %} · Available since: {{ source.available_since }}{% endif %}{% if source.locator %} · {{ source.locator }}{% endif %}
+{% if source.excerpt %}
+> {{ source.excerpt }}{% if source.truncated %} […]{% endif %}
+{% else %}
+*This source could not be retrieved; judge from the Evidence and the details above.*
 {% endif %}
+{% else %}
+*No source content is available; judge from the Evidence above.*
+{% endfor %}
 
 # Question
-Would the factual basis stated by the Proposition already have held at t_c, even if nobody had published or discovered this Evidence yet?
+Does the Evidence rely on a fact or state of affairs that came into existence only after t_c?
 
-- If yes - the Evidence merely *reports* or *documents* a state of affairs that already held at t_c - then there is **no** later event: answer `"later_event": false`.
-- If no - the Evidence describes a development, decision, correction or occurrence *after* t_c that made the Proposition true only afterwards - then answer `"later_event": true`.
+Set `change_detected` to:
+
+- `true` if a relevant event, action, decision, or other change occurred after t_c, the Evidence relies on this newly changed world state, and that world state changes the Claim's truthfulness.
+- `false` if the Evidence merely provides new information about the world state at or before t_c.
+
+# Examples
+- A social-media post published after t_c that reveals where an image was actually taken before t_c → `false`.
+- A statement published after t_c clarifying what a person had already done or said before t_c → `false`.
+- A fact-checking unit, authority or newsroom issuing a correction, clarification or finding after t_c about something that happened before t_c → `false`. Issuing the statement is an act of reporting, not a change in the matter it reports on.
+- It is claimed that a company was officially bankrupt at t_c, the company files for bankruptcy after t_c, and that later filing is used as factual support → `true`.
+- It is claimed that the U.S. president never visited Ukraine at time t_c, the president visits Ukraine after t_c, and that later visit is used as Evidence → `true`.
 
 # Output Format
 First, reason briefly. Then, output your final answer as a single fenced JSON code block with exactly these keys:
 
 ```json
 {
-  "later_event": false,
+  "change_detected": false,
   "justification": "One or two sentences summarizing the decisive observations."
 }
 ```
 
 # Rules
-* Judge the *timing* of the underlying facts, not the timing of their publication: a report published after t_c about a state that already held at t_c is not a later event.
+* The publication, posting, discovery, disclosure, investigation, correction or retrieval of information after t_c is NOT itself a change in the relevant world state — no matter who did it or how authoritative they are.
+* Judge the *timing* of *the underlying facts*, not the timing of their publication: a source published after t_c about a state that already held at t_c is not a changing event.
+* Ask counterfactually: **Had this Evidence been available at t_c, would the factual basis it describes already have been true at that time?**
+    - If yes → `change_detected = false`.
+    - If no, because the relevant fact only came into existence later → `change_detected = true`.
+* Several sources reporting the same Evidence share one answer: decide about the factual basis the Evidence states, not about any individual source.
 * You are **not** asked whether the Claim is true, and you must not state a verdict about it.
 * Base your answer only on the contents shown above.
-* Answer in English, no matter the language of the Proposition or Evidence.
+* Answer in English, no matter the language of the Claim, the Evidence or the Sources.
 
 # Your Response

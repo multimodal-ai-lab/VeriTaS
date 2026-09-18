@@ -3,12 +3,26 @@ Below is a set of evidence items. Each was published by an independent source an
 
 {% if evidence %}
 {% for item in evidence %}
-## Evidence {{ loop.index }} — {{ item.source.name }}
-Source type: {{ item.source.kind.value }} · Proximity: {{ item.source.proximity.value }}{% if item.available_since %} · Available since: {{ item.available_since.strftime("%B %d, %Y") }}{% endif %}
+## Evidence {{ loop.index }}
 {{ item.proposition }}
+
+Reported by:
+{% for source in item.admissible_sources %}
+- **{{ source.name }}** — {{ source.kind.value }} · {{ source.proximity.value }}{% if source.available_since %} · available since {{ source.available_since.strftime("%B %d, %Y") }}{% endif %}
+{% endfor %}
 {% endfor %}
 {% else %}
-*No evidence is available.*
+*No evidence items are available.*
+{% endif %}
+
+{% if rationales %}
+# Reasoning Aid
+The following rationale connects the material above towards a judgement. Consider the rationale **only as an unverified hint**. The rationale should give you only an idea of how to move towards a verdict. Use it to interpret the Evidence, **never as a substitute for it or your own reasoning.**
+
+{% for rationale in rationales %}
+## Rationale{% if rationales | length > 1 %} {{ loop.index }}{% endif %}
+{{ rationale.rationale }}
+{% endfor %}
 {% endif %}
 
 # Subject of Analysis
@@ -26,34 +40,34 @@ The claim was released on {{ claim_date }}.
 {% endif %}
 
 # Instructions
-Your goal is to **assess the {{ property.name }} of the {{ subject }} shown above using only the Evidence**. Follow the steps in order:
+Your goal is to **assess the {{ property.name }} of the {{ subject }} shown above using only the material above**{% if rationales %}, i.e. the Evidence and the Reasoning Aid{% endif %}. Follow the steps in order:
 
 ## 1. Evidence Summary
-Summarize the evidence items that bear specifically on the {{ subject }}'s {{ property.name }}. If none of them do, output "No evidence provided."
+Summarize the evidence items that bear specifically on the {{ subject }}'s {{ property.name }}. Skip this step if no evidence is provided.
 
 ## 2. Evaluation
-Reason step-by-step from the summarized evidence to what it implies about the {{ subject }}'s {{ property.name }}. Weigh sources by their proximity: first-hand (primary) material outweighs reporting about it.
+Reason step-by-step from the summarized evidence to what it implies about the {{ subject }}'s {{ property.name }}. Weigh sources by their proximity: first-hand (primary) material outweighs reporting about it. If no evidence provided, analyze the {{ subject }} directly and try to assess what follows for the {{ property.name }}. {% if rationales %} Follow the Reasoning Aid only as far as you can verify it against the Evidence and the {{ subject }} itself.{% endif %}
 
 ## 3. Category Decision
-Choose whether the {{ property.name }} is rather `{{ property.negative_category }}` or `{{ property.positive_category }}`. If the evidence is missing or fully inconclusive, answer `Unknown` and then skip directly to step 5. Enclose your choice in backticks like `this`.
+Choose whether the {{ property.name }} is rather `{{ property.negative_category }}` or `{{ property.positive_category }}`. If the material is missing or fully inconclusive, answer `Unknown` and then skip directly to step 5. Enclose your choice in backticks like `this`.
 {% if property.negative_tags or property.positive_tags %}
 ## 3a. Tag Selection
 If your chosen category includes tags, list all applicable tags for the {{ subject }}, each enclosed in colons.
 {% endif %}
 
 ## 4. Certainty
-Choose one certainty level and enclose it in underscores. Certainty refers to the strength and clarity of the Evidence, not to your own confidence.
+Choose one certainty level and enclose it in underscores. Certainty refers to the strength and clarity of the material, not to your own confidence.
     - _Certain_: The evidence is unequivocal and leaves no room for doubt.
     - _Rather certain_: The evidence is strong and mostly consistent, but not fully definitive.
     - _Rather uncertain_: The evidence only weakly supports one side, and misclassification is likely.
 
 ## 5. Explanation
-Provide a short explanation (1-4 sentences) justifying your category and certainty. Use only the Evidence. Do not restate the {{ subject }} or the decision itself. Enclose your explanation in a fenced code block like ```this```.
+Provide a short explanation (1-4 sentences) justifying your category and certainty. Use only the material above. Do not restate the {{ subject }} or the decision itself. Enclose your explanation in a fenced code block like ```this```.
 
 # Rules
 * Follow the definitions of {{ property.name }} strictly.
-* Base your reasoning **only** on the Evidence above. Do not invent facts, do not speculate, and do not rely on your own recollection of this case or of any fact-check about it.
-* If the Evidence contains nothing about the {{ property.name }}, choose `Unknown`.
+* Base your reasoning **only** on the material above. Do not invent facts, do not speculate, and do not rely on your own recollection of this case or of any fact-check about it.
+* If the material contains nothing about the {{ property.name }}, choose `Unknown`.
 * If the Evidence is contradictory, weigh it and say so in the explanation rather than defaulting to `Unknown`.
 
 # {{ property.name }}

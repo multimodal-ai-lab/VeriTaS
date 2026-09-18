@@ -1,13 +1,15 @@
 """Gold Evidence Reconstruction & Temporal Analysis.
 
 Reconstructs the evidence that the original professional fact-check used to
-establish its verdict, filters invalid/leaked evidence, and validates whether the
-remaining evidence suffices to recover the VeriTaS gold verdict.
+establish its verdict - together with the rationale that turns that evidence into a
+verdict - filters invalid/leaked evidence, and validates whether what remains
+suffices to recover the VeriTaS gold verdict.
 
-The gold verdict is never modified. Instances for which no sufficient valid
-evidence can be reconstructed are *rejected*, which is recorded exclusively in
-the new `claims.gold_evidence_*` columns and the new tables `evidence` and
-`gold_evidence_results`. No pre-existing DB value is ever overwritten.
+The gold verdict is never modified. Instances whose argument cannot be
+reconstructed are *rejected*, which is recorded exclusively in the new
+`claims.gold_evidence_*` columns and the new tables `evidence`,
+`verdict_rationales` and `gold_evidence_results`. No pre-existing DB value is ever
+overwritten.
 """
 
 from veritas import globals

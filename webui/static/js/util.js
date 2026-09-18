@@ -131,6 +131,28 @@ export const PROXIMITY_STYLE = {
     tertiary: { tone: 'plain', icon: 'fa-book-atlas' },
 };
 
+/** Admissibility is a tri-state; these are the names the browser filters on. */
+export const ADMISSIBILITY_STYLE = {
+    admissible: { tone: 'ok', icon: 'fa-circle-check' },
+    inadmissible: { tone: 'bad', icon: 'fa-circle-xmark' },
+    unfiltered: { tone: 'warn', icon: 'fa-hourglass-half' },
+};
+
+/** Where an item sits relative to the studied interval `t_c < t_e <= t_f`. */
+export const ZONE_STYLE = {
+    before_claim: { tone: 'ok', icon: 'fa-backward' },
+    in_window: { tone: 'warn', icon: 'fa-clock' },
+    after_fact_check: { tone: 'bad', icon: 'fa-forward' },
+    unvalidated: { tone: 'plain', icon: 'fa-circle-question' },
+};
+
+export const ZONE_HELP = {
+    before_claim: 'Available before the claim, t_e <= t_c.',
+    in_window: 'Inside the studied interval, t_c < t_e <= t_f.',
+    after_fact_check: 'Published after the fact-check, t_e > t_f (§3.3).',
+    unvalidated: 'The temporal check has not run for this item.',
+};
+
 export const SOURCE_KIND_ICON = {
     social_media_post: 'fa-hashtag',
     news_article: 'fa-newspaper',
@@ -145,6 +167,24 @@ export const SOURCE_KIND_ICON = {
     other: 'fa-circle-question',
 };
 
+/** The `media` filter vocabulary. Mirrors `queries.MEDIA_FILTERS`. */
+export const MEDIA_OPTIONS = [
+    ['', 'Any modality'],
+    ['any', 'With any media'],
+    ['image', 'With images'],
+    ['video', 'With videos'],
+    ['none', 'Text only'],
+];
+
+/** A select over `MEDIA_OPTIONS`, bound to `state[key]`. */
+export function mediaSelect(state, key, apply) {
+    return el('select', {
+        'aria-label': 'Filter by modality',
+        onchange: (event) => apply({ [key]: event.target.value }),
+    }, MEDIA_OPTIONS.map(([value, label]) =>
+        el('option', { value, selected: state[key] === value, text: label })));
+}
+
 /** Explanations shown as tooltips, taken from the pipeline's own docstrings. */
 export const REASON_HELP = {
     not_filtered: 'Stage 2 did not complete for this item.',
@@ -154,12 +194,12 @@ export const REASON_HELP = {
     unfaithful: 'The retrieved source no longer supports the proposition (§3.2).',
     after_fact_check: 'The source postdates the fact-check, t_e > t_f (§3.3).',
     fact_check_source: 'The source is itself a professional fact-check and leaks the verdict (§3.3).',
-    later_event: 'Reports a post-claim event that changes the veracity (§3.3).',
+    later_event: 'The proposition rests on a change of the world that happened only after the claim (§3.3).',
     no_gold_verdict: 'The claim has no current gold verdict.',
     no_claim_time: 'The claim has no date t_c.',
     no_fact_check_time: 'No review provides a publication time t_f.',
-    no_evidence_extracted: 'Stage 1 returned no candidate evidence.',
-    no_admissible_evidence: 'Every candidate was filtered out in Stage 2.',
+    nothing_extracted: 'Stage 1 returned neither evidence nor a verdict rationale.',
+    essential_evidence_lost: 'An essential evidence item lost every one of its sources in Stage 2.',
     sufficiency_validation_failed: 'The ensemble did not return a usable verdict.',
     insufficient_evidence: 'The predicted verdict was not close enough to the gold verdict.',
 };
@@ -191,10 +231,87 @@ export function countUp(node, target, format = num) {
 export const qs = (selector, root = document) => root.querySelector(selector);
 export const qsa = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-export function toast(message) {
-    const node = el('div', { class: 'toast', text: message });
+/**
+ * Copies text to the clipboard.
+ *
+ * `navigator.clipboard` only exists in a secure context, and the viewer is
+ * normally served over plain HTTP on an internal host - so the modern API is
+ * simply absent there. Fall back to a hidden textarea, and as a last resort show
+ * the text so it can be copied by hand.
+ */
+export async function copyText(text, { label = 'Link copied' } = {}) {
+    try {
+        if (window.isSecureContext && navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+            toast(label);
+            return true;
+        }
+    } catch { /* fall through to the legacy path */ }
+
+    try {
+        const area = el('textarea', {
+            value: text, readonly: true,
+            style: { position: 'fixed', top: '-1000px', opacity: '0' },
+        });
+        document.body.append(area);
+        area.select();
+        area.setSelectionRange(0, text.length);
+        const copied = document.execCommand('copy');
+        area.remove();
+        if (copied) {
+            toast(label);
+            return true;
+        }
+    } catch { /* fall through to showing the text */ }
+
+    // Both paths can be blocked outright (an embedded frame without the
+    // clipboard permission). Showing the link is then the only thing left that
+    // still lets the reader get at it.
+    toast(text, { duration: 12000, selectable: true });
+    return false;
+}
+
+
+/**
+ * An info icon that explains the thing next to it on hover.
+ *
+ * Explanations are worth having but not worth the horizontal space: a heading
+ * followed by a sentence of prose reads as two competing titles. Behind an icon
+ * the sentence is one hover away and the heading stays a heading.
+ */
+export function infoTip(text, { placement = '' } = {}) {
+    return el('i', {
+        class: `fa-solid fa-circle-info info-tip tip ${placement}`.trim(),
+        'data-tip': text,
+        tabindex: '0',
+        role: 'note',
+        'aria-label': text,
+    });
+}
+
+
+/** Truncates `text` to `length`, exposing the full value as a hover tooltip. */
+export function truncated(text, length, { tone = '' } = {}) {
+    const full = String(text ?? '');
+    if (full.length <= length) return el('span', { class: tone, text: full });
+    return el('span', {
+        class: `tip ${tone}`.trim(),
+        'data-tip': full,
+        tabindex: '0',
+        text: `${full.slice(0, length).trimEnd()}…`,
+    });
+}
+
+
+export function toast(message, { duration = 2600, selectable = false } = {}) {
+    document.querySelector('.toast')?.remove();
+    const node = el('div', {
+        class: `toast${selectable ? ' selectable' : ''}`,
+        text: message,
+    });
     document.body.append(node);
-    setTimeout(() => node.remove(), 2600);
+    setTimeout(() => node.remove(), duration);
+    return node;
 }
 
 /** Syntax-highlights a JSON value for the raw inspector.

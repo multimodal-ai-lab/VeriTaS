@@ -4,8 +4,15 @@ from datetime import date, datetime
 
 import pytest
 
+from pathlib import Path
+
+from webui import database
+from webui.config import Settings
 from webui.queries import (
+    IMAGE_REF_SQL,
+    MEDIA_FILTERS,
     MEDIA_REF_SQL,
+    VIDEO_REF_SQL,
     SORTABLE,
     as_datetime,
     build_claim_filters,
@@ -55,15 +62,33 @@ def test_placeholders_are_numbered_consecutively():
 
 
 def test_boolean_filters_use_fixed_fragments():
-    where, args = build_claim_filters(released=True, has_media=False)
+    where, args = build_claim_filters(released=True, media="none")
     assert "(c.released_quarter OR c.released_longitudinal)" in where
     assert f"c.data !~ '{MEDIA_REF_SQL}'" in where
     assert args == []
 
 
-def test_has_media_true_uses_the_matching_operator():
-    where, _ = build_claim_filters(has_media=True)
-    assert f"c.data ~ '{MEDIA_REF_SQL}'" in where
+@pytest.mark.parametrize("media,expected", [
+    ("any", f"c.data ~ '{MEDIA_REF_SQL}'"),
+    ("image", f"c.data ~ '{IMAGE_REF_SQL}'"),
+    ("video", f"c.data ~ '{VIDEO_REF_SQL}'"),
+    ("none", f"c.data !~ '{MEDIA_REF_SQL}'"),
+])
+def test_each_media_filter_maps_to_its_own_pattern(media, expected):
+    where, args = build_claim_filters(media=media)
+    assert expected in where
+    assert args == []
+
+
+def test_the_image_and_video_filters_are_distinct():
+    images, _ = build_claim_filters(media="image")
+    videos, _ = build_claim_filters(media="video")
+    assert images != videos
+
+
+def test_an_unknown_media_filter_is_rejected():
+    with pytest.raises(ValueError, match="Unknown media filter"):
+        build_claim_filters(media="gif")
 
 
 def test_sortable_columns_are_whitelisted():
@@ -110,3 +135,44 @@ def test_delta_summary_returns_both_a_summary_and_a_histogram():
     result = delta_summary([1.0, 2.0, None, 3.0])
     assert result["summary"]["n"] == 3
     assert result["histogram"]["n"] == 3
+
+
+# ---------------------------------------------- deployment misconfigurations
+
+def test_a_loopback_host_inside_a_container_is_reported(monkeypatch, tmp_path):
+    """`localhost` inside a container is the container, so a database on the
+    host's loopback can never be reached. A bare "connection refused" does not
+    say that, and this deployment gets it wrong easily."""
+    monkeypatch.setattr(database, "in_container", lambda: True)
+    monkeypatch.setattr(database, "get_settings",
+                        lambda: _settings(db_host="localhost"))
+    hint = database.connection_hint()
+    assert hint and "network_mode: host" in hint and "host.docker.internal" in hint
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_every_loopback_spelling_is_recognised(monkeypatch, host):
+    monkeypatch.setattr(database, "in_container", lambda: True)
+    monkeypatch.setattr(database, "get_settings", lambda: _settings(db_host=host))
+    assert database.connection_hint() is not None
+
+
+def test_a_real_host_is_not_flagged(monkeypatch):
+    monkeypatch.setattr(database, "in_container", lambda: True)
+    monkeypatch.setattr(database, "get_settings",
+                        lambda: _settings(db_host="db.example.org"))
+    assert database.connection_hint() is None
+
+
+def test_nothing_is_flagged_outside_a_container(monkeypatch):
+    monkeypatch.setattr(database, "in_container", lambda: False)
+    monkeypatch.setattr(database, "get_settings", lambda: _settings(db_host="localhost"))
+    assert database.connection_hint() is None
+
+
+def _settings(**overrides):
+    values = dict(db_name="veritas_db", db_user="postgres", db_password="",
+                  db_host="localhost", db_port=5432, ezmm_path=Path("/media"),
+                  page_size=25, max_page_size=200, chunk_size=1024)
+    values.update(overrides)
+    return Settings(**values)

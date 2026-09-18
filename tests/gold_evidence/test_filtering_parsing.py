@@ -4,7 +4,7 @@ import pytest
 
 from veritas.gold_evidence.filtering import (
     parse_faithfulness_response,
-    parse_temporal_response,
+    parse_later_event_response,
 )
 
 
@@ -59,47 +59,49 @@ def test_category_is_case_insensitive():
     assert score == pytest.approx(1.0)
 
 
-# --- Temporal validation ---------------------------------------------------
+# --- The later-event judgement ---------------------------------------------
 
-def temporal_response(later_event=False, justification="Because.") -> str:
+def later_event_response(change_detected=False, justification="Because.") -> str:
     return (
         "Reasoning about the timing.\n\n```json\n"
-        f'{{"later_event": {str(later_event).lower()}, '
+        f'{{"change_detected": {str(change_detected).lower()}, '
         f'"justification": "{justification}"}}\n```'
     )
 
 
 def test_parses_the_later_event_judgement():
-    parsed = parse_temporal_response(temporal_response(later_event=True))
-    assert parsed == {"later_event": True, "justification": "Because."}
+    parsed = parse_later_event_response(later_event_response(change_detected=True))
+    assert parsed == {"change_detected": True, "justification": "Because."}
 
 
-def test_no_later_event_is_not_confused_with_a_missing_answer():
-    """`false` is a judgement, not the absence of one. The prompt asks directly for
-    `later_event`, so nothing on this path inverts the model's answer."""
-    parsed = parse_temporal_response(temporal_response(later_event=False))
-    assert parsed["later_event"] is False
+def test_no_change_is_not_confused_with_a_missing_answer():
+    """`false` is a judgement, not the absence of one - and it is the answer for
+    the common case: a source that merely reports on an earlier state."""
+    parsed = parse_later_event_response(later_event_response(change_detected=False))
+    assert parsed["change_detected"] is False
 
 
 def test_yes_no_strings_are_accepted():
-    assert parse_temporal_response('```json\n{"later_event": "NO"}\n```')["later_event"] is False
-    assert parse_temporal_response('```json\n{"later_event": "yes"}\n```')["later_event"] is True
+    assert parse_later_event_response(
+        '```json\n{"change_detected": "NO"}\n```')["change_detected"] is False
+    assert parse_later_event_response(
+        '```json\n{"change_detected": "yes"}\n```')["change_detected"] is True
 
 
 def test_missing_justification_is_tolerated():
-    parsed = parse_temporal_response('```json\n{"later_event": true}\n```')
-    assert parsed["later_event"] is True
+    parsed = parse_later_event_response('```json\n{"change_detected": true}\n```')
+    assert parsed["change_detected"] is True
     assert parsed["justification"] is None
 
 
 def test_unparseable_response_returns_none():
-    assert parse_temporal_response("I cannot answer that.") is None
+    assert parse_later_event_response("I cannot answer that.") is None
 
 
 def test_response_without_the_judgement_returns_none():
-    assert parse_temporal_response('```json\n{"foo": 1}\n```') is None
+    assert parse_later_event_response('```json\n{"foo": 1}\n```') is None
 
 
 def test_json_without_a_fence_is_accepted():
-    parsed = parse_temporal_response('{"later_event": false, "justification": "x"}')
-    assert parsed["later_event"] is False
+    parsed = parse_later_event_response('{"change_detected": false, "justification": "x"}')
+    assert parsed["change_detected"] is False

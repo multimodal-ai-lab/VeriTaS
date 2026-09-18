@@ -202,7 +202,7 @@ def to_gemini_user_content(user_prompt: Prompt, extra_instructions: str | None =
 
 
 gemini_strong = Gemini("gemini-3.1-pro-preview")
-gemini_cheap = Gemini("gemini-3-flash-preview")
+gemini_cheap = Gemini("gemini-3.8-flash")
 
 if __name__ == "__main__":
     prompt = Prompt(text="<video:11> Describe what you see.")

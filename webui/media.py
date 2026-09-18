@@ -36,6 +36,15 @@ _EXTRA_TYPES = {
 
 _DEFAULT_TYPES = {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/mpeg"}
 
+#: Extensions probed when the registry's path does not resolve, most likely
+#: first. ezMM writes `.jpg` for images it re-encodes and `.mp4` for videos it
+#: stores; the rest are what scrapeMM passes through unchanged.
+_SUFFIXES = {
+    "image": (".jpg", ".png", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".heic", ".tiff"),
+    "video": (".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi", ".ogv"),
+    "audio": (".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".flac"),
+}
+
 
 @dataclass(frozen=True)
 class MediaItem:
@@ -123,23 +132,29 @@ class MediaRegistry:
     # -- file resolution ----------------------------------------------------
 
     def _resolve_file(self, kind: str, identifier: int, recorded: str | None) -> Path | None:
+        """The file backing an item, or None.
+
+        Every step is a single `stat`: the media store holds hundreds of
+        thousands of files in one directory per kind, so listing or globbing it
+        - once per reference, and a claim can hold hundreds - would dominate the
+        response time."""
         if recorded:
             path = Path(recorded)
             if path.is_file():
                 return path
-            # The registry was written elsewhere: re-root it at our media volume.
+            # The registry was written on another machine: re-root its file name
+            # at our media volume, which is the common case inside the container.
             relocated = self._settings.ezmm_path / kind / path.name
             if relocated.is_file():
                 return relocated
-        # Canonical ezMM layout, extension unknown.
+
+        # Canonical ezMM layout with an unknown extension: probe the extensions
+        # the pipeline actually writes rather than enumerating the directory.
         directory = self._settings.ezmm_path / kind
-        if directory.is_dir():
-            candidates = [path for path in directory.glob(f"{identifier}.*") if path.is_file()]
-            # `42.jpg` before derivatives such as `42.thumb.jpg`, which belong to
-            # the same item but are not the medium itself.
-            candidates.sort(key=lambda path: (path.stem != str(identifier), path.name))
-            if candidates:
-                return candidates[0]
+        for suffix in _SUFFIXES[kind]:
+            candidate = directory / f"{identifier}{suffix}"
+            if candidate.is_file():
+                return candidate
         return None
 
     def get(self, kind: str, identifier: int) -> MediaItem | None:
@@ -148,7 +163,7 @@ class MediaRegistry:
             return None
         cached = self._cache.get((kind, identifier))
         if cached is not None:
-            if cached.file_path.is_file():
+            if cached.file_path is None or cached.file_path.is_file():
                 return cached
             # The file was moved or quarantined since we resolved it; re-resolve.
             self._cache.pop((kind, identifier), None)
@@ -164,9 +179,11 @@ class MediaRegistry:
             size=file_path.stat().st_size if file_path else None,
             content_type=content_type_for(file_path, kind) if file_path else None,
         )
-        # Only successful resolutions are cached: a medium may still be downloading.
-        if item.exists:
-            self._cache[(kind, identifier)] = item
+        # Misses are cached too: a claim that references a medium the store does
+        # not hold would otherwise re-probe every extension on every render. A
+        # medium that arrives later is picked up when the cache is next cleared,
+        # which a restart does.
+        self._cache[(kind, identifier)] = item
         return item
 
     def get_by_reference(self, reference: str) -> MediaItem | None:

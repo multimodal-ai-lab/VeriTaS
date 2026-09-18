@@ -7,12 +7,15 @@ only ever read - never written - and is expected to be mounted read-only.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger("veritas-webui")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -22,10 +25,16 @@ def _load_yaml() -> dict:
     fatal: everything it provides can also be given via the environment."""
     path = Path(os.environ.get("VERITAS_CONFIG") or (REPO_ROOT / "config.yaml"))
     if not path.is_file():
+        logger.info("No config.yaml at %s; using the environment only.", path)
         return {}
     try:
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:  # pragma: no cover - a broken config must not crash startup
+    except Exception as error:  # A broken config must not crash startup.
+        # Silence here is expensive to debug: an unreadable file (in a container
+        # the mounted file often belongs to another UID) looks exactly like a
+        # missing database, so say what happened.
+        logger.warning("Ignoring %s: %s: %s. Falling back to the environment "
+                       "and the defaults.", path, type(error).__name__, error)
         return {}
 
 

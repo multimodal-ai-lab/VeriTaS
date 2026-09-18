@@ -4,8 +4,8 @@ Reads what the reconstruction stored in the DB and exports claim-level and
 evidence-level results plus aggregate tables. Optionally (re-)runs the
 sufficiency validator for the two conditions
 
-    E_claim      = {e | t_e <= t_c}
-    E_factcheck  = {e | t_e <= t_f}
+    E_c  = {e | t_e <= t_c}
+    E_f  = {e | t_e <= t_f}
 
 so that the central question - whether evidence appearing *during* the
 professional fact-checking period is necessary to reconstruct the gold verdict -
@@ -32,8 +32,8 @@ from veritas.gold_evidence import (
     ensemble_mode as default_ensemble_mode,
     proximity_threshold as default_threshold,
 )
-from veritas.gold_evidence.admissibility import select
-from veritas.gold_evidence.analysis import aggregate, build_claim_record, build_evidence_record
+from veritas.gold_evidence.admissibility import missing_essential, restrict_to_condition
+from veritas.gold_evidence.analysis import aggregate, build_claim_record, build_evidence_records
 from veritas.gold_evidence.filtering import get_reference_times
 from veritas.gold_evidence.sufficiency import ENSEMBLE_MODES, validate_sufficiency
 from veritas.util import run_with_semaphore
@@ -71,12 +71,15 @@ async def collect(args) -> tuple[list, list[dict]]:
     claims = [c for c in claims if c.gold_evidence_status]
     logger.info(f"Analyzing {len(claims)} claims with reconstruction results.")
 
-    evidence_by_claim = await db.get_evidence_for_claims([c.id for c in claims])
+    claim_ids = [c.id for c in claims]
+    evidence_by_claim = await db.get_evidence_for_claims(claim_ids)
+    rationales_by_claim = await db.get_verdict_rationales_for_claims(claim_ids)
 
     claim_records, evidence_records = [], []
 
     async def _process(claim):
         evidence = evidence_by_claim.get(claim.id, [])
+        rationales = rationales_by_claim.get(claim.id, [])
         t_c, t_f = await get_reference_times(claim)
         gold = await claim.current_verdict
 
@@ -85,22 +88,26 @@ async def collect(args) -> tuple[list, list[dict]]:
 
         if args.revalidate and gold is not None:
             for condition in CONDITIONS:
-                subset = select(evidence, condition)
-                result = await validate_sufficiency(claim, subset, gold, condition=condition,
-                                                    mode=args.mode, threshold=args.threshold)
+                subset = restrict_to_condition(evidence, condition)
+                result = await validate_sufficiency(
+                    claim, subset, gold, condition=condition, mode=args.mode,
+                    threshold=args.threshold, rationales=rationales,
+                    missing_essential=missing_essential(evidence, condition))
                 await db.save_gold_evidence_result(result.to_db_dict())
                 stored[condition] = result.to_db_dict()
 
         claim_records.append(build_claim_record(
-            claim=claim, gold=gold, evidence=evidence, t_c=t_c, t_f=t_f, results=stored))
+            claim=claim, gold=gold, evidence=evidence, t_c=t_c, t_f=t_f, results=stored,
+            rationales=rationales))
         for item in evidence:
-            evidence_records.append(build_evidence_record(item, claim_id=claim.id,
-                                                          t_c=t_c, t_f=t_f))
+            evidence_records.extend(build_evidence_records(item, claim_id=claim.id,
+                                                           t_c=t_c, t_f=t_f))
 
     await run_with_semaphore([_process(c) for c in claims], limit=args.concurrency,
                              show_progress=True, progress_description="Collecting results")
     claim_records.sort(key=lambda r: r.claim_id)
-    evidence_records.sort(key=lambda r: (r["claim_id"], r["evidence_id"] or 0))
+    evidence_records.sort(key=lambda r: (r["claim_id"], r["evidence_id"] or 0,
+                                        r["source_id"] or 0))
     return claim_records, evidence_records
 
 
@@ -136,11 +143,16 @@ def render_markdown(aggregates: dict, mode: str) -> str:
         "| --- | ---: |",
         f"| Claims analyzed | {aggregates['n_claims']} |",
         f"| Evidence candidates | {aggregates['n_evidence_candidates']} |",
-        f"| Admissible evidence items | {aggregates['n_evidence_admissible']} |",
-        f"| Items in the interval t_c < t_e <= t_f | {aggregates['n_evidence_in_window']} |",
+        f"| Sources | {aggregates['n_sources']} |",
+        f"| Admissible sources | {aggregates['n_sources_admissible']} |",
+        f"| Sources in the interval t_c < t_e <= t_f | {aggregates['n_sources_in_window']} |",
         f"| Share of claims with such evidence | {_pct(aggregates['share_claims_with_window_evidence'])} |",
         f"| Share of admissible evidence in the interval | {_pct(aggregates['share_evidence_in_window'])} |",
-        f"| Share of evidence candidates rejected | {_pct(aggregates['share_evidence_rejected'])} |",
+        f"| Share of sources rejected | {_pct(aggregates['share_sources_rejected'])} |",
+        f"| ... of those, fatal to their evidence item | {_pct(aggregates['share_sources_rejected_fatally'])} |",
+        f"| Claims with a verdict rationale | {_pct(aggregates['share_claims_with_rationale'])} |",
+        f"| Claims without admissible evidence | {_pct(aggregates['share_claims_without_admissible_evidence'])} |",
+        f"| Essential evidence items (lost) | {aggregates['n_essential']} ({aggregates['n_essential_lost']}) |",
         "",
         "## Time differences (days)",
         "",
@@ -182,15 +194,15 @@ def render_markdown(aggregates: dict, mode: str) -> str:
         "",
         f"Paired claims: {recoverability['n_paired_claims']}",
         "",
-        "| | E_factcheck recoverable | E_factcheck not recoverable |",
+        "| | E_f recoverable | E_f not recoverable |",
         "| --- | ---: | ---: |",
-        f"| **E_claim recoverable** | {contingency['both']} | {contingency['only_E_claim']} |",
-        f"| **E_claim not recoverable** | {contingency['only_E_factcheck']} | {contingency['neither']} |",
+        f"| **E_c recoverable** | {contingency['both']} | {contingency['only_E_c']} |",
+        f"| **E_c not recoverable** | {contingency['only_E_f']} | {contingency['neither']} |",
         "",
-        f"- Recoverable from `E_claim`: {recoverability['recoverable_from_E_claim']} "
-        f"({_pct(recoverability['rate_E_claim'])})",
-        f"- Recoverable from `E_factcheck`: {recoverability['recoverable_from_E_factcheck']} "
-        f"({_pct(recoverability['rate_E_factcheck'])})",
+        f"- Recoverable from `E_c`: {recoverability['recoverable_from_E_c']} "
+        f"({_pct(recoverability['rate_E_c'])})",
+        f"- Recoverable from `E_f`: {recoverability['recoverable_from_E_f']} "
+        f"({_pct(recoverability['rate_E_f'])})",
         f"- Gain attributable to the fact-checking period: "
         f"{_pct(recoverability['gain_from_fact_check_period'])}",
         f"- McNemar exact two-sided p: "
@@ -234,8 +246,9 @@ async def main() -> None:
 
         write_csv(os.path.join(out_dir, "claims.csv"), claim_dicts)
         write_json(os.path.join(out_dir, "claims.json"), claim_dicts)
-        write_csv(os.path.join(out_dir, "evidence.csv"), evidence_records)
-        write_json(os.path.join(out_dir, "evidence.json"), evidence_records)
+        # One row per source: everything Stage 2 decides varies per source.
+        write_csv(os.path.join(out_dir, "sources.csv"), evidence_records)
+        write_json(os.path.join(out_dir, "sources.json"), evidence_records)
         write_json(os.path.join(out_dir, "aggregates.json"), aggregates)
 
         markdown = render_markdown(aggregates, args.mode)

@@ -4,12 +4,18 @@ Reads the original (multimodal) fact-checking article from the DB and has an MLL
 identify every distinct evidence item the fact-checker used to establish the
 verdict. No web access happens here; the article was already scraped by the main
 pipeline's stage 3.
+
+The same call also returns the *verdict rationale*: the reasoning that bridges the
+evidence and the verdict. Both come from one reading of the article, so the roles
+the extractor assigns (`essential` means "the rationale breaks without it") are
+consistent with the rationale it wrote.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -32,6 +38,7 @@ from veritas.gold_evidence.models import (
     EvidenceSource,
     ProximityLevel,
     SourceKind,
+    VerdictRationale,
     to_naive,
 )
 from veritas.util import get_domain
@@ -42,37 +49,59 @@ logger = logging.getLogger("VeriTaS")
 
 PROMPT_PATH = "veritas/gold_evidence/prompts/extract_evidence.md.j2"
 
+@dataclass
+class Extraction:
+    """What Stage 1 recovered from a claim's fact-checking articles."""
 
-async def extract_evidence(claim: Claim, replace: bool = False) -> list[Evidence]:
-    """Extracts and persists the candidate evidence for a claim, using up to
-    `max_reviews_per_claim` of its fact-checking articles.
+    evidence: list[Evidence] = field(default_factory=list)
+    #: One rationale per article that produced one.
+    rationales: list[VerdictRationale] = field(default_factory=list)
 
-    `replace` drops the claim's previously stored evidence first. Without it, a
-    re-extraction that phrases a proposition differently would leave the earlier
-    item behind as an orphan that still enters the analysis."""
+    @property
+    def is_empty(self) -> bool:
+        """True if the articles yielded neither evidence nor a rationale, i.e. the
+        instance cannot be analyzed at all. An empty *evidence set* alone is a
+        legitimate outcome: some verdicts rest on the rationale only."""
+        return not self.evidence and not self.rationales
+
+
+async def extract_evidence(claim: Claim, replace: bool = False) -> Extraction:
+    """Extracts and persists the candidate evidence and the verdict rationale of a
+    claim, using up to `max_reviews_per_claim` of its fact-checking articles.
+
+    `replace` drops the claim's previously stored evidence and rationales first.
+    Without it, a re-extraction that phrases a proposition differently would leave
+    the earlier item behind as an orphan that still enters the analysis."""
     if replace:
         deleted = await db.delete_evidence_for_claim(claim.id)
+        deleted += await db.delete_verdict_rationales_for_claim(claim.id)
         if deleted:
-            logger.debug(f"Dropped {deleted} previously stored evidence item(s) "
+            logger.debug(f"Dropped {deleted} previously stored Stage-1 record(s) "
                          f"of claim {claim.id} before re-extraction.")
 
     reviews = await _select_reviews(claim)
     if not reviews:
         logger.debug(f"Claim {claim.id} has no usable review for evidence extraction.")
-        return []
+        return Extraction()
 
-    candidates: list[Evidence] = []
+    extraction = Extraction()
     for review in reviews:
         article = await review.article
         if not article or article.dismissed or not str(article.content).strip():
             continue
-        candidates.extend(await extract_from_article(claim, review, article))
+        evidence, rationale = await extract_from_article(claim, review, article)
+        extraction.evidence.extend(evidence)
+        if rationale:
+            extraction.rationales.append(rationale)
 
-    candidates = deduplicate(candidates)[:max_evidence_per_claim]
+    # TODO: May be removed
+    extraction.evidence = deduplicate(extraction.evidence)[:max_evidence_per_claim]
 
-    for candidate in candidates:
+    for candidate in extraction.evidence:
         await candidate.save_to_db()
-    return candidates
+    for rationale in extraction.rationales:
+        await rationale.save_to_db()
+    return extraction
 
 
 async def _select_reviews(claim: Claim) -> list[Review]:
@@ -82,7 +111,8 @@ async def _select_reviews(claim: Claim) -> list[Review]:
     return reviews[:max_reviews_per_claim]
 
 
-async def extract_from_article(claim: Claim, review: Review, article: Article) -> list[Evidence]:
+async def extract_from_article(claim: Claim, review: Review,
+                               article: Article) -> tuple[list[Evidence], VerdictRationale | None]:
     """Runs the extractor MLLM on a single fact-checking article."""
     publisher = await review.publisher
     publisher_name = publisher.name if publisher else (review.raw_publisher_name or "the fact-checker")
@@ -102,17 +132,18 @@ async def extract_from_article(claim: Claim, review: Review, article: Article) -
 
     model = _resolve_model(prompt)
     try:
-        response = await model.generate(prompt, reasoning_effort=reasoning_effort_extraction)
+        response, reasoning = await model.generate(
+            prompt, reasoning_effort=reasoning_effort_extraction, return_reasoning=True)
     except FATAL_ERRORS:
         raise
     except Exception as e:
         logger.warning(f"Evidence extraction failed for claim {claim.id}, review {review.id}: {e}")
-        return []
+        return [], None
 
     if response is None:
-        return []
+        return [], None
 
-    records = parse_extraction_response(str(response))
+    rationale_text, records = parse_extraction_response(str(response))
     excluded_domains = _excluded_domains(review, publisher)
     resolved_locators = await resolve_locators(records)
 
@@ -129,9 +160,13 @@ async def extract_from_article(claim: Claim, review: Review, article: Article) -
         )
         if item:
             evidence.append(item)
+
+    rationale = build_rationale(rationale_text, claim=claim, review=review,
+                                article=article, reasoning=reasoning)
     logger.debug(f"Extracted {len(evidence)}/{len(records)} evidence candidates "
+                 f"{'and a rationale ' if rationale else ''}"
                  f"for claim {claim.id} from review {review.id}.")
-    return evidence
+    return evidence, rationale
 
 
 def _resolve_model(prompt: Prompt):
@@ -173,26 +208,59 @@ def _host_keys(url: str) -> set[str]:
     return keys
 
 
-def parse_extraction_response(response: str) -> list[dict]:
-    """Extracts the JSON list from the model response, tolerating minor syntax
-    errors and a missing code fence."""
+def parse_extraction_response(response: str) -> tuple[str | None, list[dict]]:
+    """Splits the model response into `(verdict rationale, evidence records)`,
+    tolerating minor syntax errors and a missing code fence.
+
+    The documented shape is an object with `verdict_rationale` and `evidence`. A
+    bare list is accepted as well and then carries no rationale, so a model that
+    answers in the older format still produces usable evidence."""
     payload = extract_last_code_block(response) or response
     try:
         parsed = json_repair.loads(payload)
     except Exception:
         logger.debug("Could not parse evidence extraction response.")
-        return []
+        return None, []
+
+    rationale = None
     if isinstance(parsed, dict):
-        # Some models wrap the list, e.g. {"evidence": [...]}
-        for value in parsed.values():
-            if isinstance(value, list):
-                parsed = value
-                break
-        else:
-            parsed = [parsed]
+        rationale = str(parsed.get("verdict_rationale") or "").strip() or None
+        records = parsed.get("evidence")
+        if not isinstance(records, list):
+            # Some models wrap the list under a different key, or return a single
+            # record without a list around it.
+            records = next((value for value in parsed.values() if isinstance(value, list)),
+                           None)
+            if records is None:
+                records = [] if rationale else [parsed]
+        parsed = records
+
     if not isinstance(parsed, list):
-        return []
-    return [record for record in parsed if isinstance(record, dict)]
+        return rationale, []
+    return rationale, [record for record in parsed if isinstance(record, dict)]
+
+
+def build_rationale(text: str | None, *, claim: Claim, review: Review,
+                    article: Article, reasoning: str | None = None) -> VerdictRationale | None:
+    """Turns the extracted rationale into a `VerdictRationale`, or None if the model
+    stated none. References to media that are no longer in the store are dropped
+    along with the rationale: an unresolvable reference would break every prompt the
+    rationale is later rendered into."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        detect_hallucinated_media_refs(text)
+    except (ValueError, AssertionError) as e:
+        logger.debug(f"Dropping verdict rationale with invalid media reference: {e}")
+        return None
+    return VerdictRationale(
+        claim_id=claim.id,
+        review_id=review.id,
+        article_id=article.id,
+        rationale=text,
+        extraction_reasoning=reasoning,
+    )
 
 
 async def resolve_locators(records: list[dict]) -> dict[str, str]:
@@ -201,7 +269,8 @@ async def resolve_locators(records: list[dict]) -> dict[str, str]:
     Resolving the whole article's locators in one gather overlaps the requests
     instead of serializing them; `unshorten` returns non-shortened URLs without
     touching the network at all."""
-    locators = list({str(record.get("source_locator") or "").strip() for record in records})
+    locators = list({str(source.get("locator") or "").strip()
+                     for record in records for source in _source_records(record)})
     locators = [locator for locator in locators if locator]
     if not locators:
         return {}
@@ -220,17 +289,13 @@ def build_evidence(
         resolved_locators: dict[str, str] | None = None,
 ) -> Evidence | None:
     """Validates one extracted record and turns it into an `Evidence` object.
-    Returns None if the record violates any of the extraction rules.
 
-    Tools and offline evidence may come without a locator: a phone call has no URL,
-    and not every tool has a public page. They are the only records for which the
-    locator guards below are skipped, precisely because there is nothing to point at."""
+    A record carries one proposition and every source that reports it. Sources are
+    validated individually: those that fail a guard are dropped, and the item
+    survives as long as one of them is left. Returns None if the proposition itself
+    is unusable or no source survived."""
     proposition = str(record.get("proposition") or "").strip()
-    locator = str(record.get("source_locator") or "").strip()
-    kind = _parse_enum(record.get("source_kind"), SourceKind, SourceKind.OTHER)
     if not proposition:
-        return None
-    if not locator and kind not in UNRETRIEVABLE_KINDS:
         return None
 
     # Guard 1: no hallucinated media references
@@ -240,59 +305,123 @@ def build_evidence(
         logger.debug(f"Dropping evidence with invalid media reference: {e}")
         return None
 
-    domain = None
-    if locator:
-        # Guard 2: the locator must literally occur in the article (same trick as
-        # stage 4's appearance extraction) - this rules out invented URLs. Checked
-        # on the locator as written, before it is resolved to its long form.
-        if locator not in article_str:
-            logger.debug(f"Dropping evidence with locator not found in article: {locator}")
-            return None
+    sources = []
+    for source_record in _source_records(record):
+        source = build_source(source_record, review=review, article_str=article_str,
+                              excluded_domains=excluded_domains,
+                              resolved_locators=resolved_locators)
+        if source and not any(_same_locator(source, other) for other in sources):
+            sources.append(source)
 
-        # Guard 3: the locator must not point back at the fact-checker, unless it is a tool
-        locator = (resolved_locators or {}).get(locator) or locator
-        host_keys = _host_keys(locator)
-        if kind != SourceKind.TOOL and host_keys & excluded_domains:
-            logger.debug(f"Dropping evidence pointing back at the fact-checker: {locator}")
-            return None
-        domain = get_domain(locator) or next(iter(host_keys), None)
-        if locator.rstrip("/") == str(review.url).rstrip("/"):
-            return None
-
-    source = EvidenceSource(
-        name=str(record.get("source_name") or domain or "unknown").strip(),
-        kind=kind,
-        locator=locator or None,
-        proximity=_parse_enum(record.get("source_proximity"), ProximityLevel,
-                              ProximityLevel.SECONDARY),
-    )
+    if not sources:
+        logger.debug(f"Dropping evidence without a usable source: {proposition[:80]!r}")
+        return None
 
     return Evidence(
         claim_id=claim.id,
         review_id=review.id,
         article_id=article.id,
         proposition=proposition,
-        source=source,
+        sources=sources,
         role=_parse_enum(record.get("role"), EvidenceRole, EvidenceRole.AUXILIARY),
         extraction_reasoning=str(record.get("reasoning") or "").strip() or None,
         extraction_confidence=_parse_confidence(record.get("confidence")),
     )
 
 
-def deduplicate(candidates: list[Evidence]) -> list[Evidence]:
-    """Removes duplicates by (normalized locator, normalized proposition), keeping
-    the item with the higher extraction confidence. Sorted by role then confidence.
+def build_source(record: dict, *,
+                 review: Review,
+                 article_str: str,
+                 excluded_domains: set[str],
+                 resolved_locators: dict[str, str] | None = None) -> EvidenceSource | None:
+    """Validates one source record. Returns None if it violates an extraction rule.
 
-    Items without a locator (tools, offline evidence) are deduplicated by their
-    proposition alone."""
-    best: dict[tuple[str, str], Evidence] = {}
+    A source without a locator is kept rather than dropped: fact-checks do cite
+    sources they never link, and recording those is how the analysis can report how
+    often that happens. Only tools and offline evidence are *expected* to have no
+    locator; for any other kind, `admissibility` settles the source as inaccessible
+    without Stage 2 ever attempting a retrieval."""
+    locator = str(record.get("locator") or "").strip()
+    kind = _parse_enum(record.get("kind"), SourceKind, SourceKind.OTHER)
+
+    domain = None
+    if locator:
+        # Guard 2: the locator must literally occur in the article (same trick as
+        # stage 4's appearance extraction) - this rules out invented URLs. Checked
+        # on the locator as written, before it is resolved to its long form.
+        if locator not in article_str:
+            logger.debug(f"Dropping source with locator not found in article: {locator}")
+            return None
+
+        # Guard 3: the locator must not point back at the fact-checker, unless it is a tool
+        locator = (resolved_locators or {}).get(locator) or locator
+        host_keys = _host_keys(locator)
+        if kind != SourceKind.TOOL and host_keys & excluded_domains:
+            logger.debug(f"Dropping source pointing back at the fact-checker: {locator}")
+            return None
+        domain = get_domain(locator) or next(iter(host_keys), None)
+        if locator.rstrip("/") == str(review.url).rstrip("/"):
+            return None
+
+    return EvidenceSource(
+        name=str(record.get("name") or domain or "unnamed source").strip(),
+        kind=kind,
+        locator=locator or None,
+        proximity=_parse_enum(record.get("proximity"), ProximityLevel,
+                              ProximityLevel.SECONDARY),
+    )
+
+
+def _source_records(record: dict) -> list[dict]:
+    """The source records of an extracted item.
+
+    Accepts the documented `sources` list and, as a fallback, the flat
+    `source_name`/`source_kind`/... spelling of a single source, so that a model
+    answering in the older format still produces usable evidence."""
+    sources = record.get("sources")
+    if isinstance(sources, list):
+        return [source for source in sources if isinstance(source, dict)]
+    if isinstance(sources, dict):
+        return [sources]
+    flat = {key.removeprefix("source_"): record.get(key)
+            for key in ("source_name", "source_kind", "source_locator", "source_proximity")}
+    return [flat] if any(value for value in flat.values()) else []
+
+
+def _same_locator(source: EvidenceSource, other: EvidenceSource) -> bool:
+    """Whether two sources of one item point at the same place. A locator-less
+    source is compared by name instead, so that one tool is not listed twice."""
+    if source.locator and other.locator:
+        return source.locator.rstrip("/").lower() == other.locator.rstrip("/").lower()
+    if source.locator or other.locator:
+        return False
+    return source.name.strip().lower() == other.name.strip().lower()
+
+
+def deduplicate(candidates: list[Evidence]) -> list[Evidence]:
+    """Merges items that assert the same proposition, keeping the union of their
+    sources and the higher extraction confidence. Sorted by role then confidence.
+
+    This is where redundancy across the two fact-checking articles is collected:
+    if both cite the same proposition to different sources, the result is one
+    evidence item with two sources rather than two items."""
+    best: dict[str, Evidence] = {}
     for candidate in candidates:
-        locator = candidate.source.locator or ""
-        key = (locator.rstrip("/").lower(),
-               " ".join(candidate.proposition.lower().split()))
+        key = " ".join(candidate.proposition.lower().split())
         existing = best.get(key)
-        if existing is None or candidate.extraction_confidence > existing.extraction_confidence:
+        if existing is None:
             best[key] = candidate
+            continue
+        for source in candidate.sources:
+            if not any(_same_locator(source, other) for other in existing.sources):
+                existing.sources.append(source)
+        if candidate.extraction_confidence > existing.extraction_confidence:
+            existing.extraction_confidence = candidate.extraction_confidence
+        # The stricter role wins: if one article treats the proposition as load
+        # bearing, losing it would break that article's rationale.
+        if candidate.role == EvidenceRole.ESSENTIAL:
+            existing.role = EvidenceRole.ESSENTIAL
+
     role_rank = {EvidenceRole.ESSENTIAL: 0, EvidenceRole.AUXILIARY: 1, EvidenceRole.BACKGROUND: 2}
     return sorted(best.values(),
                   key=lambda e: (role_rank.get(e.role, 3), -e.extraction_confidence))

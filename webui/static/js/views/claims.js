@@ -1,8 +1,11 @@
 /* The claim browser: filter, search and page through processed claims. */
 
 import { api } from '../api.js';
+import { renderMediaStrip } from '../media.js';
+import { math } from '../math.js';
 import {
-    badge, date, el, humanize, num, REASON_HELP, relative, STATUS_STYLE, truncate,
+    badge, date, el, humanize, mediaSelect, num, REASON_HELP, relative, STATUS_STYLE,
+    truncate,
 } from '../util.js';
 
 const SORT_LABELS = {
@@ -18,7 +21,8 @@ export async function renderClaims(root, params, { navigate }) {
         status: params.getAll('status'),
         q: params.get('q') ?? '',
         reason: params.get('reason') ?? '',
-        has_media: params.get('has_media') ?? '',
+        language: params.getAll('language'),
+        media: params.get('media') ?? '',
         released: params.get('released') ?? '',
         sort: params.get('sort') ?? 'updated',
         order: params.get('order') ?? 'desc',
@@ -64,7 +68,8 @@ export async function renderClaims(root, params, { navigate }) {
             status: state.status,
             q: state.q || null,
             reason: state.reason || null,
-            has_media: state.has_media || null,
+            language: state.language,
+            media: state.media || null,
             released: state.released || null,
             sort: state.sort,
             order: state.order,
@@ -129,14 +134,25 @@ function buildToolbar(state, filters, apply) {
         }));
     }
 
-    const mediaSelect = el('select', {
-        'aria-label': 'Media filter',
-        onchange: (event) => apply({ has_media: event.target.value }),
-    }, [
-        el('option', { value: '', text: 'Any modality' }),
-        el('option', { value: 'true', selected: state.has_media === 'true', text: 'With media' }),
-        el('option', { value: 'false', selected: state.has_media === 'false', text: 'Text only' }),
-    ]);
+    const languageSelect = el('select', {
+        'aria-label': 'Language',
+        onchange: (event) => apply({ language: event.target.value ? [event.target.value] : [] }),
+    }, [el('option', {
+        value: '',
+        selected: state.language.length === 0,
+        text: state.language.length > 1
+            ? `Any language (${state.language.length} selected)`
+            : 'Any language',
+    })]);
+    for (const entry of filters.languages ?? []) {
+        languageSelect.append(el('option', {
+            value: entry.label,
+            selected: state.language.length === 1 && state.language[0] === entry.label,
+            text: `${entry.label} (${num(entry.count)})`,
+        }));
+    }
+
+    const modality = mediaSelect(state, 'media', apply);
 
     const releasedSelect = el('select', {
         'aria-label': 'Release filter',
@@ -163,7 +179,8 @@ function buildToolbar(state, filters, apply) {
         el('div', { class: 'search' }, [el('i', { class: 'fa-solid fa-magnifying-glass' }), search]),
         statusPills,
         reasonSelect,
-        mediaSelect,
+        languageSelect,
+        modality,
         releasedSelect,
         sortSelect,
         orderButton,
@@ -175,7 +192,12 @@ function buildResults(page, apply) {
         return el('div', { class: 'empty fade' }, [
             el('i', { class: 'fa-solid fa-inbox' }),
             el('div', { text: 'No claim matches these filters.' }),
-            el('button', { class: 'btn', onclick: () => apply({ status: [], q: '', reason: '', has_media: '', released: '' }) },
+            el('button', {
+                class: 'btn',
+                onclick: () => apply({
+                    status: [], q: '', reason: '', language: [], media: '', released: '',
+                }),
+            },
                 [el('i', { class: 'fa-solid fa-rotate-left' }), 'Reset filters']),
         ]);
     }
@@ -214,15 +236,15 @@ function claimCard(claim, index) {
             claim.reason
                 ? badge(claim.reason, { tone: 'plain', icon: 'fa-circle-info', title: REASON_HELP[claim.reason] ?? '' })
                 : null,
-            claim.n_multimodal > 0
-                ? badge(`${claim.n_multimodal} multimodal`, { tone: 'violet', icon: 'fa-photo-film' })
-                : null,
+            ...mediaBadges(claim),
             claim.released ? badge('released', { tone: 'info', icon: 'fa-box-open' }) : null,
             claim.is_rectified ? badge('rectified', { tone: 'plain', icon: 'fa-pen-nib' }) : null,
             el('span', { class: 'id', style: { marginLeft: 'auto' }, text: `#${claim.id}` }),
         ]),
 
         el('p', { class: 'text', text: truncate(stripRefs(claim.data), 340) }),
+
+        renderMediaStrip(claim.content),
 
         el('div', { class: 'meta' }, [
             el('span', { title: 'Claim date t_c' },
@@ -232,6 +254,13 @@ function claimCard(claim, index) {
             el('span', { title: 'Candidates / admissible' },
                 [el('i', { class: 'fa-solid fa-layer-group' }),
                     `${num(claim.n_admissible)} of ${num(claim.n_evidence)} admissible`]),
+            claim.n_multimodal > 0
+                ? el('span', {
+                    title: `${num(claim.n_with_images)} evidence item(s) reference an image, `
+                        + `${num(claim.n_with_videos)} a video`,
+                }, [el('i', { class: 'fa-solid fa-photo-film' }),
+                    `${num(claim.n_multimodal)} multimodal evidence`])
+                : null,
             claim.language ? el('span', {}, [el('i', { class: 'fa-solid fa-language' }), claim.language]) : null,
             el('span', { style: { marginLeft: 'auto' }, title: claim.updated_at ?? '' },
                 [el('i', { class: 'fa-solid fa-clock-rotate-left' }), relative(claim.updated_at)]),
@@ -245,6 +274,30 @@ function claimCard(claim, index) {
             ])
             : null,
     ]);
+}
+
+/** Badges for the media the *claim itself* carries, one per kind. The evidence's
+ *  own modality is reported in the meta row, so the two are never confused. */
+function mediaBadges(claim) {
+    if (!claim.content?.n_media) return [];
+
+    // Counted from the segments, which list every reference: the `media` array
+    // is capped for the preview and would undercount.
+    const counts = new Map();
+    const seen = new Set();
+    for (const part of claim.content.segments ?? []) {
+        if (part.type !== 'media' || seen.has(part.reference)) continue;
+        seen.add(part.reference);
+        counts.set(part.kind, (counts.get(part.kind) ?? 0) + 1);
+    }
+
+    const icons = { image: 'fa-image', video: 'fa-film', audio: 'fa-volume-high' };
+    return [...counts].map(([kind, count]) =>
+        badge(`${count} ${kind}${count === 1 ? '' : 's'}`, {
+            tone: 'violet',
+            icon: icons[kind] ?? 'fa-paperclip',
+            title: `The claim references ${count} ${kind}(s)`,
+        }));
 }
 
 /** Media references would clutter the one-line preview; the detail view keeps them. */

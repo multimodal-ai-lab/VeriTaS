@@ -15,13 +15,22 @@ services:
   #   docker compose up webui   ->   http://localhost:8080
   # Override the defaults in a `.env` file next to this one; see webui/README.md.
   webui:
+    # Named explicitly so the image can also be built outside compose, e.g. with
+    # `podman build -t veritas-webui:latest -f webui/Dockerfile .`, and then
+    # started with `docker compose up -d --no-build webui`.
+    image: veritas-webui:latest
     build:
       context: .
       dockerfile: webui/Dockerfile
     restart: unless-stopped
     ports:
-      - "${WEBUI_PORT:-8080}:8080"
+      # Mapped to itself, so the port is the same inside and outside the
+      # container and `WEBUI_PORT` means one thing everywhere.
+      - "${WEBUI_PORT:-8080}:${WEBUI_PORT:-8080}"
     environment:
+      # The port uvicorn binds. Also honoured where there is no port mapping,
+      # see docker-compose.podman.yaml.
+      WEBUI_PORT: ${WEBUI_PORT:-8080}
       # Defaults point at the database on the Docker host, which is where the
       # pipeline usually runs. `config.yaml` fills in anything left unset.
       VERITAS_DB_HOST: ${VERITAS_DB_HOST:-host.docker.internal}

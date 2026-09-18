@@ -40,7 +40,10 @@ export const api = {
     filters: () => request('/api/filters'),
     claims: (params) => request('/api/claims', params),
     claim: (id) => request(`/api/claims/${id}`),
+    evidenceList: (params) => request('/api/evidence', params),
+    evidenceOptions: () => request('/api/evidence/options'),
     evidence: (id) => request(`/api/evidence/${id}`),
+    evidenceItem: (id) => request(`/api/evidence/items/${id}`),
     mediaUrl: (kind, id) => `/api/media/${kind}/${id}`,
 };
 

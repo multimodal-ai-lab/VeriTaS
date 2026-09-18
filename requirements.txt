@@ -1,17 +1,16 @@
-numpy
-pydantic~=2.13.4
+numpy>=2.5.3
+pydantic>=2.13.5
 ezmm>=0.5.2
-scrapemm>=0.7.10
-openai~=2.45.0
-anthropic~=0.116.0
+scrapeMM>=0.8.1
+openai~=2.54.0
+anthropic~=0.125.0
 PyYAML~=6.0.2
 asyncpg~=0.31.0
-aiohttp~=3.14.1
+aiohttp>=3.14.3
 requests~=2.34.2
-beautifulsoup4~=4.15.0
-markdownify~=1.2.3
-playwright~=1.61.0
-tqdm~=4.68.4
+beautifulsoup4>=4.15.0
+markdownify>=1.2.3
+tqdm>=4.68.4
 python-dateutil~=2.9.0.post0
 langcodes~=3.5.1
 python-multipart>=0.0.9
@@ -22,10 +21,9 @@ jinja2
 json_repair~=0.61.5
 langdetect~=1.0.9
 ijson~=3.5.1
-opencv-python
-google-genai[aiohttp]~=1.55.0
+opencv-python>=5.0.0.93  # Video processing
+google-genai[aiohttp]>= 1.65.0, < 2
 async_lru
-oauthlib
 pytest-asyncio
 matplotlib
 psutil

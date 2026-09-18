@@ -5,13 +5,16 @@
  *   #/claims?filters          claim browser
  *   #/claims/:id              claim detail
  *   #/claims/:id/evidence/:id claim detail, scrolled to one evidence item
+ *   #/evidence?filters        evidence browser
  */
 
 import { api, ApiError } from './api.js';
+import { typeset } from './math.js';
 import { el, qs, qsa } from './util.js';
 import { renderOverview } from './views/overview.js';
 import { renderClaims } from './views/claims.js';
 import { renderClaim } from './views/claim.js';
+import { renderEvidence } from './views/evidence.js';
 
 const view = qs('#view');
 
@@ -50,7 +53,8 @@ async function pollHealth() {
             ? `Connected to ${health.database.host}:${health.database.port}/${health.database.name}\n`
               + `Media registry: ${health.media.registry_path} `
               + `(${health.media.registry_found ? 'found' : 'NOT found'})`
-            : 'The backend cannot reach the database.';
+            : health.database?.error
+              || 'The backend cannot reach the database.';
         qs('#version').textContent = `v${health.version}`;
         if (!health.media?.registry_found) {
             node.classList.add('down');
@@ -91,6 +95,9 @@ async function render() {
         } else if (parts[0] === 'claims') {
             markNav('claims');
             await renderClaims(view, params, { navigate });
+        } else if (parts[0] === 'evidence') {
+            markNav('evidence');
+            await renderEvidence(view, params, { navigate });
         } else {
             markNav('overview');
             await renderOverview(view);
@@ -98,6 +105,9 @@ async function render() {
     } catch (error) {
         view.replaceChildren(errorPanel(error));
     }
+    // Views build their math spans as plain text; render them once the view is
+    // in the DOM. Content added later (filter re-draws) typesets itself.
+    typeset(view);
 }
 
 function errorPanel(error) {

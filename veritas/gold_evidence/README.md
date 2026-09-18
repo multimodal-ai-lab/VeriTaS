@@ -17,13 +17,62 @@ their rationale.
 
 | Stage | Module | What it does |
 | --- | --- | --- |
-| 1 | `extraction.py` | An MLLM reads the stored fact-check article and returns candidate `Evidence` items: an atomic proposition plus an independently locatable source. |
-| 2 | `filtering.py`, `retrieval.py` | Per item: re-retrieve the source through scrapeMM and date it (§3.1), check the source still supports the proposition (§3.2), check the cutoff, verdict leakage and later-event contamination (§3.3). Tools and offline evidence skip retrieval and faithfulness, but are still validated temporally once they carry a `t_e`; a rate-limited source defers the item. |
-| 3 | `sufficiency.py`, `closeness.py` | A cross-family ensemble predicts a verdict from claim + retained evidence only, and `is_close` compares it to the gold verdict. |
+| 1 | `extraction.py` | An MLLM reads the stored fact-check article and returns candidate `Evidence` items (an atomic proposition plus an independently locatable source) **and** the `VerdictRationale` that turns those propositions into a verdict. |
+| 2 | `filtering.py`, `retrieval.py` | Per **source**: re-retrieve it through scrapeMM and date it (§3.1), check it still supports the proposition (§3.2), compute the two cutoffs and the verdict-leak check (§3.3). Per **item**, once its sources are dated: does the proposition rest on a change of the world that happened only after `t_c`? Tools and offline evidence skip retrieval and faithfulness; a rate-limited source defers itself. |
+| 3 | `sufficiency.py`, `closeness.py` | A cross-family ensemble predicts a verdict from claim + retained evidence + rationale, and `is_close` compares it to the gold verdict. |
 | — | `analysis.py` | Aggregation for the temporal analysis, including the paired recoverability test. |
 
 `admissibility.py` holds the decision rule, `models.py` the data model, `llm.py`
 the cached model resolution, and `pipeline.py` wires the stages together per claim.
+
+## Verdict rationale
+
+Not every verdict rests on external sources. Some claims are settled by arithmetic,
+by a contradiction inside the claim itself, or by what the claim's own image plainly
+shows. The **verdict rationale** captures that step: it is a multimodal text,
+extracted in the same call as the evidence, that bridges the gap between the
+propositions and the verdict.
+
+It may build **only on the items marked `essential`** and on the claim itself, and
+it may only combine, compare or transform what they already state — it must not
+introduce a new externally verifiable factual premise (that would be evidence, and
+belongs in `evidence` where it can be dated and re-checked), and it never states the
+verdict. Binding it to essential evidence is what keeps it honest: the rationale
+becomes invalid exactly when an essential item is lost, which is exactly when the
+instance is discarded. It is handed to the sufficiency ensemble alongside
+the evidence, which is what makes an **empty evidence set** analyzable instead of
+looking like a failed reconstruction.
+
+## Evidence, sources, and what disqualifies an instance
+
+An **evidence item** is one proposition; an **evidence source** is a place that
+proposition can be read. Fact-checks cite redundantly — two outlets for one fact, a
+register plus a screenshot of it — so an item carries *all* the sources the article
+gives for it.
+
+The split follows the questions: everything Stage 2 asks is about a source (can it
+still be retrieved, when did it become available, does it still say this?), while
+the proposition and its role belong to the item. A source the article cites without
+linking is kept too, with an empty locator, and is settled as `inaccessible`
+straight away - unless it is a tool or offline evidence, which need no locator. An item therefore **survives as
+long as one of its sources does**, and losing a source costs the reconstruction
+nothing as long as another still reports the proposition.
+
+`t_e` of an item is the **earliest** `available_since` among its sources — the moment
+from which the proposition could be read somewhere. It is what the later-event check
+is gated on: evidence that already existed at `t_c` cannot rest on anything that
+happened afterwards, so that check runs only for items that appeared later, once per
+item rather than once per source.
+
+`role` is judged against the rationale: an item is **essential** when the rationale
+breaks without the proposition it asserts. An instance is disqualified **not** when
+its evidence set ends up empty, but when an essential item loses *every* source
+(`essential_evidence_lost`).
+
+The same rule decides the two conditions without asking the ensemble: if an
+essential item has no source inside `E_c`, that condition cannot support the
+rationale, so it is recorded as insufficient directly. That is a finding about the
+claim, not a defect of the reconstruction.
 
 ## Reference times
 
@@ -42,19 +91,21 @@ ones whose outcome can differ between the two conditions.
 
 ## Source retrieval
 
-All retrieval runs through scrapeMM — nothing fetches a URL on its own:
+All retrieval runs through scrapeMM — nothing fetches a URL on its own, and each
+source is retrieved exactly once:
 
-1. `retrieve(url, format="html")`
-2. publication time from the HTML's meta tags (reuses `stage_3.extract_date_meta`)
-3. that same HTML → `MultimodalSequence` via scrapeMM's `to_multimodal_sequence`
-4. only if step 2 found nothing: a cheap model reads a stated publication time off
-   the converted content, and returns nothing rather than guessing
+1. `retrieve(url, output_format="multimodal")`
+2. publication time from the meta tags of the raw HTML that the *same* response
+   carries in `response.content.html` (reuses `stage_3.extract_date_meta`)
+3. only if step 2 found nothing: a cheap model reads a stated publication time off
+   the retrieved content, and returns nothing rather than guessing
 
-scrapeMM serves `format="html"` only through Firecrawl and Decodo, and step 1 is
-restricted to those two. Sources it handles through an API integration (social
-media, archiving services, video platforms) come back unsuccessful and are recorded
-as inaccessible — there is no second attempt in the default `multimodal_sequence`
-format. See the limitations in `DESIGN_DECISIONS.md`.
+scrapeMM produces every format preceding the requested one, so `content.multimodal`
+and `content.html` come out of one call — no second retrieval, no separate
+HTML-to-sequence conversion. Retrieval is therefore not restricted to the
+HTML-capable backends: sources served by an API integration (social media,
+archiving services, video platforms) are retrieved like any other and, having no
+HTML page, are dated in step 3.
 
 A source that only *rate-limited* us is not inaccessible: the item is deferred for
 `defer_hours` and its claim ends on status `deferred`, which a later run picks up
@@ -119,9 +170,15 @@ Two settings change the reported numbers and should be stated in any write-up:
 
 Additive only:
 
-- `evidence` — one row per reconstructed evidence item, with flat columns for
-  querying (including `deferred_until`) and a `full_evidence` JSONB blob as the
-  authoritative representation.
+- `evidence` — one row per reconstructed evidence item (proposition, role, and the
+  outcome derived from its sources), with a `full_evidence` JSONB blob as the
+  authoritative representation of the item itself.
+- `evidence_sources` — one row per source, with everything Stage 2 decided about it
+  and a `full_source` blob. The web UI joins the two: `evidence` for the
+  proposition and its outcome, `evidence_sources` for everything it filters on.
+- `verdict_rationales` — one row per fact-checking article that yielded a rationale.
+  Kept apart from `evidence` because it asserts no externally verifiable fact, so
+  none of the Stage-2 criteria apply to it.
 - `gold_evidence_results` — one row per (claim, condition, ensemble mode), holding
   the predicted verdict, every ensemble member's rating, stated justification,
   reasoning trace and answer text, the property distances and the closeness

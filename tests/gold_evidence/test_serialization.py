@@ -7,7 +7,14 @@ import pytest
 
 from tests.gold_evidence.conftest import make_evidence
 from veritas.common import Claim
-from veritas.db.veritas_db import _evidence_columns, row_to_evidence
+from veritas.db.veritas_db import (
+    _evidence_columns,
+    _rationale_columns,
+    _source_columns,
+    row_to_evidence,
+    row_to_evidence_source,
+    row_to_verdict_rationale,
+)
 from veritas.gold_evidence.models import (
     Evidence,
     EvidenceRole,
@@ -18,11 +25,23 @@ from veritas.gold_evidence.models import (
 
 
 def roundtrip(evidence: Evidence, evidence_id: int = 42) -> Evidence:
-    """Flattens to columns and reconstructs, exactly as the DB layer does."""
+    """Flattens to columns and reconstructs, exactly as the DB layer does: the item
+    and its sources live in separate tables and are reassembled on read."""
     columns, values = _evidence_columns(evidence)
     row = dict(zip(columns, values))
     row["id"] = evidence_id
-    return row_to_evidence(row)
+
+    restored = row_to_evidence(row)
+    restored.sources = [source_roundtrip(source, evidence_id)
+                        for source in evidence.sources]
+    return restored
+
+
+def source_roundtrip(source, evidence_id: int = 42, source_id: int = 7):
+    columns, values = _source_columns(source, evidence_id, claim_id=1)
+    row = dict(zip(columns, values))
+    row["id"] = source_id
+    return row_to_evidence_source(row)
 
 
 def test_evidence_survives_the_roundtrip():
@@ -32,13 +51,16 @@ def test_evidence_survives_the_roundtrip():
     assert restored.id == 42
     assert restored.claim_id == original.claim_id
     assert restored.proposition == original.proposition
-    assert restored.source.locator == original.source.locator
-    assert restored.source.kind is original.source.kind
-    assert restored.source.proximity is original.source.proximity
     assert restored.role is original.role
-    assert restored.available_since == original.available_since
-    assert restored.faithfulness.assessment == original.faithfulness.assessment
-    assert restored.temporal_validation.before_claim is True
+    assert restored.extraction_confidence == original.extraction_confidence
+
+    source, original_source = restored.sources[0], original.sources[0]
+    assert source.locator == original_source.locator
+    assert source.kind is original_source.kind
+    assert source.proximity is original_source.proximity
+    assert source.available_since == original_source.available_since
+    assert source.faithfulness.assessment == original_source.faithfulness.assessment
+    assert source.temporal_validation.before_claim is True
 
 
 def test_media_references_in_the_proposition_survive():
@@ -48,32 +70,72 @@ def test_media_references_in_the_proposition_survive():
     assert restored.proposition == "The clip <video:12> shows the square at dusk."
 
 
-def test_flat_columns_mirror_the_nested_fields():
+def test_every_source_of_an_item_survives_the_roundtrip():
+    from tests.gold_evidence.conftest import make_source
+
+    original = make_evidence(sources=[make_source(locator="https://a/1", name="Reuters"),
+                                      make_source(locator="https://a/2", name="Register")])
+    restored = roundtrip(original)
+
+    assert [s.name for s in restored.sources] == ["Reuters", "Register"]
+
+
+def test_the_source_columns_mirror_the_nested_fields():
     """The flat columns exist for querying; they must not drift from the blob."""
-    evidence = make_evidence(available_since=datetime(2024, 4, 15),
-                             faithfulness=2 / 3, later_event=True)
-    columns, values = _evidence_columns(evidence)
+    evidence = make_evidence(available_since=datetime(2024, 4, 15), faithfulness=2 / 3)
+    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
     row = dict(zip(columns, values))
 
     assert row["faithfulness_assessment"] == pytest.approx(2 / 3)
     assert row["before_claim"] is True
+    assert row["kind"] == SourceKind.NEWS_ARTICLE.value
+    assert row["proximity"] == ProximityLevel.SECONDARY.value
+    assert row["full_source"]["name"] == evidence.sources[0].name
+
+
+def test_the_later_event_judgement_is_stored_with_the_item():
+    """It is about the proposition, so it belongs to the item, not to a source."""
+    evidence = make_evidence(later_event=True)
+    columns, values = _evidence_columns(evidence)
+    row = dict(zip(columns, values))
+
     assert row["later_event"] is True
-    assert row["source_kind"] == SourceKind.NEWS_ARTICLE.value
-    assert row["source_proximity"] == ProximityLevel.SECONDARY.value
+    assert row["admissible"] is False
+    assert row["inadmissibility_reason"] == "later_event"
+    assert roundtrip(evidence).later_event.change_detected is True
+
+
+def test_the_item_columns_carry_what_the_sources_decided():
+    """The aggregation layer stores the outcome so that queries need not join."""
+    from tests.gold_evidence.conftest import make_source
+
+    evidence = make_evidence(sources=[make_source(locator="https://a/1", accessible=False),
+                                      make_source(locator="https://a/2")])
+    from veritas.gold_evidence.admissibility import apply_admissibility_to_item
+
+    apply_admissibility_to_item(evidence)
+    columns, values = _evidence_columns(evidence)
+    row = dict(zip(columns, values))
+
     assert row["role"] == EvidenceRole.ESSENTIAL.value
+    assert row["admissible"] is True          # one source survived
+    assert row["n_sources"] == 2
+    assert row["n_admissible_sources"] == 1
     assert row["full_evidence"]["proposition"] == evidence.proposition
+    # The sources live in their own table, not a second time in the blob.
+    assert "sources" not in row["full_evidence"]
 
 
 def test_unfiltered_evidence_serializes_with_nulls():
-    evidence = make_evidence(filtered=False)
-    columns, values = _evidence_columns(evidence)
+    evidence = make_evidence(decided=False)
+    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
     row = dict(zip(columns, values))
     assert row["accessible"] is None
     assert row["faithfulness_assessment"] is None
     assert row["before_claim"] is None
     assert row["admissible"] is None
 
-    restored = roundtrip(evidence)
+    restored = source_roundtrip(evidence.sources[0])
     assert restored.faithfulness is None
     assert restored.temporal_validation is None
 
@@ -85,33 +147,39 @@ def test_hashes_are_stable_and_distinguish_items():
     _, values_b = _evidence_columns(b)
     row_a, row_b = dict(zip(columns, values_a)), dict(zip(columns, values_b))
 
-    assert row_a["source_locator_hash"] == row_b["source_locator_hash"]
     assert row_a["proposition_hash"] != row_b["proposition_hash"]
     # Deterministic across calls
     assert _evidence_columns(a)[1] == values_a
 
 
+def test_sources_are_keyed_by_locator_and_fall_back_to_the_name():
+    from tests.gold_evidence.conftest import make_source
+    from veritas.db.veritas_db import _source_key_hash
+
+    a = make_source(locator="https://example.org/a")
+    b = make_source(locator="https://example.org/a")
+    assert _source_key_hash(a) == _source_key_hash(b)
+
+    # A source without a locator is identified by its name instead, so that one
+    # tool is not stored twice.
+    tool = make_source(locator=None, name="ExifTool")
+    same_tool = make_source(locator=None, name="exiftool")
+    assert _source_key_hash(tool) == _source_key_hash(same_tool)
+    assert _source_key_hash(tool) != _source_key_hash(a)
+
+
 def test_a_missing_locator_stays_null_in_the_columns():
-    """Both locator columns are nullable, so a source that is not a publication is
-    stored as what it is rather than as an empty string."""
+    """A source that is not a publication is stored as what it is rather than as
+    an empty string."""
     from veritas.gold_evidence.models import SourceKind as Kind
 
     evidence = make_evidence(locator=None, kind=Kind.OFFLINE, available_since=None)
-    columns, values = _evidence_columns(evidence)
+    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
     row = dict(zip(columns, values))
 
-    assert row["source_locator"] is None
-    assert row["source_locator_hash"] is None
-    assert roundtrip(evidence).source.locator is None
-
-
-def test_a_present_locator_is_still_hashed():
-    evidence = make_evidence(locator="https://example.org/record/1")
-    columns, values = _evidence_columns(evidence)
-    row = dict(zip(columns, values))
-
-    assert row["source_locator"] == "https://example.org/record/1"
-    assert isinstance(row["source_locator_hash"], int)
+    assert row["locator"] is None
+    assert isinstance(row["source_key_hash"], int)
+    assert roundtrip(evidence).sources[0].locator is None
 
 
 def test_the_deferral_window_is_flattened_and_restored():
@@ -119,10 +187,31 @@ def test_the_deferral_window_is_flattened_and_restored():
 
     evidence = make_evidence()
     until = datetime.now() + timedelta(hours=24)
-    evidence.deferred_until = until
-    columns, values = _evidence_columns(evidence)
+    evidence.sources[0].deferred_until = until
+    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
+
     assert dict(zip(columns, values))["deferred_until"] == until
-    assert roundtrip(evidence).deferred_until == until
+    assert roundtrip(evidence).sources[0].deferred_until == until
+
+
+# --- Verdict rationales ----------------------------------------------------
+
+def test_a_rationale_survives_the_roundtrip():
+    from tests.gold_evidence.conftest import make_rationale
+
+    original = make_rationale("The clip <video:12> shows daylight.")
+    columns, values = _rationale_columns(original)
+    row = dict(zip(columns, values))
+    row["id"] = 11
+
+    assert row["rationale"] == "The clip <video:12> shows daylight."
+    assert row["claim_id"] == 1
+    assert row["review_id"] == 7
+
+    restored = row_to_verdict_rationale(row)
+    assert restored.id == 11
+    assert restored.rationale == original.rationale
+    assert restored.article_id == original.article_id
 
 
 # --- Claim columns ---------------------------------------------------------

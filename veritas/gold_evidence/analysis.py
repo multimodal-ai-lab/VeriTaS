@@ -41,9 +41,15 @@ class ClaimRecord:
     language: str | None
     n_candidates: int
     n_admissible: int
+    n_sources: int
     n_in_window: int
     n_undated: int
     n_deferred: int
+    #: Stage 1 output beyond the evidence itself.
+    n_rationales: int
+    #: Evidence items the rationale rests on, and how many lost every source.
+    n_essential: int
+    n_essential_lost: int
     n_evidence_claim: int
     n_evidence_fact_check: int
     gold_integrity: float | None
@@ -66,20 +72,33 @@ class ClaimRecord:
     def has_window_evidence(self) -> bool:
         return self.n_in_window > 0
 
+    @property
+    def has_rationale(self) -> bool:
+        return self.n_rationales > 0
+
+    @property
+    def evidence_free(self) -> bool:
+        """No admissible evidence at all - legitimate when a rationale carries the
+        verdict (arithmetic, an internal contradiction, the claim's own media)."""
+        return self.n_admissible == 0
+
     def to_dict(self) -> dict:
         data = {k: v for k, v in self.__dict__.items()}
         data["t_c"] = self.t_c.isoformat() if self.t_c else None
         data["t_f"] = self.t_f.isoformat() if self.t_f else None
         data["fact_check_duration_days"] = self.fact_check_duration
         data["has_window_evidence"] = self.has_window_evidence
+        data["has_rationale"] = self.has_rationale
+        data["evidence_free"] = self.evidence_free
         return data
 
 
 def build_claim_record(*, claim, gold, evidence: list[Evidence],
                        t_c: datetime | None, t_f: datetime | None,
-                       results: dict[str, dict] | None = None) -> ClaimRecord:
+                       results: dict[str, dict] | None = None,
+                       rationales: list | None = None) -> ClaimRecord:
     """Assembles the claim-level row from the stored objects."""
-    from veritas.gold_evidence.admissibility import select
+    from veritas.gold_evidence.admissibility import essential, in_window, lost_essential, select
 
     results = results or {}
     t_c, t_f = to_naive(t_c), to_naive(t_f)
@@ -101,9 +120,14 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
         language=claim.language,
         n_candidates=len(evidence),
         n_admissible=len(admissible),
-        n_in_window=sum(1 for e in admissible if in_window(e)),
-        n_undated=sum(1 for e in evidence if e.available_since is None),
-        n_deferred=sum(1 for e in evidence if e.deferred),
+        n_sources=sum(len(e.sources) for e in evidence),
+        n_in_window=sum(1 for e in evidence for s in e.sources
+                        if s.admissible and in_window(s)),
+        n_undated=sum(1 for e in evidence for s in e.sources if s.available_since is None),
+        n_deferred=sum(1 for e in evidence for s in e.sources if s.deferred),
+        n_rationales=len(rationales or []),
+        n_essential=len(essential(evidence)),
+        n_essential_lost=len(lost_essential(evidence)),
         n_evidence_claim=len(claim_set),
         n_evidence_fact_check=len(fact_check_set),
         gold_integrity=_score(_safe(lambda: gold.integrity)) if gold else None,
@@ -117,37 +141,57 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
     )
 
 
-def build_evidence_record(evidence: Evidence, *, claim_id: int,
-                          t_c: datetime | None,
-                          t_f: datetime | None) -> dict:
-    """One evidence-level row of the analysis export."""
-    temporal = evidence.temporal_validation
-    faithfulness = evidence.faithfulness
+def build_evidence_records(evidence: Evidence, *, claim_id: int,
+                           t_c: datetime | None,
+                           t_f: datetime | None) -> list[dict]:
+    """One row per *source* of an evidence item.
+
+    The rows are source-level because everything that varies within an item varies
+    per source: the availability time, the accessibility, the faithfulness, the
+    admissibility. The item's own fields - proposition, role, and whether it
+    survived at all - are repeated on each row so the export can be grouped either
+    way."""
+    return [_source_record(source, evidence, claim_id=claim_id, t_c=t_c, t_f=t_f)
+            for source in evidence.sources]
+
+
+def _source_record(source, evidence: Evidence, *, claim_id: int,
+                   t_c: datetime | None, t_f: datetime | None) -> dict:
+    temporal = source.temporal_validation
+    faithfulness = source.faithfulness
     return {
+        "source_id": source.id,
         "evidence_id": evidence.id,
         "claim_id": claim_id,
         "review_id": evidence.review_id,
         "proposition": evidence.proposition,
-        "source_name": evidence.source.name,
-        "source_kind": evidence.source.kind.value,
-        "source_locator": evidence.source.locator,
-        "source_domain": evidence.source.domain,
-        "source_proximity": evidence.source.proximity.value,
         "role": evidence.role.value,
-        "available_since": evidence.available_since.isoformat() if evidence.available_since else None,
-        "t_e_minus_t_c_days": evidence.time_to_claim(t_c),
-        "t_e_minus_t_f_days": evidence.time_to_fact_check(t_f),
-        "in_window": in_window(evidence),
-        "is_multimodal": evidence.is_multimodal,
         "extraction_confidence": evidence.extraction_confidence,
-        "accessible": evidence.accessible,
+        "is_multimodal": evidence.is_multimodal,
+        # Whether the *item* survived; a discarded source of a surviving item costs
+        # the reconstruction nothing.
+        "evidence_admissible": evidence.admissible,
+        "n_sources": len(evidence.sources),
+
+        "source_name": source.name,
+        "source_kind": source.kind.value,
+        "source_locator": source.locator,
+        "source_domain": source.domain,
+        "source_proximity": source.proximity.value,
+        "available_since": source.available_since.isoformat() if source.available_since else None,
+        "t_e_minus_t_c_days": source.time_to_claim(t_c),
+        "t_e_minus_t_f_days": source.time_to_fact_check(t_f),
+        "in_window": in_window(source),
+        "accessible": source.accessible,
         "faithfulness": faithfulness.assessment if faithfulness else None,
         "before_claim": temporal.before_claim if temporal else None,
         "before_fact_check": temporal.before_fact_check if temporal else None,
-        "later_event": temporal.later_event if temporal else None,
-        "admissible": evidence.admissible,
-        "inadmissibility_reason": evidence.inadmissibility_reason,
-        "deferred": evidence.deferred,
+        # §3.3 (3) is judged for the proposition, so it is the same on every row
+        # of one item.
+        "later_event": evidence.relies_on_later_event,
+        "admissible": source.admissible,
+        "inadmissibility_reason": source.inadmissibility_reason,
+        "deferred": source.deferred,
     }
 
 
@@ -170,19 +214,23 @@ def aggregate(claim_records: list[ClaimRecord],
     window_records = [e for e in admissible_records if e.get("in_window")]
 
     rejected = [e for e in evidence_records if e.get("admissible") is False]
+    # A source can be lost without costing the reconstruction anything, as long as
+    # its item kept another one. That difference is what this reports.
+    fatal = [e for e in rejected if e.get("evidence_admissible") is False]
 
     return {
         "n_claims": n_claims,
         "n_claims_processed": len(processed),
-        "n_evidence_candidates": len(evidence_records),
-        "n_evidence_admissible": len(admissible_records),
-        "n_evidence_in_window": len(window_records),
-        "n_evidence_deferred": sum(1 for e in evidence_records if e.get("deferred")),
+        "n_sources": len(evidence_records),
+        "n_evidence_candidates": sum(c.n_candidates for c in claim_records),
+        "n_sources_admissible": len(admissible_records),
+        "n_sources_in_window": len(window_records),
+        "n_sources_deferred": sum(1 for e in evidence_records if e.get("deferred")),
 
         # Proportion of claims containing post-claim / pre-fact-check evidence
         "share_claims_with_window_evidence": _share(
             sum(1 for c in claim_records if c.has_window_evidence), n_claims),
-        # Fraction of admissible evidence items falling into the interval
+        # Fraction of admissible sources falling into the interval
         "share_evidence_in_window": _share(len(window_records), len(admissible_records)),
         "mean_window_items_per_claim": _mean([c.n_in_window for c in claim_records]),
 
@@ -204,14 +252,24 @@ def aggregate(claim_records: list[ClaimRecord],
         },
 
         # Rejection accounting
-        "share_evidence_rejected": _share(len(rejected), len(evidence_records)),
+        "share_sources_rejected": _share(len(rejected), len(evidence_records)),
+        "share_sources_rejected_fatally": _share(len(fatal), len(evidence_records)),
         "rejection_reasons": _counts(rejected, "inadmissibility_reason"),
         "instance_statuses": dict(Counter(c.status for c in claim_records)),
         "instance_rejection_reasons": dict(Counter(c.reason for c in claim_records if c.reason)),
         "share_instances_rejected_insufficient": _share(
             sum(1 for c in claim_records if c.reason == "insufficient_evidence"), n_claims),
-        "share_instances_rejected_no_admissible": _share(
-            sum(1 for c in claim_records if c.reason == "no_admissible_evidence"), n_claims),
+        "share_instances_rejected_essential_lost": _share(
+            sum(1 for c in claim_records if c.reason == "essential_evidence_lost"), n_claims),
+
+        # Rationale and redundancy accounting
+        "share_claims_with_rationale": _share(
+            sum(1 for c in claim_records if c.has_rationale), n_claims),
+        "share_claims_without_admissible_evidence": _share(
+            sum(1 for c in claim_records if c.evidence_free), n_claims),
+        "n_essential": sum(c.n_essential for c in claim_records),
+        "n_essential_lost": sum(c.n_essential_lost for c in claim_records),
+        "sources_per_evidence": describe(_sources_per_evidence(evidence_records)),
 
         # The central question
         "recoverability": recoverability(claim_records),
@@ -219,7 +277,7 @@ def aggregate(claim_records: list[ClaimRecord],
 
 
 def recoverability(claim_records: list[ClaimRecord]) -> dict:
-    """The 2x2 contingency of `E_claim` vs `E_factcheck` recoverability, plus
+    """The 2x2 contingency of `E_c` vs `E_f` recoverability, plus
     McNemar's exact test on the discordant pairs.
 
     A significant result with `only_fact_check > only_claim` is the evidence that
@@ -240,14 +298,14 @@ def recoverability(claim_records: list[ClaimRecord]) -> dict:
         "n_paired_claims": len(paired),
         "contingency": {
             "both": both,
-            "only_E_claim": only_claim,
-            "only_E_factcheck": only_fact_check,
+            "only_E_c": only_claim,
+            "only_E_f": only_fact_check,
             "neither": neither,
         },
-        "recoverable_from_E_claim": n_claim,
-        "recoverable_from_E_factcheck": n_fact_check,
-        "rate_E_claim": _share(n_claim, len(paired)),
-        "rate_E_factcheck": _share(n_fact_check, len(paired)),
+        "recoverable_from_E_c": n_claim,
+        "recoverable_from_E_f": n_fact_check,
+        "rate_E_c": _share(n_claim, len(paired)),
+        "rate_E_f": _share(n_fact_check, len(paired)),
         "gain_from_fact_check_period": _share(n_fact_check - n_claim, len(paired)),
         "mcnemar_exact_p": mcnemar_exact(only_fact_check, only_claim),
     }
@@ -291,6 +349,16 @@ def describe(values: list[float]) -> dict:
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+def _sources_per_evidence(records: list[dict]) -> list[float]:
+    """How many sources each evidence item has. The mean says how redundantly the
+    fact-checks cite, and therefore how much link rot the reconstruction absorbs."""
+    sizes: dict = {}
+    for index, record in enumerate(records):
+        key = record.get("evidence_id") or f"#{index}"
+        sizes[key] = sizes.get(key, 0) + 1
+    return [float(size) for size in sizes.values()]
+
 
 def _values(records: list[dict], key: str) -> list[float]:
     return [r[key] for r in records if r.get(key) is not None]

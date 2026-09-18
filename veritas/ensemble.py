@@ -236,8 +236,8 @@ class Ensemble:
 
 ensemble = Ensemble()  # global singleton instance
 ensemble.register(gpt_strong)
-ensemble.register("anthropic:claude-sonnet-4-5-20250929")
-ensemble.register("selfhosted:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
+ensemble.register("anthropic:claude-opus-5")
+# ensemble.register("selfhosted:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")  # TODO: Replace with Qwen
 ensemble.register(gemini_strong)
 
 if __name__ == "__main__":

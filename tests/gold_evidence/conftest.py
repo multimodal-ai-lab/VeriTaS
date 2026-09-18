@@ -13,14 +13,17 @@ from veritas.common import Verdict
 from veritas.common.annotation import Rating
 from veritas.common.annotation.rating import RatingAggregated
 from veritas.common.verdict import MediumVerdict
+from veritas.gold_evidence.admissibility import apply_admissibility_to_item
 from veritas.gold_evidence.models import (
     Evidence,
     EvidenceRole,
     EvidenceSource,
     Faithfulness,
+    LaterEventCheck,
     ProximityLevel,
     SourceKind,
     TemporalValidation,
+    VerdictRationale,
 )
 
 
@@ -59,39 +62,71 @@ def make_gold_verdict(*, veracity: float | None = None,
     )
 
 
-def make_evidence(
+def make_source(
         *,
-        claim_id: int = 1,
-        proposition: str = "The mayor signed the decree on 3 May.",
         locator: str | None = "https://example.org/record/1",
+        name: str = "Example",
         kind: SourceKind = SourceKind.NEWS_ARTICLE,
         proximity: ProximityLevel = ProximityLevel.SECONDARY,
-        role: EvidenceRole = EvidenceRole.ESSENTIAL,
-        confidence: float = 0.9,
         accessible: bool | None = True,
         faithfulness: float | None = 1.0,
         available_since=datetime(2024, 4, 15),
         before_claim: bool = True,
         before_fact_check: bool = True,
-        later_event: bool = False,
         filtered: bool = True,
-) -> Evidence:
-    """A fully specified evidence item, by default admissible and pre-claim."""
-    evidence = Evidence(
-        claim_id=claim_id,
-        proposition=proposition,
-        source=EvidenceSource(name="Example", kind=kind, locator=locator, proximity=proximity),
-        role=role,
-        extraction_confidence=confidence,
-        available_since=available_since,
-    )
+) -> EvidenceSource:
+    """A source, by default retrievable, faithful and available before the claim."""
+    source = EvidenceSource(name=name, kind=kind, locator=locator, proximity=proximity,
+                            available_since=available_since)
     if filtered:
-        evidence.accessible = accessible
+        source.accessible = accessible
         if faithfulness is not None:
-            evidence.faithfulness = Faithfulness(assessment=faithfulness, reasoning="r")
-        evidence.temporal_validation = TemporalValidation(
+            source.faithfulness = Faithfulness(assessment=faithfulness, reasoning="r")
+        source.temporal_validation = TemporalValidation(
             before_fact_check=before_fact_check,
             before_claim=before_claim,
-            later_event=later_event,
         )
+    return source
+
+
+def make_evidence(
+        *,
+        claim_id: int = 1,
+        review_id: int | None = 7,
+        proposition: str = "The mayor signed the decree on 3 May.",
+        role: EvidenceRole = EvidenceRole.ESSENTIAL,
+        confidence: float = 0.9,
+        sources: list[EvidenceSource] | None = None,
+        later_event: bool | None = None,
+        decided: bool = True,
+        **source_kwargs,
+) -> Evidence:
+    """An evidence item, by default admissible and pre-claim.
+
+    Without `sources` it gets a single source built from the remaining keyword
+    arguments, which keeps the common one-source case short. `decided=False`
+    leaves the sources unfiltered, i.e. as Stage 1 produced them."""
+    if sources is None:
+        sources = [make_source(filtered=decided, **source_kwargs)]
+    evidence = Evidence(
+        claim_id=claim_id,
+        review_id=review_id,
+        proposition=proposition,
+        sources=sources,
+        role=role,
+        extraction_confidence=confidence,
+        later_event=(None if later_event is None
+                     else LaterEventCheck(change_detected=later_event)),
+    )
+    if decided:
+        # The configured policy, so that an undated fixture behaves as in production.
+        apply_admissibility_to_item(evidence)
     return evidence
+
+
+def make_rationale(rationale: str = "3 May is before 5 May, so the order of the two "
+                                    "events in the claim is reversed.",
+                   *, claim_id: int = 1, review_id: int | None = 7) -> VerdictRationale:
+    """A verdict rationale: reasoning only, no external facts and no verdict."""
+    return VerdictRationale(claim_id=claim_id, review_id=review_id, article_id=3,
+                            rationale=rationale)

@@ -11,48 +11,87 @@ Below is a fact-checking article published by {{ publisher_name }}{% if fact_che
 {% endif %}
 
 # Instructions
-Your goal is to **reconstruct the evidence the fact-checker used** to establish the verdict. Work through the steps in order.
+Your goal is to **reconstruct how the fact-checker arrived at the verdict**: the evidence they gathered, and the reasoning that turns that evidence into the verdict. Work through the steps in order.
 
 ## 1. Evidence Identification
-Read the article and identify every *distinct* piece of evidence it relies on. A piece of evidence is one **atomic factual information contributed by an external source**, for example:
+Read the article and identify every *distinct* piece of evidence it relies on. A piece of evidence is one **atomic factual information contributed by one or more external sources**, for example:
 - what an original social media post actually said or showed,
-- what an official register, database, statute or press release states,
+- what an official register, database, statute, or press release states,
 - what a named expert or eyewitness stated,
 - what a scientific study found,
 - what a tool (reverse image search, geolocation tool, metadata analyzer, deepfake detector, ...) reported.
 
-## 2. Source Attribution
-For each piece of evidence, name the **original source** and give a stable locator (usually a URL) for it.
+Write each proposition as the **bare fact itself** — what the world is like according to the source — not as a statement about the sources or about how many of them there are. The proposition carries the fact; the `sources` list carries who reports it and how many do:
 
-## 3. Output
-Output a single fenced JSON code block containing a list of objects. Use exactly this schema:
+- *Wrong:* "Multiple social media posts show the rally." — *Right:* "A rally took place in Tiruvannamalai on May 1, 2024."
+- *Wrong:* "Several outlets reported that the ministry denied the transfer." — *Right:* "The ministry denied the transfer."
+
+## 2. Source Attribution
+For each piece of evidence, list **every source the article gives for it**, each with a stable locator (usually a URL). If two outlets report the same fact, they are **two sources of one evidence item** — not two evidence items. Give each source its own entry in the `sources` list.
+
+The sources of one item are **interchangeable witnesses to the same fact**: each of them must support the proposition on its own. They are not pieces of a collection that only add up together.
+
+## 3. Verdict Rationale
+State the reasoning that **bridges the gap between the evidence and the verdict**: the steps that turn the propositions above into a judgement about the Claim. This is where arithmetic, logical contradictions, comparisons of dates or numbers, and what an image or video plainly shows belong.
+
+Some claims are settled *without* any external source — by a calculation, by an internal contradiction, or by looking at the claim's own media. Write the rationale for those cases too; the evidence list may then be empty.
+
+## 4. Output
+Output a single fenced JSON code block. Use exactly this schema:
 
 ```json
-[
-  {
-    "proposition": "The atomic factual information, stated as a self-contained sentence.",
-    "source_name": "Name of the publishing organization or person",
-    "source_kind": "one of: {{ source_kinds | join(', ') }}",
-    "source_locator": "https://... (must occur verbatim in the article)",
-    "source_proximity": "one of: primary, secondary, tertiary",
-    "role": "one of: essential, auxiliary, background",
-    "reasoning": "Why you believe the fact-checker used this evidence and how it bears on the verdict.",
-    "confidence": 0.0
-  }
-]
+{
+  "verdict_rationale": "The reasoning that leads from the evidence to the verdict, without stating the verdict itself.",
+  "evidence": [
+    {
+      "proposition": "The atomic factual information, stated as a self-contained sentence about the world, not about its sources.",
+      "sources": [
+        {
+          "name": "Name of the publishing organization or person",
+          "kind": "one of: {{ source_kinds | join(', ') }}",
+          "locator": "https://... (must occur verbatim in the article)",
+          "proximity": "one of: primary, secondary, tertiary"
+        }
+      ],
+      "role": "one of: essential, auxiliary, background",
+      "reasoning": "Why you believe the fact-checker used this evidence and how it bears on the verdict.",
+      "confidence": 0.0
+    }
+  ]
+}
 ```
 
 # Rules
-* **Do NOT extract** the fact-checker's own interpretation or reasoning, conclusions that are not backed by an external source, or the final verdict itself.
-* Every evidence item **must have an independently locatable source**, with the two exceptions below (tools and offline evidence). If you cannot name a locator that appears in the article, drop the item.
+## Evidence
+* **Do NOT extract** the fact-checker's own interpretation or reasoning, conclusions that are not backed by an external source, or the final verdict itself. Reasoning belongs in `verdict_rationale`.
+* One evidence item = **one proposition**. If the article gives several sources for it, list them all under `sources`; if it gives one source for several distinct propositions, write several evidence items.
+* **Write the fact, not the citation.** A proposition states *what is the case*; the `sources` list states *who reports it and how many do*. Anonymous, quantified provenance — "multiple posts", "several outlets", "users on social media", "sources say" — usually should not appear in a proposition. Drop it and write the bare fact those sources show.
+* **Named attribution is different.** Where the statement of a *named* actor is itself the fact at issue ("The Election Commission stated on May 3 that no re-poll was ordered", "The study found no correlation"), keep the attribution: every source reporting it states exactly that. What has to go is the unnamed quantifier in front of it.
+* **Each source must carry the proposition alone.** Keep this in mind when formulating the proposition.
+* Every evidence item **must have at least one source**, but a source may lack a locator: articles might cite material they never link. Keep such a source, leave `locator` empty, and **say so in your `reasoning`**. A locator must make the source **independently locatable**, so copy it verbatim from the article; do not invent one, and do not substitute a different page for the one that is missing.
 * The source must be the **original source**, not the fact-check article quoting it. Never use {{ publisher_name }}'s own URL as a locator, and never use the article's own URL.
-* If the evidence originates from a **tool** used by the fact-checker, use the tool's webpage, documentation or source repository as the locator and set `source_kind` to `tool`. If the tool has no such page, leave `source_locator` empty.
-* If the evidence doesn't originate from the web (e.g., a phone call, interview, etc.), leave `source_locator` empty and set `source_kind` to `offline`. Name who was spoken to in `source_name`.
-* `source_proximity`: `primary` = first-hand material produced by a party directly involved (the original post, an eyewitness recording, an official register, a tool's own output); `secondary` = reporting, analysis or aggregation of primary material; `tertiary` = compilations of secondary material (encyclopedia, etc.).
-* `role`: `essential` = the verdict does not hold without this evidence; `auxiliary` = it corroborates or refines essential evidence; `background` = context only, no probative weight on its own.
+* If the evidence originates from a **tool** used by the fact-checker, use the tool's webpage, documentation, or source repository as the locator and set `kind` to `tool`. If the tool has no such page, leave `locator` empty.
+* If the article does not even name the source, leave `name` empty as well and describe what it attributes the information to in `reasoning`.
+* If the evidence doesn't originate from the web (e.g., a phone call, interview, etc.), leave `locator` empty and set `kind` to `offline`. Name who was spoken to in `name`.
+* `proximity`: `primary` = first-hand material produced by a party directly involved (the original post, an eyewitness recording, an official register, a tool's own output); `secondary` = reporting, analysis or aggregation of primary material; `tertiary` = compilations of secondary material (encyclopedia, etc.).
 * `confidence` is a number in [0, 1] expressing how certain you are that the fact-checker actually used this evidence for the verdict.
-* If the evidence is (partly) an image or a video that appears in the article, include its reference — the `<image:N>` or `<video:N>` marker, where `N` is the number shown in the article — **inline in the proposition text**. Copy such markers verbatim from the article; never invent one and never make up a number.
-* Write propositions in the language of the article.
-* If the article contains no usable evidence at all, output an empty list `[]`.
+* `reasoning` states why you believe the fact-checker used this evidence — and, whenever a source carries no locator or no name, that the article failed to provide one.
+* If the article relies on no external source at all, output an empty `evidence` list — but still write the `verdict_rationale`.
+
+## Evidence Roles
+* `essential` = **the Verdict Rationale breaks without this proposition**: remove the evidence item and the reasoning no longer reaches a judgement.
+* `auxiliary` = relevant evidence that corroborates, contextualizes, explains, or strengthens the fact-check, but the rationale still carries without it.
+* `background` = context only, no probative weight on its own.
+
+## Verdict Rationale
+* It may build **only on propositions you marked `essential`** and on the Claim itself. Do not lean on an `auxiliary` or `background` item: if the reasoning actually needs it, mark that item `essential` instead.
+* It must **not** state or imply the verdict ("therefore the claim is false", "the video is genuine"). Stop at the reasoning.
+* It must **not** introduce a new externally verifiable factual premise. It may only combine, compare, or transform what the essential evidence items and the Claim already state. If you find yourself asserting a fact that a reader would have to look up, that fact is *evidence* and belongs in the `evidence` list with its source.
+* Observations about the **evidence base itself** — that a fact was reported independently by several outlets, that a video circulated in numerous posts — belong here rather than in a proposition. They rest on the source lists of the essential items, which the reader of this rationale can see.
+* Arithmetic, unit conversions, date comparisons, logical steps, and observations about the claim's own media are exactly what belongs here.
+* Keep it to a few sentences and write it in the language of the article.
+
+## Media
+* If an evidence item or the rationale is (partly) an image or a video that appears in the article, include its reference — the `<image:N>` or `<video:N>` marker, where `N` is the number shown in the article — **inline in the text**. Copy such markers verbatim from the article; never invent one and never make up a number.
 
 # Your Response

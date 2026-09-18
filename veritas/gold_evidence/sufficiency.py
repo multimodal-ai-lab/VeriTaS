@@ -1,9 +1,14 @@
 """Stage 3 - Evidence sufficiency validation (Spec §4).
 
 An ensemble of strong (M)LLMs from different model families receives *only* the
-claim and the retained multimodal evidence and predicts a VeriTaS verdict with
-high reasoning effort. The instance is kept iff that prediction is sufficiently
-close to the gold verdict.
+claim, the retained multimodal evidence and the verdict rationale, and predicts a
+VeriTaS verdict with high reasoning effort. The instance is kept iff that
+prediction is sufficiently close to the gold verdict.
+
+The rationale carries the reasoning step - arithmetic, a logical contradiction,
+what the claim's own media shows - that no evidence item states. Without it, every
+claim settled that way would look unrecoverable for lack of evidence. It states no
+verdict and no external fact of its own (see `VerdictRationale`).
 
 The ensemble is a **sufficiency validator, not a mechanism for revising the gold
 verdict**: nothing in this module writes to `verdicts` or changes a gold rating.
@@ -37,7 +42,7 @@ from veritas.gold_evidence.closeness import (
     is_close,
     property_diffs,
 )
-from veritas.gold_evidence.models import Evidence
+from veritas.gold_evidence.models import Evidence, VerdictRationale
 from veritas.pipeline.stage_6 import extract_label_from_response
 
 logger = logging.getLogger("VeriTaS")
@@ -95,6 +100,8 @@ class SufficiencyResult:
     ensemble_mode: str
     n_evidence: int
     threshold: float
+    #: Whether the ensemble was given a verdict rationale alongside the evidence.
+    with_rationale: bool = False
     predicted: PredictedVerdict | None = None
     member_responses: dict[str, list[dict]] = field(default_factory=dict)
     property_diffs: dict[str, float] = field(default_factory=dict)
@@ -109,6 +116,7 @@ class SufficiencyResult:
             "condition": self.condition,
             "ensemble_mode": self.ensemble_mode,
             "n_evidence": self.n_evidence,
+            "with_rationale": self.with_rationale,
             "predicted_verdict": self.predicted.model_dump(mode="json") if self.predicted else None,
             "member_responses": self.member_responses,
             "property_diffs": self.property_diffs,
@@ -132,8 +140,16 @@ async def validate_sufficiency(
         condition: str,
         mode: str = None,
         threshold: float = None,
+        rationales: Iterable[VerdictRationale] = (),
+        missing_essential: Iterable[Evidence] = (),
 ) -> SufficiencyResult:
-    """Predicts a verdict from the evidence alone and compares it to the gold verdict."""
+    """Predicts a verdict from the evidence and rationale, and compares it to the
+    gold verdict.
+
+    `missing_essential` lists the essential items this condition cannot supply. It
+    short-circuits the whole prediction: the rationale is built on those
+    propositions, so a condition without them cannot support it, and asking the
+    ensemble would only measure how well it guesses without them."""
     if mode is None:
         mode = default_ensemble_mode
     if threshold is None:
@@ -141,25 +157,36 @@ async def validate_sufficiency(
     assert mode in ENSEMBLE_MODES, f"Unknown ensemble mode: {mode}"
 
     evidence = list(evidence)
+    rationales = list(rationales)
+    missing_essential = list(missing_essential)
     result = SufficiencyResult(
         claim_id=claim.id,
         condition=condition,
         ensemble_mode=mode,
         n_evidence=len(evidence),
         threshold=threshold,
+        with_rationale=bool(rationales),
         model_specifiers=get_ensemble().model_names,
     )
 
-    if not evidence:
-        result.error = "No evidence in this condition."
+    if missing_essential:
+        result.error = (f"{len(missing_essential)} essential evidence item(s) are not "
+                        f"available in this condition.")
+        result.is_close = False
+        return result
+
+    if not evidence and not rationales:
+        # Nothing to reason from at all. With a rationale, an empty evidence set is
+        # a legitimate case (a claim settled by arithmetic or by its own media).
+        result.error = "Neither evidence nor a rationale in this condition."
         result.is_close = False
         return result
 
     try:
         if mode == MODE_INTEGRITY:
-            predicted = await _predict_integrity(claim, evidence, result)
+            predicted = await _predict_integrity(claim, evidence, result, rationales)
         else:
-            predicted = await _predict_full(claim, evidence, result)
+            predicted = await _predict_full(claim, evidence, result, rationales)
     except FATAL_ERRORS:
         # A degraded ensemble would silently reject the claim; abort the run instead.
         raise
@@ -182,10 +209,11 @@ async def validate_sufficiency(
 
 
 async def _predict_integrity(claim: Claim, evidence: list[Evidence],
-                             result: SufficiencyResult) -> PredictedVerdict | None:
+                             result: SufficiencyResult,
+                             rationales: list[VerdictRationale] = ()) -> PredictedVerdict | None:
     """One ensemble call predicting the claim's integrity directly."""
     rating, responses = await assess_property_from_evidence(
-        "integrity", claim, evidence)
+        "integrity", claim, evidence, rationales=rationales)
     result.member_responses["integrity"] = [r.to_dict() for r in responses]
     if rating is None:
         return None
@@ -193,7 +221,8 @@ async def _predict_integrity(claim: Claim, evidence: list[Evidence],
 
 
 async def _predict_full(claim: Claim, evidence: list[Evidence],
-                        result: SufficiencyResult) -> PredictedVerdict | None:
+                        result: SufficiencyResult,
+                        rationales: list[VerdictRationale] = ()) -> PredictedVerdict | None:
     """The full stage-6 property cascade, driven by evidence instead of reviews."""
     media = MultimodalSequence(claim.data).unique_items()
     media_verdicts: list[MediumVerdict] = []
@@ -201,12 +230,12 @@ async def _predict_full(claim: Claim, evidence: list[Evidence],
 
     for medium in media:
         authenticity, responses = await assess_property_from_evidence(
-            "authenticity", claim, evidence, medium=medium)
+            "authenticity", claim, evidence, medium=medium, rationales=rationales)
         result.member_responses[f"authenticity[{medium.reference}]"] = [
             r.to_dict() for r in responses]
 
         contextualization, responses = await assess_property_from_evidence(
-            "contextualization", claim, evidence, medium=medium)
+            "contextualization", claim, evidence, medium=medium, rationales=rationales)
         result.member_responses[f"contextualization[{medium.reference}]"] = [
             r.to_dict() for r in responses]
 
@@ -222,11 +251,12 @@ async def _predict_full(claim: Claim, evidence: list[Evidence],
 
     veracity = context_coverage = None
     if not incorrect_contextualization:
-        veracity, responses = await assess_property_from_evidence("veracity", claim, evidence)
+        veracity, responses = await assess_property_from_evidence(
+            "veracity", claim, evidence, rationales=rationales)
         result.member_responses["veracity"] = [r.to_dict() for r in responses]
         if veracity is not None and veracity.score > 0:
             context_coverage, responses = await assess_property_from_evidence(
-                "context_coverage", claim, evidence)
+                "context_coverage", claim, evidence, rationales=rationales)
             result.member_responses["context_coverage"] = [r.to_dict() for r in responses]
 
     predicted = PredictedVerdict(
@@ -247,15 +277,17 @@ async def assess_property_from_evidence(
         claim: Claim,
         evidence: list[Evidence],
         medium: Item | None = None,
+        rationales: Iterable[VerdictRationale] = (),
 ) -> tuple[RatingAggregated | None, list[MemberResponse]]:
-    """Queries the ensemble for one property, given only claim + evidence.
+    """Queries the ensemble for one property, given only claim + evidence + rationale.
 
     Returns the aggregated rating and every member's full response, so the
     individual reasonings can be persisted alongside the result."""
     prop: Property = PROPERTIES[property_name]
     subject = "Claim" if medium is None else medium.kind.capitalize()
 
-    prompt = build_prompt(claim, evidence, prop, subject=subject, medium=medium)
+    prompt = build_prompt(claim, evidence, prop, subject=subject, medium=medium,
+                          rationales=list(rationales))
 
     def extract(response: ModelResponse) -> MemberResponse:
         rating = extract_label_from_response(response, prop)
@@ -280,12 +312,14 @@ async def assess_property_from_evidence(
 
 
 def build_prompt(claim: Claim, evidence: list[Evidence], prop: Property, *,
-                 subject: str, medium: Item | None = None) -> Prompt:
+                 subject: str, medium: Item | None = None,
+                 rationales: list[VerdictRationale] = ()) -> Prompt:
     """Composes the evidence-only prompt. The claim is included for every property
     except authenticity, mirroring `stage_6.assess_property`."""
     return Prompt(
         PROMPT_PATH,
         evidence=evidence,
+        rationales=list(rationales),
         claim=None if prop.name == "Authenticity" else claim.data,
         claim_date=claim.date_str or None,
         medium=medium,

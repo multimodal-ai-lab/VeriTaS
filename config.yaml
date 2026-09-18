@@ -73,16 +73,16 @@ gold_evidence:
   min_ensemble_ratings: 3
 
   # Reasoning effort, scaled with task complexity. Null omits the parameter.
-  reasoning_effort_extraction: "medium"
-  reasoning_effort_dating:
+  reasoning_effort_extraction: "high"
+  reasoning_effort_dating: "low"
   reasoning_effort_faithfulness: "low"
   reasoning_effort_temporal: "medium"
   reasoning_effort_sufficiency: "high"
 
   # Thresholds
-  proximity_threshold: 0.3      # Max. allowed distance to the gold verdict
+  proximity_threshold: 0.334      # Max. allowed distance to the gold verdict
   faithfulness_threshold: 0.334 # 1/3 = "entailed (rather uncertain)"
-  min_extraction_confidence: 0.0
+  min_extraction_confidence: 0.5
 
   # How to treat evidence whose source has no determinable publication time.
   # 'tool_only' (default) keeps the kinds that are not publications (tool, offline),

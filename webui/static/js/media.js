@@ -8,6 +8,7 @@
  */
 
 import { api } from './api.js';
+import { renderMarkdown } from './markdown.js';
 import { bytes, el, truncate } from './util.js';
 
 const KIND_ICON = { image: 'fa-image', video: 'fa-film', audio: 'fa-volume-high' };
@@ -23,20 +24,32 @@ const KIND_ICON = { image: 'fa-image', video: 'fa-film', audio: 'fa-volume-high'
  * @returns {HTMLElement} a container holding the text and, if any, the gallery.
  */
 export function renderMultimodal(payload, options = {}) {
-    const { textClass = 'rich-text', wide = false, emptyText = '—' } = options;
-    const container = el('div', { class: 'multimodal' });
+    const {
+        textClass = 'rich-text', wide = false, emptyText = '—', markdown = false,
+        containerClass = '',
+    } = options;
+    const container = el('div', { class: `multimodal ${containerClass}`.trim() });
 
     const segments = payload?.segments ?? [];
     const textNode = el('div', { class: textClass });
 
     if (!segments.length) {
         textNode.append(el('span', { class: 'seg-text muted', text: payload?.text || emptyText }));
-    }
-    for (const part of segments) {
-        if (part.type === 'text') {
-            textNode.append(el('span', { class: 'seg-text', text: part.text }));
-        } else {
-            textNode.append(referenceChip(part, payload));
+    } else if (markdown) {
+        // Scraped sources are stored as Markdown. Render the whole text in one
+        // pass so block structure survives, and let the renderer hand media
+        // references back so they stay interactive chips.
+        textNode.append(renderMarkdown(payload.text, {
+            renderRef: (kind, id, reference) =>
+                referenceChip({ type: 'media', kind, id, reference }, payload),
+        }));
+    } else {
+        for (const part of segments) {
+            if (part.type === 'text') {
+                textNode.append(el('span', { class: 'seg-text', text: part.text }));
+            } else {
+                textNode.append(referenceChip(part, payload));
+            }
         }
     }
     container.append(textNode);
@@ -49,6 +62,54 @@ export function renderMultimodal(payload, options = {}) {
         link(container);
     }
     return container;
+}
+
+/**
+ * A compact, non-interactive thumbnail strip for list previews.
+ *
+ * List cards are links, so the media must not carry their own click or hover
+ * behaviour; this renders the same items as static thumbnails with a "+n"
+ * badge for whatever the preview payload left out.
+ */
+export function renderMediaStrip(payload, { limit = 4 } = {}) {
+    const media = (payload?.media ?? []).slice(0, limit);
+    if (!media.length) return null;
+
+    const hidden = payload?.n_hidden_media
+        ?? Math.max((payload?.n_media ?? media.length) - media.length, 0);
+
+    const strip = el('div', { class: 'media-strip' });
+    media.forEach((item, index) => {
+        const thumb = el('span', {
+            class: `media-thumb${item.exists ? '' : ' missing'}`,
+            style: { '--i': index },
+            title: item.exists ? item.reference : `${item.reference} — file not in registry`,
+        });
+        if (!item.exists) {
+            thumb.append(el('i', { class: 'fa-solid fa-image-slash' }));
+        } else if (item.kind === 'video') {
+            // A poster frame would need decoding the video; the icon says enough
+            // at this size, and the detail view plays it.
+            thumb.append(el('i', { class: 'fa-solid fa-film' }));
+        } else if (item.kind === 'audio') {
+            thumb.append(el('i', { class: 'fa-solid fa-volume-high' }));
+        } else {
+            thumb.append(el('img', {
+                src: api.mediaUrl(item.kind, item.id),
+                alt: item.reference, loading: 'lazy', decoding: 'async',
+            }));
+        }
+        strip.append(thumb);
+    });
+
+    if (hidden > 0) {
+        strip.append(el('span', {
+            class: 'media-thumb more',
+            text: `+${hidden}`,
+            title: `${hidden} more medium/media in this claim`,
+        }));
+    }
+    return strip;
 }
 
 /** The inline `<image:42>` chip that stays in the text. */
