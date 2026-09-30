@@ -17,8 +17,8 @@ their rationale.
 
 | Stage | Module | What it does |
 | --- | --- | --- |
-| 1 | `extraction.py` | An MLLM reads the stored fact-check article and returns candidate `Evidence` items (an atomic proposition plus an independently locatable source) **and** the `VerdictRationale` that turns those propositions into a verdict. |
-| 2 | `filtering.py`, `retrieval.py` | Per **source**: re-retrieve it through scrapeMM and date it (§3.1), check it still supports the proposition (§3.2), compute the two cutoffs and the verdict-leak check (§3.3). Per **item**, once its sources are dated: does the proposition rest on a change of the world that happened only after `t_c`? Tools and offline evidence skip retrieval and faithfulness; a rate-limited source defers itself. |
+| 1 | `extraction.py` | An MLLM reads the stored fact-check article and returns candidate `Evidence` items (an atomic proposition plus a `Citation` of every source that reports it) **and** the `VerdictRationale` that turns those propositions into a verdict. |
+| 2 | `filtering.py`, `retrieval.py` | Per **source**, i.e. once per URL: re-retrieve it through scrapeMM and date it (§3.1), and check the publisher registry for a verdict leak (§3.3). Per **citation**: check the source still supports the proposition (§3.2) and compute the two cutoffs of the citing claim (§3.3). Per **item**, once its citations are dated: does the proposition rest on a change of the world that happened only after `t_c`? Tools and offline evidence skip retrieval and faithfulness; a rate-limited or Archive.today-gated source defers every item citing it. |
 | 3 | `sufficiency.py`, `closeness.py` | A cross-family ensemble predicts a verdict from claim + retained evidence + rationale, and `is_close` compares it to the gold verdict. |
 | — | `analysis.py` | Aggregation for the temporal analysis, including the paired recoverability test. |
 
@@ -30,49 +30,82 @@ the cached model resolution, and `pipeline.py` wires the stages together per cla
 Not every verdict rests on external sources. Some claims are settled by arithmetic,
 by a contradiction inside the claim itself, or by what the claim's own image plainly
 shows. The **verdict rationale** captures that step: it is a multimodal text,
-extracted in the same call as the evidence, that bridges the gap between the
-propositions and the verdict.
+extracted in the same call as the evidence, that bridges the gap between the claim
+and its evidence on the one side and the verdict on the other — arithmetic, logical
+argumentation, comparisons, visual analysis.
 
-It may build **only on the items marked `essential`** and on the claim itself, and
-it may only combine, compare or transform what they already state — it must not
-introduce a new externally verifiable factual premise (that would be evidence, and
-belongs in `evidence` where it can be dated and re-checked), and it never states the
-verdict. Binding it to essential evidence is what keeps it honest: the rationale
-becomes invalid exactly when an essential item is lost, which is exactly when the
-instance is discarded. It is handed to the sufficiency ensemble alongside
-the evidence, which is what makes an **empty evidence set** analyzable instead of
+It carries **reasoning and commonsense knowledge only**. It must not restate the
+evidence, must not refer to specific evidence items, and must not introduce any
+externally available information (that would be evidence, and belongs in
+`evidence` where it can be dated and re-checked); it never states the verdict.
+Keeping the evidence out of it is what keeps it honest: nothing the rationale says
+can leak a proposition into a condition that lacks it, so it stays valid whichever
+items a condition supplies. If the verdict follows trivially from the evidence, the
+rationale says just that. It is handed to the sufficiency ensemble alongside the
+evidence, which is what makes an **empty evidence set** analyzable instead of
 looking like a failed reconstruction.
 
 ## Evidence, sources, and what disqualifies an instance
 
-An **evidence item** is one proposition; an **evidence source** is a place that
-proposition can be read. Fact-checks cite redundantly — two outlets for one fact, a
-register plus a screenshot of it — so an item carries *all* the sources the article
-gives for it.
+An **evidence item** is one proposition; a **source** is a publication, identified
+by its URL; a **citation** records that an item cites a source for its proposition.
+Fact-checks cite redundantly — two outlets for one fact, a register plus a screenshot
+of it — so an item carries a citation of *every* source the article gives for it.
 
-The split follows the questions: everything Stage 2 asks is about a source (can it
-still be retrieved, when did it become available, does it still say this?), while
-the proposition and its role belong to the item. A source the article cites without
-linking is kept too, with an empty locator, and is settled as `inaccessible`
-straight away - unless it is a tool or offline evidence, which need no locator. An item therefore **survives as
-long as one of its sources does**, and losing a source costs the reconstruction
-nothing as long as another still reports the proposition.
+The three levels follow the questions Stage 2 asks:
 
-`t_e` of an item is the **earliest** `available_since` among its sources — the moment
+- **Source** — can it still be retrieved, what does it say, when did it become
+  available, is it a professional fact-check? These depend on the URL alone, so a
+  source is **global**: stored once, however many items of however many claims cite
+  it, and retrieved and dated exactly once.
+- **Citation** — the source's name and kind *as cited*, its proximity to the
+  proposition, whether it still supports *this* proposition (faithfulness), and
+  where it sits relative to the citing claim's cutoffs.
+- **Item** — the proposition, its role, and whether it rests on a later event.
+
+A source the article cites without linking becomes a citation without a source and
+is settled as `inaccessible` straight away - unless it is a tool or offline
+evidence, which need no locator. An item therefore **survives as long as one of its
+citations does**, and losing a source costs the reconstruction nothing as long as
+another still reports the proposition.
+
+Sources are **write-once**: a retrieved source is reused, never refetched
+implicitly, because other claims' decisions rest on what was stored. `re_retrieve`
+fetches the sources of the processed claims anew; every citation judged against the
+previous content then counts as *stale* and is judged again the next time its claim
+is processed.
+
+`t_e` of an item is the **earliest** `available_since` among its citations — the moment
 from which the proposition could be read somewhere. It is what the later-event check
 is gated on: evidence that already existed at `t_c` cannot rest on anything that
 happened afterwards, so that check runs only for items that appeared later, once per
-item rather than once per source.
+item rather than once per citation.
 
-`role` is judged against the rationale: an item is **essential** when the rationale
-breaks without the proposition it asserts. An instance is disqualified **not** when
-its evidence set ends up empty, but when an essential item loses *every* source
-(`essential_evidence_lost`).
+`role` is assigned once the article's evidence list is complete, by asking what
+removing the item from that list would do to the gold verdict:
 
-The same rule decides the two conditions without asking the ensemble: if an
-essential item has no source inside `E_c`, that condition cannot support the
-rationale, so it is recorded as insufficient directly. That is a finding about the
-claim, not a defect of the reconstruction.
+- **key** — establishes a central factual premise underlying the verdict; removing
+  it likely breaks the verdict.
+- **auxiliary** — corroborates, qualifies, or strengthens the main justification
+  without being its principal evidential basis; removing it would not break the
+  verdict.
+- **background** — context for understanding the claim or its circumstances,
+  without directly contributing to the justification.
+
+Only one or two items — or none — are typically `key`. An instance is disqualified
+**not** when its evidence set ends up empty, but when a key item loses *every*
+citation (`key_evidence_lost`). Losing an auxiliary item never disqualifies it;
+whether the remaining evidence still carries the verdict is for the sufficiency
+ensemble to judge.
+
+The same rule decides the two conditions without asking the ensemble: if a key item
+has no citation inside `E_c`, that condition cannot carry the verdict, so it is
+recorded as insufficient directly. That is a finding about the claim, not a defect
+of the reconstruction.
+
+Rows written before the rename carry the role `essential` and the rejection reason
+`essential_evidence_lost`. They are left untouched in the database and read as `key`
+and `key_evidence_lost` (`models.LEGACY_ROLE_ALIASES`, `LEGACY_REASON_ALIASES`).
 
 ## Reference times
 
@@ -92,7 +125,10 @@ ones whose outcome can differ between the two conditions.
 ## Source retrieval
 
 All retrieval runs through scrapeMM — nothing fetches a URL on its own, and each
-source is retrieved exactly once:
+source is retrieved exactly once, however many citations point at it. Before a
+source is retrieved, its stored state is re-read under a per-URL lock, so a URL that
+another claim - even one running concurrently - already retrieved is adopted
+instead of fetched again:
 
 1. `retrieve(url, output_format="multimodal")`
 2. publication time from the meta tags of the raw HTML that the *same* response
@@ -107,10 +143,17 @@ HTML-capable backends: sources served by an API integration (social media,
 archiving services, video platforms) are retrieved like any other and, having no
 HTML page, are dated in step 3.
 
-A source that only *rate-limited* us is not inaccessible: the item is deferred for
-`defer_hours` and its claim ends on status `deferred`, which a later run picks up
-again. An exhausted scrapeMM quota, like an exhausted model quota, aborts the run
+A source that only *rate-limited* us is not inaccessible: it is deferred for
+`defer_hours`, and so is every item citing it; their claims end on status
+`deferred`, which a later run picks up again. An exhausted scrapeMM quota, like an exhausted model quota, aborts the run
 instead of being recorded against the claim that hit it.
+
+A source gated behind Archive.today's access check is deferred the same way -
+scrapeMM buffers the URL and answers it from a persistent cache once a human
+passes the CAPTCHA, which can take much longer than `defer_hours`. Once that has
+happened, `python -m scripts.retry_deferred_archive_today` clears the deferral
+of every affected source (and every affected Stage 4 appearance) and retries it
+right away, instead of waiting for the next scheduled run to notice.
 
 ## Running it
 
@@ -123,6 +166,9 @@ python -m scripts.gold_evidence.run_temporal_analysis
 
 # Figures from an exported result directory (no DB access)
 python -m scripts.gold_evidence.plot_temporal_analysis exports/gold_evidence/<timestamp>
+
+# After solving Archive.today's access check, retry everything deferred behind it
+python -m scripts.retry_deferred_archive_today
 ```
 
 The reconstruction has no command-line interface: it reads
@@ -131,8 +177,10 @@ The reconstruction has no command-line interface: it reads
 stored in the DB is reused and claims are picked up again while their status is
 incomplete (`pending`, `extracted`, `filtered`, `deferred`) — and `re_extract` /
 `re_filter` force the corresponding stage to run again. `re_extract` drops the
-claim's stored evidence first, so nothing survives that the new run no longer
-produces.
+claim's stored evidence and citations first, so nothing survives that the new run
+no longer produces; the global sources stay. `re_filter` judges every citation
+again against the stored sources, without refetching them; `re_retrieve` refetches
+them as well.
 
 ## Reasoning traces
 
@@ -173,9 +221,18 @@ Additive only:
 - `evidence` — one row per reconstructed evidence item (proposition, role, and the
   outcome derived from its sources), with a `full_evidence` JSONB blob as the
   authoritative representation of the item itself.
-- `evidence_sources` — one row per source, with everything Stage 2 decided about it
-  and a `full_source` blob. The web UI joins the two: `evidence` for the
-  proposition and its outcome, `evidence_sources` for everything it filters on.
+- `sources` — one row per URL, global: the retrieved content, `available_since`
+  and how it was dated, accessibility, the registry's fact-check finding and any
+  deferral, with a `full_source` blob. Unique on a SHA-1 of the normalized URL.
+- `citations` — one row per (evidence item, source): name, kind and proximity as
+  cited, faithfulness, the cutoffs of the citing claim and the admissibility, with a
+  `full_citation` blob. A citation of a source the article never located has no
+  `source_id`.
+- `citation_rows` — a read-only view joining the two into one flat row per
+  citation, which the web UI reads.
+- `evidence_sources` — the per-item predecessor of `sources` and `citations`. Kept
+  as it is, but no longer read or written. A claim whose evidence was stored in that
+  format has items without citations, and is re-extracted when next processed.
 - `verdict_rationales` — one row per fact-checking article that yielded a rationale.
   Kept apart from `evidence` because it asserts no externally verifiable fact, so
   none of the Stage-2 criteria apply to it.

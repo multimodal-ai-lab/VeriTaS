@@ -7,7 +7,7 @@ must let them through.
 
 import pytest
 
-from tests.gold_evidence.conftest import make_evidence, make_source
+from tests.gold_evidence.conftest import make_evidence
 from veritas.gold_evidence import extraction as extraction_module
 from veritas.gold_evidence import filtering as filtering_module
 from veritas.gold_evidence import retrieval as retrieval_module
@@ -62,32 +62,43 @@ async def test_the_later_event_check_propagates_fatal_errors(monkeypatch, error_
     # Only evidence that appeared after the claim reaches the model at all.
     evidence = make_evidence(available_since=datetime(2024, 5, 10), before_claim=False)
     with pytest.raises(error_cls):
-        await filtering_module.check_later_event(
-            evidence, claim=claim, t_c=datetime(2024, 5, 1))
+        await filtering_module.check_later_event(evidence, claim=claim)
 
 
 # --- Stage 2: the item-level wrapper -----------------------------------------
 
 @pytest.mark.parametrize("error_cls", FATAL)
 @pytest.mark.asyncio
-async def test_filter_source_propagates_fatal_errors(monkeypatch, error_cls):
-    from datetime import datetime
-
+async def test_settle_source_propagates_fatal_errors(monkeypatch, error_cls):
     async def exploding_retrieve(*a, **k):
         raise error_cls("out of budget")
 
+    async def not_a_fact_checker(locator):
+        return False
+
+    class FakeDB:
+        updates = []
+
+        async def get_source_by_locator(self, locator):
+            return None
+
+        async def update_source(self, source):
+            self.updates.append(source)
+
+    fake_db = FakeDB()
     monkeypatch.setattr(filtering_module, "retrieve_source", exploding_retrieve)
+    monkeypatch.setattr(filtering_module, "_is_fact_checking_org", not_a_fact_checker)
+    monkeypatch.setattr(filtering_module, "db", fake_db)
     evidence = make_evidence(decided=False)
-    source = evidence.sources[0]
+    source = evidence.citations[0].source
 
     with pytest.raises(error_cls):
-        await filtering_module.filter_source(
-            source, evidence=evidence, claim=None,
-            t_c=datetime(2024, 5, 1), t_f=datetime(2024, 5, 21))
+        await filtering_module.settle_source(source)
 
     # Nothing was recorded about the source, so a later run still evaluates it.
-    assert source.admissible is None
-    assert source.filtered is False
+    assert source.accessible is None
+    assert fake_db.updates == []
+    assert evidence.citations[0].filtered is False
 
 
 # --- Stage 1 ------------------------------------------------------------------

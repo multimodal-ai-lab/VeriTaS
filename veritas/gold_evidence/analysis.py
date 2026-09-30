@@ -20,7 +20,7 @@ from datetime import datetime
 
 from veritas.gold_evidence import CONDITION_CLAIM, CONDITION_FACT_CHECK
 from veritas.gold_evidence.admissibility import in_window
-from veritas.gold_evidence.models import Evidence, to_naive
+from veritas.gold_evidence.models import Evidence, normalize_reason, to_naive
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +47,10 @@ class ClaimRecord:
     n_deferred: int
     #: Stage 1 output beyond the evidence itself.
     n_rationales: int
-    #: Evidence items the rationale rests on, and how many lost every source.
-    n_essential: int
-    n_essential_lost: int
+    #: Key evidence items (the verdict likely breaks without them), and how many
+    #: lost every source.
+    n_key: int
+    n_key_lost: int
     n_evidence_claim: int
     n_evidence_fact_check: int
     gold_integrity: float | None
@@ -60,6 +61,9 @@ class ClaimRecord:
     recoverable_fact_check: bool | None = None
     max_diff_claim: float | None = None
     max_diff_fact_check: float | None = None
+    #: Auxiliary items that lost every source. They do not disqualify the
+    #: instance, since another item can stand in for them.
+    n_auxiliary_lost: int = 0
 
     @property
     def fact_check_duration(self) -> float | None:
@@ -98,7 +102,8 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
                        results: dict[str, dict] | None = None,
                        rationales: list | None = None) -> ClaimRecord:
     """Assembles the claim-level row from the stored objects."""
-    from veritas.gold_evidence.admissibility import essential, in_window, lost_essential, select
+    from veritas.gold_evidence.admissibility import (
+        in_window, key_evidence, lost_auxiliary, lost_key, select)
 
     results = results or {}
     t_c, t_f = to_naive(t_c), to_naive(t_f)
@@ -114,20 +119,20 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
         t_c=t_c,
         t_f=t_f,
         status=claim.gold_evidence_status,
-        reason=claim.gold_evidence_reason,
+        reason=normalize_reason(claim.gold_evidence_reason),
         released=bool(claim.released),
         is_rectified=bool(claim.is_rectified),
         language=claim.language,
         n_candidates=len(evidence),
         n_admissible=len(admissible),
-        n_sources=sum(len(e.sources) for e in evidence),
-        n_in_window=sum(1 for e in evidence for s in e.sources
-                        if s.admissible and in_window(s)),
-        n_undated=sum(1 for e in evidence for s in e.sources if s.available_since is None),
-        n_deferred=sum(1 for e in evidence for s in e.sources if s.deferred),
+        n_sources=sum(len(e.citations) for e in evidence),
+        n_in_window=sum(1 for e in evidence for c in e.citations
+                        if c.admissible and in_window(c)),
+        n_undated=sum(1 for e in evidence for c in e.citations if c.available_since is None),
+        n_deferred=sum(1 for e in evidence for c in e.citations if c.deferred),
         n_rationales=len(rationales or []),
-        n_essential=len(essential(evidence)),
-        n_essential_lost=len(lost_essential(evidence)),
+        n_key=len(key_evidence(evidence)),
+        n_key_lost=len(lost_key(evidence)),
         n_evidence_claim=len(claim_set),
         n_evidence_fact_check=len(fact_check_set),
         gold_integrity=_score(_safe(lambda: gold.integrity)) if gold else None,
@@ -138,29 +143,34 @@ def build_claim_record(*, claim, gold, evidence: list[Evidence],
         recoverable_fact_check=fact_check_result.get("is_close"),
         max_diff_claim=claim_result.get("max_property_diff"),
         max_diff_fact_check=fact_check_result.get("max_property_diff"),
+        n_auxiliary_lost=len(lost_auxiliary(evidence)),
     )
 
 
 def build_evidence_records(evidence: Evidence, *, claim_id: int,
                            t_c: datetime | None,
                            t_f: datetime | None) -> list[dict]:
-    """One row per *source* of an evidence item.
+    """One row per *citation* of an evidence item.
 
-    The rows are source-level because everything that varies within an item varies
-    per source: the availability time, the accessibility, the faithfulness, the
-    admissibility. The item's own fields - proposition, role, and whether it
-    survived at all - are repeated on each row so the export can be grouped either
-    way."""
-    return [_source_record(source, evidence, claim_id=claim_id, t_c=t_c, t_f=t_f)
-            for source in evidence.sources]
+    The rows are citation-level because everything that varies within an item
+    varies per citation: the availability time, the accessibility, the
+    faithfulness, the admissibility. The item's own fields - proposition, role, and
+    whether it survived at all - are repeated on each row so the export can be
+    grouped either way, and `source_id` groups the rows of one URL across items and
+    claims."""
+    return [_citation_record(citation, evidence, claim_id=claim_id, t_c=t_c, t_f=t_f)
+            for citation in evidence.citations]
 
 
-def _source_record(source, evidence: Evidence, *, claim_id: int,
-                   t_c: datetime | None, t_f: datetime | None) -> dict:
-    temporal = source.temporal_validation
-    faithfulness = source.faithfulness
+def _citation_record(citation, evidence: Evidence, *, claim_id: int,
+                     t_c: datetime | None, t_f: datetime | None) -> dict:
+    temporal = citation.temporal_validation
+    faithfulness = citation.faithfulness
+    source = citation.source
+    available_since = citation.available_since
     return {
-        "source_id": source.id,
+        "citation_id": citation.id,
+        "source_id": source.id if source else None,
         "evidence_id": evidence.id,
         "claim_id": claim_id,
         "review_id": evidence.review_id,
@@ -168,30 +178,31 @@ def _source_record(source, evidence: Evidence, *, claim_id: int,
         "role": evidence.role.value,
         "extraction_confidence": evidence.extraction_confidence,
         "is_multimodal": evidence.is_multimodal,
-        # Whether the *item* survived; a discarded source of a surviving item costs
-        # the reconstruction nothing.
+        # Whether the *item* survived; a discarded citation of a surviving item
+        # costs the reconstruction nothing.
         "evidence_admissible": evidence.admissible,
-        "n_sources": len(evidence.sources),
+        "n_sources": len(evidence.citations),
 
-        "source_name": source.name,
-        "source_kind": source.kind.value,
-        "source_locator": source.locator,
-        "source_domain": source.domain,
-        "source_proximity": source.proximity.value,
-        "available_since": source.available_since.isoformat() if source.available_since else None,
-        "t_e_minus_t_c_days": source.time_to_claim(t_c),
-        "t_e_minus_t_f_days": source.time_to_fact_check(t_f),
-        "in_window": in_window(source),
-        "accessible": source.accessible,
+        "source_name": citation.name,
+        "source_kind": citation.kind.value,
+        "source_locator": citation.locator,
+        "source_domain": citation.domain,
+        "source_proximity": citation.proximity.value,
+        "available_since": available_since.isoformat() if available_since else None,
+        "dating_method": source.dating_method if source else None,
+        "t_e_minus_t_c_days": citation.time_to_claim(t_c),
+        "t_e_minus_t_f_days": citation.time_to_fact_check(t_f),
+        "in_window": in_window(citation),
+        "accessible": source.accessible if source and not citation.exempt else None,
         "faithfulness": faithfulness.assessment if faithfulness else None,
         "before_claim": temporal.before_claim if temporal else None,
         "before_fact_check": temporal.before_fact_check if temporal else None,
         # §3.3 (3) is judged for the proposition, so it is the same on every row
         # of one item.
         "later_event": evidence.relies_on_later_event,
-        "admissible": source.admissible,
-        "inadmissibility_reason": source.inadmissibility_reason,
-        "deferred": source.deferred,
+        "admissible": citation.admissible,
+        "inadmissibility_reason": citation.inadmissibility_reason,
+        "deferred": citation.deferred,
     }
 
 
@@ -204,6 +215,7 @@ def aggregate(claim_records: list[ClaimRecord],
     """Computes every quantity §5 asks for."""
     n_claims = len(claim_records)
     processed = [c for c in claim_records if c.n_candidates > 0]
+    accepted = [c for c in claim_records if c.status == "accepted"]
 
     deltas_claim = _values(evidence_records, "t_e_minus_t_c_days")
     deltas_fact_check = _values(evidence_records, "t_e_minus_t_f_days")
@@ -214,8 +226,8 @@ def aggregate(claim_records: list[ClaimRecord],
     window_records = [e for e in admissible_records if e.get("in_window")]
 
     rejected = [e for e in evidence_records if e.get("admissible") is False]
-    # A source can be lost without costing the reconstruction anything, as long as
-    # its item kept another one. That difference is what this reports.
+    # A citation can be lost without costing the reconstruction anything, as long
+    # as its item kept another one. That difference is what this reports.
     fatal = [e for e in rejected if e.get("evidence_admissible") is False]
 
     return {
@@ -230,7 +242,7 @@ def aggregate(claim_records: list[ClaimRecord],
         # Proportion of claims containing post-claim / pre-fact-check evidence
         "share_claims_with_window_evidence": _share(
             sum(1 for c in claim_records if c.has_window_evidence), n_claims),
-        # Fraction of admissible sources falling into the interval
+        # Fraction of admissible citations falling into the interval
         "share_evidence_in_window": _share(len(window_records), len(admissible_records)),
         "mean_window_items_per_claim": _mean([c.n_in_window for c in claim_records]),
 
@@ -259,17 +271,26 @@ def aggregate(claim_records: list[ClaimRecord],
         "instance_rejection_reasons": dict(Counter(c.reason for c in claim_records if c.reason)),
         "share_instances_rejected_insufficient": _share(
             sum(1 for c in claim_records if c.reason == "insufficient_evidence"), n_claims),
-        "share_instances_rejected_essential_lost": _share(
-            sum(1 for c in claim_records if c.reason == "essential_evidence_lost"), n_claims),
+        "share_instances_rejected_key_lost": _share(
+            sum(1 for c in claim_records if c.reason == "key_evidence_lost"), n_claims),
 
         # Rationale and redundancy accounting
         "share_claims_with_rationale": _share(
             sum(1 for c in claim_records if c.has_rationale), n_claims),
         "share_claims_without_admissible_evidence": _share(
             sum(1 for c in claim_records if c.evidence_free), n_claims),
-        "n_essential": sum(c.n_essential for c in claim_records),
-        "n_essential_lost": sum(c.n_essential_lost for c in claim_records),
+        "n_key": sum(c.n_key for c in claim_records),
+        "n_key_lost": sum(c.n_key_lost for c in claim_records),
+        "n_auxiliary_lost": sum(c.n_auxiliary_lost for c in claim_records),
+        # Accepted instances that lost a whole (redundant) evidence item on the way:
+        # what disqualifying only on lost `key` items saves from rejection.
+        "share_accepted_despite_lost_evidence": _share(
+            sum(1 for c in accepted if c.n_auxiliary_lost > 0), len(accepted)),
         "sources_per_evidence": describe(_sources_per_evidence(evidence_records)),
+        # How many distinct URLs the citations point at: the retrievals saved by
+        # retrieving each source once rather than once per citation.
+        "n_distinct_sources": len({e["source_id"] for e in evidence_records
+                                   if e.get("source_id") is not None}),
 
         # The central question
         "recoverability": recoverability(claim_records),
@@ -351,7 +372,7 @@ def describe(values: list[float]) -> dict:
 # ---------------------------------------------------------------------------
 
 def _sources_per_evidence(records: list[dict]) -> list[float]:
-    """How many sources each evidence item has. The mean says how redundantly the
+    """How many citations each evidence item has. The mean says how redundantly the
     fact-checks cite, and therefore how much link rot the reconstruction absorbs."""
     sizes: dict = {}
     for index, record in enumerate(records):

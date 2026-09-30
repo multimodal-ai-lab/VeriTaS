@@ -7,7 +7,7 @@ Below is a set of evidence items. Each was published by an independent source an
 {{ item.proposition }}
 
 Reported by:
-{% for source in item.admissible_sources %}
+{% for source in item.admissible_citations %}
 - **{{ source.name }}** — {{ source.kind.value }} · {{ source.proximity.value }}{% if source.available_since %} · available since {{ source.available_since.strftime("%B %d, %Y") }}{% endif %}
 {% endfor %}
 {% endfor %}

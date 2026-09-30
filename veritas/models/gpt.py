@@ -221,9 +221,9 @@ async def preprocess_prompt(prompt: Prompt) -> list[dict]:
     return content_formatted
 
 
-gpt_strong = GPT("gpt-5.6-sol")
+gpt_strong = GPT("gpt-6.1-sol")
 gpt_cheap = GPT("gpt-5.6-terra")
-gpt_nano = GPT("gpt-5.6-luna")
+gpt_nano = GPT("gpt-6-luna")
 gpt_transcribe = GPT("gpt-4o-mini-transcribe")
 text_embedder = GPT("text-embedding-3-large")
 

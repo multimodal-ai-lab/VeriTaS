@@ -6,9 +6,10 @@ verdict. No web access happens here; the article was already scraped by the main
 pipeline's stage 3.
 
 The same call also returns the *verdict rationale*: the reasoning that bridges the
-evidence and the verdict. Both come from one reading of the article, so the roles
-the extractor assigns (`essential` means "the rationale breaks without it") are
-consistent with the rationale it wrote.
+claim and the evidence to the verdict. The extractor first assigns each item a role
+(`key` means "removing it likely breaks the verdict") and only then writes the
+rationale, which carries reasoning and commonsense knowledge only - no evidence,
+no reference to specific evidence items, no externally available information.
 """
 
 from __future__ import annotations
@@ -30,13 +31,13 @@ from veritas.gold_evidence import (
     max_reviews_per_claim,
     reasoning_effort_extraction,
 )
-from veritas.gold_evidence.admissibility import UNRETRIEVABLE_KINDS
 from veritas.gold_evidence.llm import FATAL_ERRORS, resolve_model
 from veritas.gold_evidence.models import (
+    Citation,
     Evidence,
     EvidenceRole,
-    EvidenceSource,
     ProximityLevel,
+    Source,
     SourceKind,
     VerdictRationale,
     to_naive,
@@ -96,6 +97,7 @@ async def extract_evidence(claim: Claim, replace: bool = False) -> Extraction:
 
     # TODO: May be removed
     extraction.evidence = deduplicate(extraction.evidence)[:max_evidence_per_claim]
+    share_sources(extraction.evidence)
 
     for candidate in extraction.evidence:
         await candidate.save_to_db()
@@ -113,18 +115,34 @@ async def _select_reviews(claim: Claim) -> list[Review]:
 
 async def extract_from_article(claim: Claim, review: Review,
                                article: Article) -> tuple[list[Evidence], VerdictRationale | None]:
-    """Runs the extractor MLLM on a single fact-checking article."""
+    """Runs the extractor MLLM on a single fact-checking article.
+
+    A *rectified* claim is not the claim the article checked: it is a corrected
+    version of it, produced to balance the dataset, and the fact-checker never
+    ruled on it. Only part of their investigation bears on it, and their argument
+    does not - it runs against the original claim, whose verdict is the opposite
+    of the rectified claim's. So the extractor is shown both claims and asked to
+    assemble the case for the rectified one instead of reconstructing the
+    fact-checker's own. For an original claim nothing about the prompt changes.
+    """
     publisher = await review.publisher
     publisher_name = publisher.name if publisher else (review.raw_publisher_name or "the fact-checker")
     article_content = article.content
     article_str = str(article_content)[:max_article_length]
     published = to_naive(review.published)
 
+    original_claim = await claim.variant if claim.is_rectified else None
+    if claim.is_rectified and original_claim is None:
+        logger.warning(f"Rectified claim {claim.id} has no original variant on record; "
+                       f"extracting without showing the claim the article checked.")
+
     prompt = Prompt(
         PROMPT_PATH,
         article=article_str,
         claim=claim.data,
         claim_date=claim.date_str or None,
+        is_rectified=claim.is_rectified,
+        original_claim=original_claim.data if original_claim else None,
         fact_check_date=published.strftime("%B %d, %Y") if published else None,
         publisher_name=publisher_name,
         source_kinds=[kind.value for kind in SourceKind],
@@ -144,6 +162,9 @@ async def extract_from_article(claim: Claim, review: Review,
         return [], None
 
     rationale_text, records = parse_extraction_response(str(response))
+    if not records:
+        logger.debug(f"Extractor returned no evidence records for claim {claim.id}, "
+                     f"review {review.id}. Response:\n{str(response)[:3000]}")
     excluded_domains = _excluded_domains(review, publisher)
     resolved_locators = await resolve_locators(records)
 
@@ -163,9 +184,13 @@ async def extract_from_article(claim: Claim, review: Review,
 
     rationale = build_rationale(rationale_text, claim=claim, review=review,
                                 article=article, reasoning=reasoning)
-    logger.debug(f"Extracted {len(evidence)}/{len(records)} evidence candidates "
-                 f"{'and a rationale ' if rationale else ''}"
-                 f"for claim {claim.id} from review {review.id}.")
+    # Every record dropped by the guards is a strong hint of a systematic problem
+    # (e.g. locators no longer matching the stored article text), so it is surfaced
+    # at INFO; the per-record reasons are logged at DEBUG by `build_citation`.
+    log = logger.info if records and not evidence else logger.debug
+    log(f"Extracted {len(evidence)}/{len(records)} evidence candidates "
+        f"{'and a rationale ' if rationale else ''}"
+        f"for claim {claim.id} from review {review.id}.")
     return evidence, rationale
 
 
@@ -290,10 +315,10 @@ def build_evidence(
 ) -> Evidence | None:
     """Validates one extracted record and turns it into an `Evidence` object.
 
-    A record carries one proposition and every source that reports it. Sources are
-    validated individually: those that fail a guard are dropped, and the item
-    survives as long as one of them is left. Returns None if the proposition itself
-    is unusable or no source survived."""
+    A record carries one proposition and every source that reports it. Each source
+    becomes a citation and is validated individually: those that fail a guard are
+    dropped, and the item survives as long as one of them is left. Returns None if
+    the proposition itself is unusable or no citation survived."""
     proposition = str(record.get("proposition") or "").strip()
     if not proposition:
         return None
@@ -305,15 +330,15 @@ def build_evidence(
         logger.debug(f"Dropping evidence with invalid media reference: {e}")
         return None
 
-    sources = []
+    citations = []
     for source_record in _source_records(record):
-        source = build_source(source_record, review=review, article_str=article_str,
-                              excluded_domains=excluded_domains,
-                              resolved_locators=resolved_locators)
-        if source and not any(_same_locator(source, other) for other in sources):
-            sources.append(source)
+        citation = build_citation(source_record, review=review, article_str=article_str,
+                                  excluded_domains=excluded_domains,
+                                  resolved_locators=resolved_locators)
+        if citation and not any(citation.key == other.key for other in citations):
+            citations.append(citation)
 
-    if not sources:
+    if not citations:
         logger.debug(f"Dropping evidence without a usable source: {proposition[:80]!r}")
         return None
 
@@ -322,25 +347,29 @@ def build_evidence(
         review_id=review.id,
         article_id=article.id,
         proposition=proposition,
-        sources=sources,
+        citations=citations,
         role=_parse_enum(record.get("role"), EvidenceRole, EvidenceRole.AUXILIARY),
         extraction_reasoning=str(record.get("reasoning") or "").strip() or None,
         extraction_confidence=_parse_confidence(record.get("confidence")),
     )
 
 
-def build_source(record: dict, *,
-                 review: Review,
-                 article_str: str,
-                 excluded_domains: set[str],
-                 resolved_locators: dict[str, str] | None = None) -> EvidenceSource | None:
-    """Validates one source record. Returns None if it violates an extraction rule.
+def build_citation(record: dict, *,
+                   review: Review,
+                   article_str: str,
+                   excluded_domains: set[str],
+                   resolved_locators: dict[str, str] | None = None) -> Citation | None:
+    """Validates one source record and turns it into a citation. Returns None if it
+    violates an extraction rule.
 
-    A source without a locator is kept rather than dropped: fact-checks do cite
-    sources they never link, and recording those is how the analysis can report how
-    often that happens. Only tools and offline evidence are *expected* to have no
-    locator; for any other kind, `admissibility` settles the source as inaccessible
-    without Stage 2 ever attempting a retrieval."""
+    A located source becomes a `Source` the citation refers to; `share_sources`
+    later makes all citations of the same URL within the claim refer to one
+    instance, and the DB to one row across claims. A source without a locator is
+    kept as a citation without a `Source` rather than dropped: fact-checks do cite
+    sources they never link, and recording those is how the analysis can report
+    how often that happens. Only tools and offline evidence are *expected* to have
+    no locator; for any other kind, `admissibility` settles the citation as
+    inaccessible without Stage 2 ever attempting a retrieval."""
     locator = str(record.get("locator") or "").strip()
     kind = _parse_enum(record.get("kind"), SourceKind, SourceKind.OTHER)
 
@@ -363,10 +392,10 @@ def build_source(record: dict, *,
         if locator.rstrip("/") == str(review.url).rstrip("/"):
             return None
 
-    return EvidenceSource(
+    return Citation(
+        source=Source(locator=locator) if locator else None,
         name=str(record.get("name") or domain or "unnamed source").strip(),
         kind=kind,
-        locator=locator or None,
         proximity=_parse_enum(record.get("proximity"), ProximityLevel,
                               ProximityLevel.SECONDARY),
     )
@@ -388,23 +417,25 @@ def _source_records(record: dict) -> list[dict]:
     return [flat] if any(value for value in flat.values()) else []
 
 
-def _same_locator(source: EvidenceSource, other: EvidenceSource) -> bool:
-    """Whether two sources of one item point at the same place. A locator-less
-    source is compared by name instead, so that one tool is not listed twice."""
-    if source.locator and other.locator:
-        return source.locator.rstrip("/").lower() == other.locator.rstrip("/").lower()
-    if source.locator or other.locator:
-        return False
-    return source.name.strip().lower() == other.name.strip().lower()
+def share_sources(evidence: list[Evidence]) -> list[Evidence]:
+    """Makes every citation of the same URL within the claim refer to one `Source`
+    instance, so that Stage 2 retrieves and dates it once and every citing item sees
+    the same outcome. Returns the items for convenience."""
+    shared: dict[str, Source] = {}
+    for item in evidence:
+        for citation in item.citations:
+            if citation.source is not None:
+                citation.source = shared.setdefault(citation.source.key, citation.source)
+    return evidence
 
 
 def deduplicate(candidates: list[Evidence]) -> list[Evidence]:
     """Merges items that assert the same proposition, keeping the union of their
-    sources and the higher extraction confidence. Sorted by role then confidence.
+    citations and the higher extraction confidence. Sorted by role then confidence.
 
     This is where redundancy across the two fact-checking articles is collected:
     if both cite the same proposition to different sources, the result is one
-    evidence item with two sources rather than two items."""
+    evidence item with two citations rather than two items."""
     best: dict[str, Evidence] = {}
     for candidate in candidates:
         key = " ".join(candidate.proposition.lower().split())
@@ -412,17 +443,17 @@ def deduplicate(candidates: list[Evidence]) -> list[Evidence]:
         if existing is None:
             best[key] = candidate
             continue
-        for source in candidate.sources:
-            if not any(_same_locator(source, other) for other in existing.sources):
-                existing.sources.append(source)
+        for citation in candidate.citations:
+            if not any(citation.key == other.key for other in existing.citations):
+                existing.citations.append(citation)
         if candidate.extraction_confidence > existing.extraction_confidence:
             existing.extraction_confidence = candidate.extraction_confidence
-        # The stricter role wins: if one article treats the proposition as load
-        # bearing, losing it would break that article's rationale.
-        if candidate.role == EvidenceRole.ESSENTIAL:
-            existing.role = EvidenceRole.ESSENTIAL
+        # The stricter role wins: if one article's verdict breaks without the
+        # proposition, losing it breaks that article's case.
+        if candidate.role == EvidenceRole.KEY:
+            existing.role = EvidenceRole.KEY
 
-    role_rank = {EvidenceRole.ESSENTIAL: 0, EvidenceRole.AUXILIARY: 1, EvidenceRole.BACKGROUND: 2}
+    role_rank = {EvidenceRole.KEY: 0, EvidenceRole.AUXILIARY: 1, EvidenceRole.BACKGROUND: 2}
     return sorted(best.values(),
                   key=lambda e: (role_rank.get(e.role, 3), -e.extraction_confidence))
 
@@ -435,6 +466,11 @@ def _parse_enum(value, enum_cls, default):
         for member in enum_cls:
             if member.value == normalized or member.name.lower() == normalized:
                 return member
+        try:
+            # Lets an enum accept aliases of its own, e.g. legacy role names.
+            return enum_cls(normalized)
+        except ValueError:
+            pass
     return default
 
 

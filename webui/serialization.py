@@ -82,9 +82,9 @@ def evidence_item_payload(row: dict, registry: MediaRegistry) -> dict:
 def evidence_source_payload(row: dict, registry: MediaRegistry) -> dict:
     """One evidence source with everything the detail view needs.
 
-    Rows come from `evidence_sources` joined with the item that owns them, so the
-    proposition and role are available as context even when a single source is
-    fetched on its own."""
+    Rows come from `citation_rows` - a citation joined with the source it cites -
+    and the item that owns them, so the proposition and role are available as
+    context even when a single source is fetched on its own."""
     full: dict = row.get("full_source") or {}
     item_blob: dict = row.get("full_evidence") or {}
     columns = {key: value for key, value in row.items()

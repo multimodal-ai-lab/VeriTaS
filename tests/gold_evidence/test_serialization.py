@@ -1,18 +1,20 @@
-"""Round-tripping of Evidence through the DB representation, and the additive
-`gold_evidence_*` columns on Claim."""
+"""Round-tripping of Evidence, its citations and the sources they cite through the
+DB representation, and the additive `gold_evidence_*` columns on Claim."""
 
 from datetime import datetime
 
 import pytest
 
-from tests.gold_evidence.conftest import make_evidence
+from tests.gold_evidence.conftest import make_citation, make_evidence, make_source
 from veritas.common import Claim
 from veritas.db.veritas_db import (
+    _citation_columns,
     _evidence_columns,
     _rationale_columns,
     _source_columns,
+    row_to_citation,
     row_to_evidence,
-    row_to_evidence_source,
+    row_to_source,
     row_to_verdict_rationale,
 )
 from veritas.gold_evidence.models import (
@@ -24,24 +26,39 @@ from veritas.gold_evidence.models import (
 )
 
 
+def source_roundtrip(source, source_id: int = 7):
+    columns, values = _source_columns(source)
+    row = dict(zip(columns, values))
+    row["id"] = source_id
+    return row_to_source(row)
+
+
+def citation_roundtrip(citation, evidence_id: int = 42, citation_id: int = 9):
+    columns, values = _citation_columns(citation, evidence_id, claim_id=1)
+    row = dict(zip(columns, values))
+    row["id"] = citation_id
+    return row_to_citation(row)
+
+
 def roundtrip(evidence: Evidence, evidence_id: int = 42) -> Evidence:
-    """Flattens to columns and reconstructs, exactly as the DB layer does: the item
-    and its sources live in separate tables and are reassembled on read."""
+    """Flattens to columns and reconstructs, exactly as the DB layer does: the item,
+    its citations and the sources they cite live in separate tables and are
+    reassembled on read, citations of one source sharing one instance."""
     columns, values = _evidence_columns(evidence)
     row = dict(zip(columns, values))
     row["id"] = evidence_id
 
     restored = row_to_evidence(row)
-    restored.sources = [source_roundtrip(source, evidence_id)
-                        for source in evidence.sources]
+    sources = {}
+    for index, citation in enumerate(evidence.citations):
+        copy = citation_roundtrip(citation, evidence_id, citation_id=index + 1)
+        if citation.source is not None:
+            key = id(citation.source)
+            if key not in sources:
+                sources[key] = source_roundtrip(citation.source, source_id=len(sources) + 1)
+            copy.source = sources[key]
+        restored.citations.append(copy)
     return restored
-
-
-def source_roundtrip(source, evidence_id: int = 42, source_id: int = 7):
-    columns, values = _source_columns(source, evidence_id, claim_id=1)
-    row = dict(zip(columns, values))
-    row["id"] = source_id
-    return row_to_evidence_source(row)
 
 
 def test_evidence_survives_the_roundtrip():
@@ -54,13 +71,15 @@ def test_evidence_survives_the_roundtrip():
     assert restored.role is original.role
     assert restored.extraction_confidence == original.extraction_confidence
 
-    source, original_source = restored.sources[0], original.sources[0]
-    assert source.locator == original_source.locator
-    assert source.kind is original_source.kind
-    assert source.proximity is original_source.proximity
-    assert source.available_since == original_source.available_since
-    assert source.faithfulness.assessment == original_source.faithfulness.assessment
-    assert source.temporal_validation.before_claim is True
+    citation, original_citation = restored.citations[0], original.citations[0]
+    assert citation.locator == original_citation.locator
+    assert citation.kind is original_citation.kind
+    assert citation.proximity is original_citation.proximity
+    assert citation.available_since == original_citation.available_since
+    assert citation.faithfulness.assessment == original_citation.faithfulness.assessment
+    assert citation.temporal_validation.before_claim is True
+    assert citation.admissible is True
+    assert citation.judged_at == original_citation.judged_at
 
 
 def test_media_references_in_the_proposition_survive():
@@ -70,31 +89,65 @@ def test_media_references_in_the_proposition_survive():
     assert restored.proposition == "The clip <video:12> shows the square at dusk."
 
 
-def test_every_source_of_an_item_survives_the_roundtrip():
-    from tests.gold_evidence.conftest import make_source
-
-    original = make_evidence(sources=[make_source(locator="https://a/1", name="Reuters"),
-                                      make_source(locator="https://a/2", name="Register")])
+def test_every_citation_of_an_item_survives_the_roundtrip():
+    original = make_evidence(citations=[make_citation(locator="https://a/1", name="Reuters"),
+                                        make_citation(locator="https://a/2", name="Register")])
     restored = roundtrip(original)
 
-    assert [s.name for s in restored.sources] == ["Reuters", "Register"]
+    assert [c.name for c in restored.citations] == ["Reuters", "Register"]
 
 
-def test_the_source_columns_mirror_the_nested_fields():
+def test_the_source_survives_the_roundtrip_with_its_content():
+    source = make_source(content="The page text.", available_since=datetime(2024, 4, 15))
+    source.dating_method = "meta"
+    restored = source_roundtrip(source)
+
+    assert restored.id == 7
+    assert restored.locator == source.locator
+    assert restored.raw_content == "The page text."
+    assert restored.accessible is True
+    assert restored.available_since == datetime(2024, 4, 15)
+    assert restored.dating_method == "meta"
+    assert restored.is_fact_check is False
+
+
+def test_the_content_is_stored_once_per_source():
+    """It is the bulk of the row: a column of its own, not a second copy in the blob."""
+    columns, values = _source_columns(make_source(content="The page text."))
+    row = dict(zip(columns, values))
+    assert row["raw_content"] == "The page text."
+    assert "raw_content" not in row["full_source"]
+
+
+def test_a_source_is_stored_under_its_normalized_locator():
+    a, b = make_source(locator="https://Example.org/a/"), make_source(locator="https://example.org/a")
+    key_a = dict(zip(*_source_columns(a)))["locator_key"]
+    key_b = dict(zip(*_source_columns(b)))["locator_key"]
+    assert key_a == key_b
+    assert len(key_a) == 40  # SHA-1: collision-free across the global table
+
+
+def test_the_citation_columns_mirror_the_nested_fields():
     """The flat columns exist for querying; they must not drift from the blob."""
     evidence = make_evidence(available_since=datetime(2024, 4, 15), faithfulness=2 / 3)
-    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
+    citation = evidence.citations[0]
+    citation.source.id = 5
+    columns, values = _citation_columns(citation, evidence_id=42, claim_id=1)
     row = dict(zip(columns, values))
 
+    assert row["source_id"] == 5
     assert row["faithfulness_assessment"] == pytest.approx(2 / 3)
     assert row["before_claim"] is True
     assert row["kind"] == SourceKind.NEWS_ARTICLE.value
     assert row["proximity"] == ProximityLevel.SECONDARY.value
-    assert row["full_source"]["name"] == evidence.sources[0].name
+    assert row["citation_key"] == citation.source.key
+    assert row["full_citation"]["name"] == citation.name
+    # The source is stored in its own table, not a second time in the citation.
+    assert "source" not in row["full_citation"]
 
 
 def test_the_later_event_judgement_is_stored_with_the_item():
-    """It is about the proposition, so it belongs to the item, not to a source."""
+    """It is about the proposition, so it belongs to the item, not to a citation."""
     evidence = make_evidence(later_event=True)
     columns, values = _evidence_columns(evidence)
     row = dict(zip(columns, values))
@@ -105,37 +158,38 @@ def test_the_later_event_judgement_is_stored_with_the_item():
     assert roundtrip(evidence).later_event.change_detected is True
 
 
-def test_the_item_columns_carry_what_the_sources_decided():
+def test_the_item_columns_carry_what_the_citations_decided():
     """The aggregation layer stores the outcome so that queries need not join."""
-    from tests.gold_evidence.conftest import make_source
-
-    evidence = make_evidence(sources=[make_source(locator="https://a/1", accessible=False),
-                                      make_source(locator="https://a/2")])
     from veritas.gold_evidence.admissibility import apply_admissibility_to_item
 
+    evidence = make_evidence(citations=[make_citation(locator="https://a/1", accessible=False),
+                                        make_citation(locator="https://a/2")])
     apply_admissibility_to_item(evidence)
     columns, values = _evidence_columns(evidence)
     row = dict(zip(columns, values))
 
-    assert row["role"] == EvidenceRole.ESSENTIAL.value
-    assert row["admissible"] is True          # one source survived
+    assert row["role"] == EvidenceRole.KEY.value
+    assert row["admissible"] is True          # one citation survived
     assert row["n_sources"] == 2
     assert row["n_admissible_sources"] == 1
     assert row["full_evidence"]["proposition"] == evidence.proposition
-    # The sources live in their own table, not a second time in the blob.
+    # The citations live in their own table, not a second time in the blob.
+    assert "citations" not in row["full_evidence"]
     assert "sources" not in row["full_evidence"]
 
 
 def test_unfiltered_evidence_serializes_with_nulls():
     evidence = make_evidence(decided=False)
-    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
+    citation = evidence.citations[0]
+    columns, values = _citation_columns(citation, evidence_id=42, claim_id=1)
     row = dict(zip(columns, values))
-    assert row["accessible"] is None
     assert row["faithfulness_assessment"] is None
     assert row["before_claim"] is None
     assert row["admissible"] is None
+    assert row["judged_at"] is None
+    assert dict(zip(*_source_columns(citation.source)))["accessible"] is None
 
-    restored = source_roundtrip(evidence.sources[0])
+    restored = citation_roundtrip(citation)
     assert restored.faithfulness is None
     assert restored.temporal_validation is None
 
@@ -152,46 +206,52 @@ def test_hashes_are_stable_and_distinguish_items():
     assert _evidence_columns(a)[1] == values_a
 
 
-def test_sources_are_keyed_by_locator_and_fall_back_to_the_name():
-    from tests.gold_evidence.conftest import make_source
-    from veritas.db.veritas_db import _source_key_hash
+def test_citations_are_keyed_by_source_and_fall_back_to_kind_and_name():
+    a = make_citation(locator="https://example.org/a")
+    b = make_citation(locator="https://example.org/a", name="Another label")
+    assert a.key == b.key
 
-    a = make_source(locator="https://example.org/a")
-    b = make_source(locator="https://example.org/a")
-    assert _source_key_hash(a) == _source_key_hash(b)
-
-    # A source without a locator is identified by its name instead, so that one
-    # tool is not stored twice.
-    tool = make_source(locator=None, name="ExifTool")
-    same_tool = make_source(locator=None, name="exiftool")
-    assert _source_key_hash(tool) == _source_key_hash(same_tool)
-    assert _source_key_hash(tool) != _source_key_hash(a)
+    # A citation without a source is identified by kind and name instead, so that
+    # one interview is not stored twice within an item.
+    interview = make_citation(locator=None, kind=SourceKind.OFFLINE, name="Prof. Meier")
+    same = make_citation(locator=None, kind=SourceKind.OFFLINE, name="prof.  meier")
+    assert interview.key == same.key
+    assert interview.key != a.key
 
 
-def test_a_missing_locator_stays_null_in_the_columns():
+def test_a_citation_without_a_source_stays_null_in_the_columns():
     """A source that is not a publication is stored as what it is rather than as
     an empty string."""
-    from veritas.gold_evidence.models import SourceKind as Kind
-
-    evidence = make_evidence(locator=None, kind=Kind.OFFLINE, available_since=None)
-    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
+    evidence = make_evidence(locator=None, kind=SourceKind.OFFLINE, available_since=None)
+    columns, values = _citation_columns(evidence.citations[0], evidence_id=42, claim_id=1)
     row = dict(zip(columns, values))
 
-    assert row["locator"] is None
-    assert isinstance(row["source_key_hash"], int)
-    assert roundtrip(evidence).sources[0].locator is None
+    assert row["source_id"] is None
+    restored = roundtrip(evidence)
+    assert restored.citations[0].source is None
+    assert restored.citations[0].locator is None
+
+
+def test_citations_of_one_source_share_it_after_the_roundtrip():
+    shared = make_source()
+    evidence = make_evidence(citations=[make_citation(source=shared, name="A"),
+                                        make_citation(locator=None, kind=SourceKind.TOOL,
+                                                      name="B")])
+    restored = roundtrip(evidence)
+    assert restored.citations[0].source is not None
+    assert restored.sources == [restored.citations[0].source]
 
 
 def test_the_deferral_window_is_flattened_and_restored():
     from datetime import timedelta
 
-    evidence = make_evidence()
+    source = make_source()
     until = datetime.now() + timedelta(hours=24)
-    evidence.sources[0].deferred_until = until
-    columns, values = _source_columns(evidence.sources[0], evidence_id=42, claim_id=1)
+    source.deferred_until = until
+    columns, values = _source_columns(source)
 
     assert dict(zip(columns, values))["deferred_until"] == until
-    assert roundtrip(evidence).sources[0].deferred_until == until
+    assert source_roundtrip(source).deferred_until == until
 
 
 # --- Verdict rationales ----------------------------------------------------

@@ -1,22 +1,32 @@
-import asyncio
 import logging
 import re
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import requests
 import tldextract
 from bs4 import BeautifulSoup, Tag
-from playwright.async_api import async_playwright
 from pydantic import HttpUrl
 from scrapemm import retrieve
 from scrapemm.common import ScrapingResponse
-from scrapemm.util import to_multimodal_sequence
 
-from veritas.util.parsing import perform_extraction
 from veritas.util.scraping import HEADERS
 
 logger = logging.getLogger("VeriTaS")
+
+#: Matches a bare URL inside free text (e.g. a publisher's name field that embeds
+#: its homepage). Used to be re-exported by scrapeMM (`scrapemm.util.URL_REGEX`);
+#: inlined here since scrapeMM's client package no longer ships that module - the
+#: scraping engine it belonged to moved server-side.
+URL_REGEX = r"https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9@:%_\+.~#?&//=]*)"
+
+
+def preprocess_url(url: str) -> str:
+    """Decodes a URL and strips unwanted symbols from it, such as surrounding
+    whitespace or non-breaking spaces. Used to be re-exported by scrapeMM
+    (`scrapemm.util.preprocess_url`); inlined here for the same reason as
+    `URL_REGEX` above."""
+    return unquote(str(url)).strip()
 
 
 def get_domain(url: str | HttpUrl | None) -> str | None:
@@ -111,11 +121,11 @@ async def resolve_perma_cc_url(url: str) -> dict | None:
                 return dict(original_url=resolved_url)
 
         # Handle regular perma.cc URLs by scraping via scrapeMM
-        response: ScrapingResponse = await retrieve(url, show_progress=False, format="html")
-        if not response.successful:
+        response: ScrapingResponse = await retrieve(url, show_progress=False, output_format="html")
+        if not response.success:
             return None
 
-        html: str = response.content
+        html: str = response.content.html
 
         # Parse the HTML to extract the original URL
         soup = BeautifulSoup(html, "lxml")
@@ -155,85 +165,25 @@ async def resolve_archive_org_url(url) -> dict | None:
     return dict(original_url=original_url)
 
 
-async def get_original_url_playwright(archive_url: str) -> str | None:
-    """Attempts to retrieve the original URL from an Archive Today page using Playwright.
-
-    Args:
-        archive_url: The archive.today (or similar domain) URL to resolve
-
-    Returns:
-        The original URL if found, None otherwise
-    """
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-            page = await context.new_page()
-
-            # Load the page
-            await page.goto(archive_url, wait_until='domcontentloaded', timeout=20000)
-            await asyncio.sleep(2)  # Wait for everything to load
-
-            # Get original URL from the input field
-            try:
-                original_url = await page.input_value('input[type="text"]')
-                await browser.close()
-
-                if original_url and original_url.startswith("http"):
-                    return original_url
-                return None
-            except Exception as e:
-                logger.debug(f"Could not extract URL from input field: {e}")
-                await browser.close()
-                return None
-
-    except Exception as e:
-        logger.debug(f"Playwright extraction failed for {archive_url}: {e}")
-        return None
-
-
 async def resolve_archive_today_url(url: str) -> dict | None:
-    """Resolves an Archive Today URL to the original URL.
+    """Resolves an Archive Today URL to the original URL - long form only
+    (https://archive.today/2022.04.08-155753/https://example.com), extracted
+    from the URL itself via regex, no network request needed.
 
-    Archive Today uses multiple domains (archive.ph, archive.is, etc.) and two URL formats:
-    1. Long format with original URL in path: https://archive.today/2022.04.08-155753/https://example.com
-    2. Short code format: https://archive.ph/nLdE3
-
-    For long format URLs, the original URL is extracted via regex (no network request needed).
-    For short code format URLs, tries Playwright first, then falls back to scrapeMM.
-    Note: Short format requires Cloudflare bypass (Firecrawl/Decodo with Advanced plan).
-    """
-    from veritas.pipeline import max_video_size
-
-    # First, try regex for long-format URLs (no need for scraping)
-    match = re.match(
-        r"^https?://(?:archive\.today|archive\.is|archive\.ph|archive\.vn|archive\.li|archive\.fo|archive\.md).*?[/-](?P<original>https?://?[^#]*)",
-        url,
-    )
-    if match:
-        result = match.group("original")
-        return dict(original_url=result)
-
-    # Otherwise, the URL is in short format. This needs targeted scraping and extraction.
-    # Use Decodo (Advanced Scraping API required) to retrieve the HTML of the page and parse it
-    result: ScrapingResponse = await retrieve(url, methods=["decodo"], format="html", show_progress=False,
-                                              max_video_size=max_video_size)
-
-    # TODO: Move this to ScrapeMM:
-    # Extract the original URL from the HTML and return it along with the scraped content (to save requests)
-    if result:
-        html = result.content
-        if html:
-            extracted = perform_extraction(html, extraction={"tag": "input", "attrs": {"name": "q"}, "get": "value"})
-            original_url = extracted if isinstance(extracted, str) and extracted.startswith("http") else None
-
-            # Turn scraped HTML into multimodal sequence
-            async with aiohttp.ClientSession() as session:
-                mm_seq = await to_multimodal_sequence(html, remove_urls=False, session=session, url=url)
-
-            return dict(original_url=original_url, scraped_content=mm_seq)
+    Short-code URLs (https://archive.ph/nLdE3) cannot be resolved anymore: this
+    used to delegate to scrapeMM's `identify_snapshot()`, an ungated lookup
+    through Archive.today's own metadata endpoints, but scrapeMM moved to a
+    client/server split and that lookup lives only in the server's internal
+    `archive_today` integration now - it is not exposed over the client's HTTP
+    API (`/v1/archive-today` only covers the CAPTCHA session/buffer, not
+    resolving a snapshot's original URL). A short-code URL's Appearance is
+    therefore saved with `url=None`, same as any other appearance whose
+    original URL could not be determined."""
+    domains = "|".join(re.escape(domain) for domain in ARCHIVE_TODAY_DOMAINS)
+    match = re.match(rf"^https?://(?:{domains}).*?[/-](?P<original>https?://?[^#]*)", url)
+    if not match:
+        return None
+    return dict(original_url=match.group("original"))
 
 
 async def resolve_ghostarchive_url(url: str) -> dict | None:
@@ -270,6 +220,31 @@ def resolve_archiveport_url(url: str) -> dict:
 
 def is_archiving_url(url: str):
     return get_domain(url) in ARCHIVING_SITES
+
+
+#: Archive.today's mirror domains. They are one and the same service - a single
+#: access check, shared session and page cache cover all of them (see scrapeMM's
+#: `archive_today` integration) - so anything gated on one of them is gated the
+#: same way regardless of which mirror the URL happens to use.
+ARCHIVE_TODAY_DOMAINS = (
+    "archive.today", "archive.is", "archive.ph", "archive.vn",
+    "archive.li", "archive.fo", "archive.md",
+)
+
+
+def is_archive_today_url(url: str | HttpUrl | None) -> bool:
+    """True if the URL belongs to one of Archive.today's mirror domains."""
+    return get_domain(url) in ARCHIVE_TODAY_DOMAINS
+
+
+#: Matches an Archive.today URL on any mirror domain, for the SQL `~*` filters
+#: that look up appearances/evidence sources still waiting behind the access
+#: check (see `scripts/retry_deferred_archive_today.py`).
+ARCHIVE_TODAY_URL_SQL_PATTERN = (
+    r"^https?://([a-z0-9-]+\.)?(" +
+    "|".join(domain.replace(".", r"\.") for domain in ARCHIVE_TODAY_DOMAINS) +
+    r")(/|$)"
+)
 
 
 ARCHIVING_SITES = {

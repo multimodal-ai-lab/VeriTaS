@@ -10,9 +10,11 @@ import {
     countUp, decimal, el, humanize, infoTip, num, percent, REASON_HELP,
 } from '../util.js';
 
+// Every status needs an entry: a missing one makes the donut fall back to the
+// palette by slice position, so its colour would change with the data.
 const STATUS_COLOURS = {
     accepted: '--ok', rejected: '--bad', filtered: '--info',
-    extracted: '--violet', pending: '--warn',
+    extracted: '--violet', deferred: '--warn', pending: '--neutral',
 };
 
 export async function renderOverview(root) {
@@ -267,7 +269,7 @@ function evidenceSection(evidence) {
                     })),
                 panel('Evidence role', 'admissible only',
                     donutChart(evidence.roles, {
-                        colours: { essential: '--accent', auxiliary: '--info', background: '--neutral' },
+                        colours: { key: '--accent', auxiliary: '--info', background: '--neutral' },
                     })),
                 panel('Why candidates were discarded', 'all filtered items',
                     barChart(evidence.inadmissibility_reasons, { tone: 'bad', help: REASON_HELP })),

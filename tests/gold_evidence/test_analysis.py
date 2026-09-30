@@ -23,7 +23,7 @@ def claim_record(**overrides) -> ClaimRecord:
         claim_id=1, t_c=T_C, t_f=T_F, status="accepted", reason=None, released=True,
         is_rectified=False, language="en", n_candidates=5, n_admissible=4,
         n_sources=5, n_in_window=1, n_undated=0, n_deferred=0, n_rationales=1,
-        n_essential=2, n_essential_lost=0, n_evidence_claim=3,
+        n_key=2, n_key_lost=0, n_evidence_claim=3,
         n_evidence_fact_check=4,
         gold_integrity=-1.0, gold_veracity=-1.0, gold_context_coverage=None,
         has_media=False,
@@ -108,7 +108,7 @@ def test_aggregate_reports_categorical_distributions():
     result = aggregate([claim_record()], evidence_rows())
     assert result["source_kind_distribution"] == {"news_article": 4}
     assert result["source_proximity_distribution"] == {"secondary": 4}
-    assert result["role_distribution"] == {"essential": 4}
+    assert result["role_distribution"] == {"key": 4}
     assert result["modality_composition"]["text_only"] == 4
     assert result["modality_composition"]["share_multimodal"] == pytest.approx(0.0)
 
@@ -117,13 +117,27 @@ def test_aggregate_reports_instance_rejections():
     records = [
         claim_record(claim_id=1, status="accepted", reason=None),
         claim_record(claim_id=2, status="rejected", reason="insufficient_evidence"),
-        claim_record(claim_id=3, status="rejected", reason="essential_evidence_lost"),
+        claim_record(claim_id=3, status="rejected", reason="key_evidence_lost"),
         claim_record(claim_id=4, status="rejected", reason="insufficient_evidence"),
     ]
     result = aggregate(records, [])
     assert result["instance_statuses"] == {"accepted": 1, "rejected": 3}
     assert result["share_instances_rejected_insufficient"] == pytest.approx(0.5)
-    assert result["share_instances_rejected_essential_lost"] == pytest.approx(0.25)
+    assert result["share_instances_rejected_key_lost"] == pytest.approx(0.25)
+
+
+def test_aggregate_reports_instances_that_survived_losing_evidence():
+    """Losing a replaceable item is not a rejection; how often an accepted
+    instance got by without one is what disqualifying on key items alone buys."""
+    records = [
+        claim_record(claim_id=1, status="accepted", n_auxiliary_lost=2),
+        claim_record(claim_id=2, status="accepted", n_auxiliary_lost=0),
+        claim_record(claim_id=3, status="rejected", reason="insufficient_evidence",
+                     n_auxiliary_lost=1),
+    ]
+    result = aggregate(records, [])
+    assert result["n_auxiliary_lost"] == 3
+    assert result["share_accepted_despite_lost_evidence"] == pytest.approx(0.5)
 
 
 def test_aggregate_reports_rationales_and_evidence_free_instances():

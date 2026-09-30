@@ -4,11 +4,12 @@ from datetime import date, datetime
 from bs4 import BeautifulSoup
 from scrapemm import retrieve
 from scrapemm.common import ScrapingResponse
+from scrapemm.common.exceptions import ServerError
 from ezmm.common import item_registry
 
 from veritas.common import Article, Review, Prompt
 from veritas.db import db
-from veritas.models import gpt_nano
+from veritas.models import QuotaExceededError, gpt_nano
 from veritas.pipeline import max_video_size, min_scraped_article_length, min_extracted_article_length, \
     max_extracted_article_length
 from veritas.pipeline.util.stage import Stage
@@ -86,15 +87,22 @@ async def process_articles(reviews: list[Review]):
 
     # Scrape all unscraped articles concurrently and dynamically
     logger.info(f"Downloading articles of {len(urls)} reviews...")
-    responses = await retrieve(list(urls), prioritize="speed", show_progress=False, max_video_size=max_video_size)
+    try:
+        responses = await retrieve(list(urls), prioritize="speed", show_progress=False,
+                                   max_video_size=max_video_size)
+    except ServerError as e:
+        # Run-level condition: every URL in the batch would fail the same way, and
+        # nothing below this has run yet, so nothing needs to be undone - just
+        # abort instead of falling into the stage's generic retry-with-sleep loop.
+        raise QuotaExceededError(f"scrapeMM server unreachable: {e}") from e
     assert isinstance(responses, list)
-    scraped_pages = [response.content for response in responses]
+    scraped_pages = [response.content.multimodal if response.content else None for response in responses]
     url_to_response: dict[str, ScrapingResponse] = dict(zip(urls, responses))
     url_to_scraped = dict(zip(urls, scraped_pages))
 
     # Log retrieval statistics
     if urls:
-        n_successes = sum(response.successful for response in responses)
+        n_successes = sum(response.success for response in responses)
         logger.info(f"Successfully retrieved {n_successes} articles from {len(urls)} URLs.")
         avg_time = sum(r.retrieval_time for r in responses) / len(responses)
         logger.info(f"Avg time per URL: {avg_time:.2f}s")

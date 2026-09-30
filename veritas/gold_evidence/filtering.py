@@ -1,28 +1,40 @@
 """Stage 2 - Evidence filtering (Spec §3).
 
-Each *source* is filtered independently - these criteria are about the source,
-not about the proposition it reports:
-  §3.1 accessibility  - retrieve the source, determine `available_since` (t_e)
-  §3.2 faithfulness   - does the *current* source still support the proposition?
-  §3.3 cutoffs        - is t_e before t_c, before t_f? Computed, not predicted.
+Stage 2 decides three kinds of things, each at the level it is about:
 
-One criterion is about the *item*: whether the proposition rests on a change of the
-world that happened only after t_c (§3.3 (3)). It is asked once per item, after its
-sources have been dated, and only when the item became available after t_c at all.
+- per **source**, i.e. once per URL, however many items and claims cite it:
+  §3.1 accessibility - retrieve the source, determine `available_since` (t_e) -
+  and whether the publisher registry lists it as a professional fact-check;
+- per **citation**, i.e. once per (evidence item, source):
+  §3.2 faithfulness - does the source still support *this* proposition? - and
+  §3.3 cutoffs - is t_e before the citing claim's t_c and t_f? Computed, not predicted;
+- per **item**: whether the proposition rests on a change of the world that
+  happened only after t_c (§3.3 (3)), asked once its citations are dated, and only
+  when the item became available after t_c at all.
 
-An evidence item survives as long as one of its sources does.
+An evidence item survives as long as one of its citations does.
+
+Sources are global and write-once (see `models.Source`). Before a source is
+retrieved, its stored state is re-read under a per-URL lock, so a source that
+another claim - possibly running concurrently - already retrieved is adopted rather
+than fetched again. Only `re_retrieve` fetches a source anew; the citations judged
+against its previous state then count as stale and are judged again whenever the
+claims owning them are processed next.
 
 The faithfulness validator receives only the proposition and the source content.
 The temporal validator receives the claim but never the gold verdict or the
 fact-checker's reasoning, so neither check can be circular.
 
 Quota and rate-limit errors are run-level conditions and are never recorded as a
-judgement on the item that happened to hit them: they abort the run instead. A
-source that only rate-limited us defers the item by `defer_hours`.
+judgement on the source that happened to hit them: they abort the run instead. A
+source that only rate-limited us, or is still behind Archive.today's access check,
+is deferred by `defer_hours`, and so is every item citing it (see
+`retrieval.SourceRetrieval`).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 
@@ -41,18 +53,17 @@ from veritas.gold_evidence import (
     undated_policy,
 )
 from veritas.gold_evidence.admissibility import (
-    UNRETRIEVABLE_KINDS,
     apply_admissibility,
     compute_temporal_bounds,
     select,
 )
 from veritas.gold_evidence.llm import FATAL_ERRORS, resolve_model
 from veritas.gold_evidence.models import (
+    Citation,
     Evidence,
-    EvidenceSource,
     Faithfulness,
     LaterEventCheck,
-    SourceKind,
+    Source,
     TemporalValidation,
     to_naive,
 )
@@ -72,26 +83,57 @@ POSITIVE_CATEGORY = "entails"
 NEGATIVE_CATEGORY = "contradicts"
 FAITHFULNESS_CATEGORIES = (POSITIVE_CATEGORY, NEGATIVE_CATEGORY, "unknown")
 
+#: One lock per source key, shared by every claim this process reconstructs, so
+#: that a URL cited by several claims running concurrently is retrieved once.
+_source_locks: dict[str, asyncio.Lock] = {}
+#: Keys of the sources `re_retrieve` has already fetched anew in this process: a
+#: second claim citing the same URL in the same run reuses that retrieval.
+_retrieved_anew: set[str] = set()
+
+
+def _lock(key: str) -> asyncio.Lock:
+    lock = _source_locks.get(key)
+    if lock is None:
+        lock = _source_locks[key] = asyncio.Lock()
+    return lock
+
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
-async def filter_evidence(claim: Claim, evidence: list[Evidence]) -> list[Evidence]:
-    """Filters every source of the provided evidence items independently and persists the
-    outcome. Returns the admissible items (i.e. `E_f`)."""
+async def filter_evidence(claim: Claim, evidence: list[Evidence], *,
+                          re_retrieve: bool = False,
+                          re_judge: bool = False) -> list[Evidence]:
+    """Filters the given evidence items and persists the outcome. Returns the
+    admissible items (i.e. `E_f`).
+
+    First every distinct source is settled - once, however many of the items cite
+    it - then every citation that is not yet decided against its source's current
+    state is judged, and finally the item-level later-event check is asked.
+
+    `re_retrieve` fetches the sources anew instead of reusing what is stored;
+    `re_judge` judges every citation again, even those already decided."""
     if not evidence:
         return []
 
     t_c, t_f = await get_reference_times(claim)
 
-    tasks = [filter_source(source, evidence=item, claim=claim, t_c=t_c, t_f=t_f)
-             for item in evidence for source in item.sources if not source.deferred]
     try:
-        await run_with_semaphore(tasks, limit=evidence_concurrency)
+        await run_with_semaphore(
+            [settle_source(source, re_retrieve=re_retrieve)
+             for source in sources_to_retrieve(evidence)],
+            limit=evidence_concurrency)
+
+        await run_with_semaphore(
+            [judge_citation(citation, evidence=item, t_c=t_c, t_f=t_f)
+             for item in evidence for citation in item.citations
+             if (re_judge or re_retrieve or not citation.filtered)
+             and not citation.deferred],
+            limit=evidence_concurrency)
 
         # The later-event check needs the dates the retrievals just established, so
-        # it runs once the sources are done - once per item, not once per source.
+        # it runs once the citations are done - once per item, not once per source.
         await run_with_semaphore(
             [check_later_event(item, claim=claim) for item in evidence
              if needs_later_event_check(item, t_c)],
@@ -105,79 +147,140 @@ async def filter_evidence(claim: Claim, evidence: list[Evidence]) -> list[Eviden
     return select(evidence, CONDITION_FACT_CHECK)
 
 
-async def filter_source(source: EvidenceSource, *,
-                        evidence: Evidence,
-                        claim: Claim,
-                        t_c: datetime | None,
-                        t_f: datetime | None) -> EvidenceSource:
-    """Runs §3.1-§3.3 on a single source and sets its admissibility."""
-    def decide() -> EvidenceSource:
-        return apply_admissibility(source, undated_policy=undated_policy,
-                                   extraction_confidence=evidence.extraction_confidence)
+def sources_to_retrieve(evidence: list[Evidence]) -> list[Source]:
+    """The distinct sources the items cite as publications. A source cited only as
+    a tool or as offline evidence is not retrieved: nothing about it is used."""
+    seen, sources = set(), []
+    for item in evidence:
+        for citation in item.citations:
+            source = citation.source
+            if source is None or citation.exempt or id(source) in seen:
+                continue
+            seen.add(id(source))
+            sources.append(source)
+    return sources
 
-    try:
-        # --- 0 Kinds that cannot be retrieved -----------------------------------
-        # A tool has no publication to re-read and offline evidence has no locator,
-        # so §3.1 and §3.2 do not apply. §3.3 does as soon as a `t_e` is known: a
-        # dated source can be placed on the timeline like any other, and there is
-        # no reason to exempt it from the cutoff and the later-event check.
-        if source.kind in UNRETRIEVABLE_KINDS:
-            if source.available_since is not None:
-                source.temporal_validation = _temporal_validation(source, t_c=t_c, t_f=t_f)
-            return decide()
 
-        # --- 0 Sources the article never located ---------------------------------
-        if not source.locator:
-            source.accessible = False
-            source.dismissed_reason = "The article cites this source without locating it."
-            return decide()
+async def settle_source(source: Source, *, re_retrieve: bool = False) -> Source:
+    """Establishes what is decided once per URL: whether the source is a
+    professional fact-check, whether it can be retrieved, what it says and when it
+    became available. Persists the outcome.
 
-        # --- 0 Blacklist comparison ---------------------------------------------
-        if await _is_fact_checking_org(source.locator):
-            # Recorded on the source itself, so the leak is visible in the exports
-            # and `determine_inadmissibility` can decide it as a pure function.
-            source.kind = SourceKind.FACT_CHECK
-            source.dismissed_reason = "Source is an accredited fact-checking organization."
-            return decide()
+    Under the source's lock, the stored state is adopted first: another claim may
+    have settled the source since this claim loaded it. A settled source is then
+    left alone - sources are write-once - unless `re_retrieve` asks for a fresh
+    retrieval, which happens at most once per process and URL."""
+    async with _lock(source.key):
+        stored = await db.get_source_by_locator(source.locator)
+        if stored is not None:
+            source.adopt(stored)
 
-        # --- §3.1 Accessibility -------------------------------------------------
-        retrieval = await retrieve_source(source.locator)
-
-        if retrieval.rate_limited:
-            # A throttled source says nothing about the item. Leave it entirely
-            # unjudged and retry it after the cooldown.
-            source.defer(hours=defer_hours)
-            logger.debug(f"Deferring source {source.locator} of evidence {evidence.id} "
-                         f"for {defer_hours}h: {retrieval.error}")
+        if re_retrieve and source.key not in _retrieved_anew:
+            source.reset_retrieval()
+        elif source.decided or source.deferred:
             return source
 
-        source.accessed_at = datetime.now()
-        source.accessible = retrieval.accessible
-        if retrieval.content is not None:
-            source.raw_content = str(retrieval.content)
-        source.available_since = to_naive(retrieval.available_since)
+        persist = True
+        try:
+            # --- Blacklist comparison ---------------------------------------------
+            if source.is_fact_check is None:
+                # None again if the lookup failed, so a later run asks once more.
+                source.is_fact_check = await _is_fact_checking_org(source.locator)
+            if source.is_fact_check:
+                # Recorded on the source itself, so the leak is visible in the
+                # exports and `determine_inadmissibility` can decide it as a pure
+                # function. Nothing else needs to be known about it.
+                return source
 
-        if not retrieval.accessible:
-            source.dismissed_reason = retrieval.error
+            # --- §3.1 Accessibility -----------------------------------------------
+            retrieval = await retrieve_source(source.locator)
+
+            if retrieval.rate_limited or retrieval.gated:
+                # A throttled or Archive.today-gated source says nothing about any
+                # item. Leave it unjudged and retry it after the cooldown (or on
+                # demand via `scripts/retry_deferred_archive_today.py`).
+                source.defer(hours=defer_hours)
+                source.retrieval_error = retrieval.error
+                reason = "gated by Archive.today" if retrieval.gated else "rate limited"
+                logger.debug(f"Deferring source {source.locator} for {defer_hours}h "
+                             f"({reason}): {retrieval.error}")
+                return source
+
+            source.deferred_until = None
+            source.accessed_at = datetime.now()
+            source.accessible = retrieval.accessible
+            source.raw_content = (str(retrieval.content)
+                                  if retrieval.content is not None else None)
+            source.available_since = to_naive(retrieval.available_since)
+            source.dating_method = retrieval.dating_method
+            source.retrieval_method = retrieval.method
+            source.retrieval_error = None if retrieval.accessible else retrieval.error
+            if re_retrieve:
+                _retrieved_anew.add(source.key)
+
+        except FATAL_ERRORS:
+            # Nothing is recorded about the source - in particular a stored
+            # retrieval that `re_retrieve` was about to replace is kept - so a
+            # later run evaluates it.
+            persist = False
+            raise
+        except Exception as e:
+            logger.warning(f"Retrieving source {source.locator} failed: "
+                           f"{type(e).__name__}: {e}")
+            source.accessed_at = datetime.now()
+            source.accessible = False
+            source.retrieval_error = f"{type(e).__name__}: {e}"
+        finally:
+            if persist:
+                await db.update_source(source)
+
+    return source
+
+
+async def judge_citation(citation: Citation, *,
+                         evidence: Evidence,
+                         t_c: datetime | None,
+                         t_f: datetime | None) -> Citation:
+    """Runs §3.2 and §3.3 on one citation, against the settled state of the source
+    it cites, and sets its admissibility."""
+    def decide() -> Citation:
+        return apply_admissibility(citation, undated_policy=undated_policy,
+                                   extraction_confidence=evidence.extraction_confidence)
+
+    citation.error = None
+    citation.faithfulness = None
+    citation.temporal_validation = None
+    try:
+        # --- Kinds that cannot be retrieved --------------------------------------
+        # A tool has no publication to re-read and offline evidence has no locator,
+        # so §3.1 and §3.2 do not apply. §3.3 does as soon as a `t_e` is known.
+        if citation.exempt:
+            if citation.available_since is not None:
+                citation.temporal_validation = _temporal_validation(
+                    citation.available_since, t_c=t_c, t_f=t_f)
             return decide()
 
-        source_str = str(retrieval.content)[:max_source_content_length]
+        # A source that was never located, could not be retrieved, or leaks the
+        # verdict is decided by `determine_inadmissibility` on its state alone.
+        source = citation.source
+        if source is None or source.is_fact_check or not source.accessible:
+            return decide()
 
-        # --- §3.2 Faithfulness --------------------------------------------------
-        source.faithfulness = await assess_faithfulness(evidence.proposition, source_str)
+        # --- §3.2 Faithfulness ------------------------------------------------------
+        source_str = (source.raw_content or "")[:max_source_content_length]
+        citation.faithfulness = await assess_faithfulness(evidence.proposition, source_str)
 
-        # --- §3.3 Cutoffs --------------------------------------------------------
-        source.temporal_validation = _temporal_validation(source, t_c=t_c, t_f=t_f)
+        # --- §3.3 Cutoffs -----------------------------------------------------------
+        citation.temporal_validation = _temporal_validation(
+            citation.available_since, t_c=t_c, t_f=t_f)
 
     except FATAL_ERRORS:
-        # Nothing is recorded about the source, so a later run evaluates it properly.
+        # Nothing is recorded about the citation, so a later run evaluates it.
         raise
     except Exception as e:
-        logger.warning(f"Filtering source {source.locator} of evidence {evidence.id} "
-                       f"failed: {type(e).__name__}: {e}")
-        source.dismissed_reason = f"{type(e).__name__}: {e}"
-        if source.accessible is None:
-            source.accessible = False
+        logger.warning(f"Judging citation {citation.locator or citation.name} of evidence "
+                       f"{evidence.id} failed: {type(e).__name__}: {e}")
+        citation.error = f"{type(e).__name__}: {e}"
 
     return decide()
 
@@ -278,11 +381,12 @@ def parse_faithfulness_response(output: str) -> tuple[float | None, str | None]:
 # §3.3 Cutoffs and later events
 # ---------------------------------------------------------------------------
 
-def _temporal_validation(source: EvidenceSource, *,
+def _temporal_validation(available_since: datetime | None, *,
                          t_c: datetime | None,
                          t_f: datetime | None) -> TemporalValidation:
-    """Where the source sits relative to the two cutoffs. Pure computation."""
-    before_claim, before_fact_check = compute_temporal_bounds(source.available_since, t_c, t_f)
+    """Where a cited source sits relative to the citing claim's two cutoffs. Pure
+    computation."""
+    before_claim, before_fact_check = compute_temporal_bounds(available_since, t_c, t_f)
     return TemporalValidation(before_fact_check=before_fact_check, before_claim=before_claim)
 
 
@@ -291,14 +395,14 @@ def needs_later_event_check(evidence: Evidence, t_c: datetime | None) -> bool:
 
     Only for evidence that became available *after* the claim: a proposition that
     could already be read at t_c cannot rest on anything that happened afterwards.
-    Items that lost every source are skipped as well - they are out regardless, and
+    Items that lost every citation are skipped as well - they are out regardless, and
     the call would be spent on a decision that no longer matters."""
     if evidence.later_event is not None:
         return False  # already judged
     if evidence.admissible is False:
         return False
     if evidence.deferred:
-        # A source is still waiting out a rate limit, so `t_e` is not final yet.
+        # A cited source is still waiting out a rate limit, so `t_e` is not final yet.
         # The next run asks once the whole set is dated.
         return False
     t_e = to_naive(evidence.available_since)
@@ -314,8 +418,8 @@ async def check_later_event(evidence: Evidence, *,
     pre-existing state or all describe a later change, so asking per source would
     only multiply the cost and the chances of an inconsistent answer.
 
-    The sources are shown with their dates and an excerpt each, sharing the same
-    content budget a single source used to get."""
+    The cited sources are shown with their dates and an excerpt each, sharing the
+    same content budget a single source used to get."""
     model = _resolve_filtering_model()
     prompt = Prompt(
         LATER_EVENT_PROMPT_PATH,
@@ -350,22 +454,25 @@ async def check_later_event(evidence: Evidence, *,
 
 
 def _source_briefs(evidence: Evidence) -> list[dict]:
-    """The item's sources as the prompt renders them: who reported the proposition,
-    when it became available, and an excerpt of what was retrieved.
+    """The item's citations as the prompt renders them: who reported the
+    proposition, when it became available, and an excerpt of what was retrieved.
 
     The excerpts share `max_source_content_length` between them, so an item with
-    five sources costs the same context as one with a single source."""
-    sources = evidence.sources
-    budget = max_source_content_length // max(len(sources), 1)
+    five citations costs the same context as one with a single citation."""
+    citations = evidence.citations
+    budget = max_source_content_length // max(len(citations), 1)
     briefs = []
-    for source in sources:
-        content = (source.raw_content or "").strip()
+    for citation in citations:
+        source = citation.source
+        content = ((source.raw_content if source and not citation.exempt else None)
+                   or "").strip()
+        available_since = citation.available_since
         briefs.append({
-            "name": source.name,
-            "kind": source.kind.value,
-            "locator": source.locator,
-            "available_since": (source.available_since.strftime("%B %d, %Y")
-                                if source.available_since else None),
+            "name": citation.name,
+            "kind": citation.kind.value,
+            "locator": citation.locator,
+            "available_since": (available_since.strftime("%B %d, %Y")
+                                if available_since else None),
             "excerpt": content[:budget],
             "truncated": len(content) > budget,
         })

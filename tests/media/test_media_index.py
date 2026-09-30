@@ -66,7 +66,8 @@ def test_usage_aggregation_filters_by_source():
 
 
 def test_the_used_predicate_covers_every_usage_column():
-    for column in ("claim_ids", "appearance_ids", "article_ids", "evidence_ids"):
+    for column in ("claim_ids", "appearance_ids", "article_ids", "evidence_ids",
+                   "source_ids"):
         assert f"CARDINALITY({column}) > 0" in MEDIA_IS_USED
     assert MEDIA_IS_USED.startswith("(") and MEDIA_IS_USED.endswith(")")
 
@@ -92,3 +93,17 @@ def test_the_migration_only_ever_fills_in_a_missing_embedding():
         "SET embedding = COALESCE(media.embedding, EXCLUDED.embedding);",
     ]
     assert "DROP TABLE" not in source
+
+
+def test_the_index_scans_every_place_gold_evidence_stores_content():
+    """Global sources keep their media in use even when no item cites them any
+    more - they may be cited again - and the legacy per-item table still holds
+    content of its own. The column dropped from `evidence` must not be scanned: a
+    missing column would abort the whole rebuild."""
+    source = inspect.getsource(VeritasDB.rebuild_media_index)
+
+    assert "FROM sources src" in source and "src.raw_content" in source
+    assert "FROM evidence_sources es" in source and "es.raw_content" in source
+    assert "e.proposition" in source
+    assert "source_raw_content" not in source
+    assert '_usage_agg("source")' in source

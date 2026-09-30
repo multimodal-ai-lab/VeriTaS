@@ -141,15 +141,15 @@ async def validate_sufficiency(
         mode: str = None,
         threshold: float = None,
         rationales: Iterable[VerdictRationale] = (),
-        missing_essential: Iterable[Evidence] = (),
+        missing_key: Iterable[Evidence] = (),
 ) -> SufficiencyResult:
     """Predicts a verdict from the evidence and rationale, and compares it to the
     gold verdict.
 
-    `missing_essential` lists the essential items this condition cannot supply. It
-    short-circuits the whole prediction: the rationale is built on those
-    propositions, so a condition without them cannot support it, and asking the
-    ensemble would only measure how well it guesses without them."""
+    `missing_key` lists the key items this condition cannot supply. It
+    short-circuits the whole prediction: the verdict likely breaks without them,
+    so a condition lacking them cannot support it, and asking the ensemble would
+    only measure how well it guesses."""
     if mode is None:
         mode = default_ensemble_mode
     if threshold is None:
@@ -158,7 +158,7 @@ async def validate_sufficiency(
 
     evidence = list(evidence)
     rationales = list(rationales)
-    missing_essential = list(missing_essential)
+    missing_key = list(missing_key)
     result = SufficiencyResult(
         claim_id=claim.id,
         condition=condition,
@@ -169,8 +169,8 @@ async def validate_sufficiency(
         model_specifiers=get_ensemble().model_names,
     )
 
-    if missing_essential:
-        result.error = (f"{len(missing_essential)} essential evidence item(s) are not "
+    if missing_key:
+        result.error = (f"{len(missing_key)} key evidence item(s) are not "
                         f"available in this condition.")
         result.is_close = False
         return result

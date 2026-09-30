@@ -368,9 +368,9 @@ const legendEntry = (colour, label) =>
 
 /* --------------------------------------------------------------- rationale */
 
-/** The reasoning that bridges the evidence and the verdict. Shown next to the
- *  evidence because the roles below are judged against it: an item is essential
- *  exactly when this reasoning breaks without it. */
+/** The reasoning that bridges the claim and its evidence to the verdict. It
+ *  carries reasoning and commonsense knowledge only: no evidence, and no
+ *  reference to any specific evidence item below. */
 function rationalePanel(detail) {
     const rationales = detail.rationales ?? [];
     if (!rationales.length) return el('div');

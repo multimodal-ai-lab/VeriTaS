@@ -37,7 +37,7 @@ def record(sources=None, **overrides) -> dict:
     base = {
         "proposition": "The video was posted on 2 May.",
         "sources": sources if sources is not None else [source_record()],
-        "role": "essential",
+        "role": "key",
         "reasoning": "The fact-check dates the video from this post.",
         "confidence": 0.9,
     }
@@ -123,9 +123,9 @@ def test_valid_record_becomes_evidence():
     assert evidence.claim_id == 1
     assert evidence.review_id == 7
     assert evidence.article_id == 3
-    assert evidence.sources[0].kind is SourceKind.SOCIAL_MEDIA_POST
-    assert evidence.sources[0].proximity is ProximityLevel.PRIMARY
-    assert evidence.role is EvidenceRole.ESSENTIAL
+    assert evidence.citations[0].kind is SourceKind.SOCIAL_MEDIA_POST
+    assert evidence.citations[0].proximity is ProximityLevel.PRIMARY
+    assert evidence.role is EvidenceRole.KEY
     assert evidence.admissible is None  # Stage 2 has not run yet
 
 
@@ -152,7 +152,7 @@ def test_tools_may_be_hosted_by_the_fact_checker():
         article_str=article, excluded_domains={"factchecker.example"},
     )
     assert evidence is not None
-    assert evidence.sources[0].kind is SourceKind.TOOL
+    assert evidence.citations[0].kind is SourceKind.TOOL
 
 
 def test_the_article_url_itself_is_rejected():
@@ -178,7 +178,7 @@ def test_a_source_the_article_never_located_is_still_extracted():
     evidence = build(sources=[source_record(locator="")])
 
     assert evidence is not None
-    assert evidence.sources[0].locator is None
+    assert evidence.citations[0].locator is None
 
 
 @pytest.mark.parametrize("kind", ["offline", "tool"])
@@ -187,9 +187,9 @@ def test_tools_and_offline_evidence_need_no_locator(kind):
     evidence = build(sources=[source_record(locator="", kind=kind,
                                             name="Prof. Meier (phone interview)")])
     assert evidence is not None
-    assert evidence.sources[0].locator is None
-    assert evidence.sources[0].kind is SourceKind(kind)
-    assert evidence.sources[0].name == "Prof. Meier (phone interview)"
+    assert evidence.citations[0].locator is None
+    assert evidence.citations[0].kind is SourceKind(kind)
+    assert evidence.citations[0].name == "Prof. Meier (phone interview)"
 
 
 def test_an_item_without_any_usable_source_is_dropped():
@@ -199,7 +199,7 @@ def test_an_item_without_any_usable_source_is_dropped():
 
 def test_an_unnamed_source_is_labelled_as_such():
     evidence = build(sources=[source_record(locator="", name="")])
-    assert evidence.sources[0].name == "unnamed source"
+    assert evidence.citations[0].name == "unnamed source"
 
 
 def test_a_locator_less_item_still_needs_a_proposition():
@@ -215,7 +215,7 @@ def test_every_source_of_a_proposition_is_kept():
         source_record(locator="https://x.com/someone/status/123"),
         source_record(locator="https://register.example.gov/entry/9", kind="government_record"),
     ])
-    assert [s.locator for s in evidence.sources] == [
+    assert [s.locator for s in evidence.citations] == [
         "https://x.com/someone/status/123", "https://register.example.gov/entry/9"]
 
 
@@ -225,12 +225,12 @@ def test_an_invalid_source_does_not_take_the_item_down():
         source_record(locator="https://register.example.gov/entry/9"),
     ])
     assert evidence is not None
-    assert len(evidence.sources) == 1
+    assert len(evidence.citations) == 1
 
 
 def test_the_same_source_is_not_listed_twice():
     evidence = build(sources=[source_record(), source_record()])
-    assert len(evidence.sources) == 1
+    assert len(evidence.citations) == 1
 
 
 def test_the_flat_single_source_spelling_is_still_accepted():
@@ -239,12 +239,12 @@ def test_the_flat_single_source_spelling_is_still_accepted():
         {"proposition": "The video was posted on 2 May.",
          "source_name": "Someone", "source_kind": "social_media_post",
          "source_locator": "https://x.com/someone/status/123",
-         "source_proximity": "primary", "role": "essential"},
+         "source_proximity": "primary", "role": "key"},
         claim=FakeClaim(), review=FakeReview(), article=FakeArticle(),
         article_str=ARTICLE, excluded_domains=set(),
     )
     assert evidence is not None
-    assert evidence.sources[0].name == "Someone"
+    assert evidence.citations[0].name == "Someone"
 
 
 # --- Value coercion --------------------------------------------------------
@@ -295,25 +295,55 @@ def test_merging_collects_the_sources_of_both_articles():
               proposition="The  video was posted on 2 May.")
     [merged] = deduplicate([a, b])
 
-    assert len(merged.sources) == 2
+    assert len(merged.citations) == 2
 
 
 def test_merging_keeps_the_stricter_role():
     """If one article's rationale leans on the proposition, losing it breaks that
     article's argument - whatever the other article made of it."""
     auxiliary = build(role="auxiliary")
-    essential = build(role="essential",
+    key = build(role="key",
                       sources=[source_record(locator="https://register.example.gov/entry/9")])
-    [merged] = deduplicate([auxiliary, essential])
+    [merged] = deduplicate([auxiliary, key])
 
-    assert merged.role is EvidenceRole.ESSENTIAL
+    assert merged.role is EvidenceRole.KEY
 
 
-def test_deduplication_orders_essential_first():
-    essential = build(role="essential", confidence=0.5)
+def test_items_citing_the_same_url_share_one_source():
+    """Different propositions read off the same page: the page is one source, to be
+    retrieved and dated once, cited twice."""
+    from veritas.gold_evidence.extraction import share_sources
+
+    a = build()
+    b = build(proposition="The video shows a crowd.")
+    assert a.citations[0].source is not b.citations[0].source
+
+    share_sources([a, b])
+    assert a.citations[0].source is b.citations[0].source
+    assert len({id(c.source) for e in (a, b) for c in e.citations}) == 1
+
+
+def test_urls_differing_only_in_host_case_or_trailing_slash_are_one_source():
+    from veritas.gold_evidence.models import locator_key
+
+    assert locator_key("https://X.com/someone/status/123/") == \
+           locator_key("https://x.com/someone/status/123")
+    # Paths are case-sensitive on many platforms (video IDs), so they stay apart.
+    assert locator_key("https://youtu.be/AbC") != locator_key("https://youtu.be/abc")
+
+
+def test_a_source_without_a_locator_becomes_a_citation_without_a_source():
+    evidence = build(sources=[source_record(locator="", kind="offline",
+                                            name="Prof. Meier")])
+    assert evidence.citations[0].source is None
+    assert evidence.citations[0].locator is None
+
+
+def test_deduplication_orders_key_first():
+    key = build(role="key", confidence=0.5)
     background = build(role="background", confidence=0.99, proposition="Something else.")
-    ordered = deduplicate([background, essential])
-    assert [e.role for e in ordered] == [EvidenceRole.ESSENTIAL, EvidenceRole.BACKGROUND]
+    ordered = deduplicate([background, key])
+    assert [e.role for e in ordered] == [EvidenceRole.KEY, EvidenceRole.BACKGROUND]
 
 
 # --- Verdict rationale -----------------------------------------------------

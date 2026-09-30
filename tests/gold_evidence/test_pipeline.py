@@ -13,7 +13,7 @@ from tests.gold_evidence.conftest import (
     make_evidence,
     make_gold_verdict,
     make_rationale,
-    make_source,
+    make_citation,
 )
 from veritas.common import Claim
 from veritas.gold_evidence import (
@@ -27,7 +27,7 @@ from veritas.gold_evidence.admissibility import apply_admissibility_to_item
 from veritas.gold_evidence.extraction import Extraction
 from veritas.gold_evidence.models import EvidenceRole, Faithfulness, TemporalValidation
 from veritas.gold_evidence.pipeline import (
-    REJECT_ESSENTIAL_EVIDENCE_LOST,
+    REJECT_KEY_EVIDENCE_LOST,
     REJECT_INSUFFICIENT_EVIDENCE,
     REJECT_NO_CLAIM_TIME,
     REJECT_NO_FACT_CHECK_TIME,
@@ -79,7 +79,7 @@ def wired(monkeypatch):
         "close": {CONDITION_CLAIM: True, CONDITION_FACT_CHECK: True},
         "sufficiency_calls": [],
         "rationales_seen": [],
-        "missing_essential_seen": [],
+        "missing_key_seen": [],
         "t_c": datetime(2024, 5, 1),
         "t_f": datetime(2024, 5, 21),
     }
@@ -98,26 +98,26 @@ def wired(monkeypatch):
         return Extraction(evidence=list(state["extracted"]),
                           rationales=list(state["rationales"]))
 
-    async def fake_filter(claim, evidence):
+    async def fake_filter(claim, evidence, **kwargs):
         """Stands in for Stage 2: marks every source accessible, faithful and
         in-time unless the test already set those fields itself."""
         for item in evidence:
-            for source in item.sources:
-                if source.accessible is None:
-                    source.accessible = True
-                if source.faithfulness is None:
-                    source.faithfulness = Faithfulness(assessment=1.0)
-                if source.temporal_validation is None:
-                    source.temporal_validation = TemporalValidation(
+            for citation in item.citations:
+                if citation.source.accessible is None:
+                    citation.source.accessible = True
+                if citation.faithfulness is None:
+                    citation.faithfulness = Faithfulness(assessment=1.0)
+                if citation.temporal_validation is None:
+                    citation.temporal_validation = TemporalValidation(
                         before_fact_check=True, before_claim=True)
             apply_admissibility_to_item(item, undated_policy="permissive")
         return [item for item in evidence if item.admissible]
 
     async def fake_validate(claim, evidence, gold, *, condition, mode, threshold,
-                            rationales=(), missing_essential=()):
+                            rationales=(), missing_key=()):
         state["sufficiency_calls"].append((condition, len(list(evidence))))
         state["rationales_seen"].append(len(list(rationales)))
-        state["missing_essential_seen"].append(len(list(missing_essential)))
+        state["missing_key_seen"].append(len(list(missing_key)))
         return SufficiencyResult(
             claim_id=claim.id, condition=condition, ensemble_mode=mode,
             n_evidence=len(list(evidence)), threshold=threshold,
@@ -169,13 +169,13 @@ async def test_e_claim_is_never_larger_than_e_factcheck(wired, monkeypatch):
         make_evidence(proposition=f"p{i}", decided=False) for i in range(3)
     ]
 
-    async def fake_filter(claim, evidence):
+    async def fake_filter(claim, evidence, **kwargs):
         """Stage 2 marking the third item as post-claim but pre-fact-check."""
         for i, item in enumerate(evidence):
-            for source in item.sources:
-                source.accessible = True
-                source.faithfulness = Faithfulness(assessment=1.0)
-                source.temporal_validation = TemporalValidation(
+            for citation in item.citations:
+                citation.source.accessible = True
+                citation.faithfulness = Faithfulness(assessment=1.0)
+                citation.temporal_validation = TemporalValidation(
                     before_fact_check=True, before_claim=(i < 2))
             apply_admissibility_to_item(item, undated_policy="permissive")
         return evidence
@@ -242,39 +242,39 @@ async def test_an_empty_evidence_set_is_analyzed_when_a_rationale_carries_it(wir
 
 
 @pytest.mark.asyncio
-async def test_rejected_when_an_essential_group_loses_every_member(wired, monkeypatch):
+async def test_rejected_when_an_key_item_loses_every_source(wired, monkeypatch):
     wired["extracted"] = [make_evidence(decided=False)]
     wired["rationales"] = [make_rationale()]
 
-    async def fake_filter(claim, evidence):
+    async def fake_filter(claim, evidence, **kwargs):
         for item in evidence:
-            for source in item.sources:
-                source.accessible = False
+            for citation in item.citations:
+                citation.source.accessible = False
             apply_admissibility_to_item(item)
         return []
 
     monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
     outcome = await reconstruct_claim(make_claim())
     assert outcome.status == STATUS_REJECTED
-    assert outcome.reason == REJECT_ESSENTIAL_EVIDENCE_LOST
-    assert outcome.n_essential_lost == 1
+    assert outcome.reason == REJECT_KEY_EVIDENCE_LOST
+    assert outcome.n_key_lost == 1
     assert wired["sufficiency_calls"] == []  # no ensemble calls were wasted
 
 
 @pytest.mark.asyncio
-async def test_redundant_essential_evidence_keeps_the_instance(wired, monkeypatch):
+async def test_redundant_key_evidence_keeps_the_instance(wired, monkeypatch):
     """One source of the proposition survives, so the argument still holds."""
-    wired["extracted"] = [make_evidence(decided=False, sources=[
-        make_source(locator="https://a/1", filtered=False),
-        make_source(locator="https://a/2", filtered=False),
+    wired["extracted"] = [make_evidence(decided=False, citations=[
+        make_citation(locator="https://a/1", filtered=False),
+        make_citation(locator="https://a/2", filtered=False),
     ])]
 
-    async def fake_filter(claim, evidence):
+    async def fake_filter(claim, evidence, **kwargs):
         for item in evidence:
-            for index, source in enumerate(item.sources):
-                source.accessible = index > 0  # the first source is gone
-                source.faithfulness = Faithfulness(assessment=1.0)
-                source.temporal_validation = TemporalValidation(
+            for index, citation in enumerate(item.citations):
+                citation.source.accessible = index > 0  # the first source is gone
+                citation.faithfulness = Faithfulness(assessment=1.0)
+                citation.temporal_validation = TemporalValidation(
                     before_fact_check=True, before_claim=True)
             apply_admissibility_to_item(item)
         return [item for item in evidence if item.admissible]
@@ -283,8 +283,8 @@ async def test_redundant_essential_evidence_keeps_the_instance(wired, monkeypatc
     outcome = await reconstruct_claim(make_claim())
 
     assert outcome.status == STATUS_ACCEPTED
-    assert outcome.n_essential == 1
-    assert outcome.n_essential_lost == 0
+    assert outcome.n_key == 1
+    assert outcome.n_key_lost == 0
     assert outcome.n_admissible == 1
 
 
@@ -292,10 +292,10 @@ async def test_redundant_essential_evidence_keeps_the_instance(wired, monkeypatc
 async def test_losing_auxiliary_evidence_is_not_a_rejection(wired, monkeypatch):
     wired["extracted"] = [make_evidence(role=EvidenceRole.AUXILIARY, decided=False)]
 
-    async def fake_filter(claim, evidence):
+    async def fake_filter(claim, evidence, **kwargs):
         for item in evidence:
-            for source in item.sources:
-                source.accessible = False
+            for citation in item.citations:
+                citation.source.accessible = False
             apply_admissibility_to_item(item)
         return []
 
@@ -304,6 +304,85 @@ async def test_losing_auxiliary_evidence_is_not_a_rejection(wired, monkeypatch):
 
     assert outcome.status == STATUS_ACCEPTED
     assert outcome.n_admissible == 0
+
+
+def _lose(*propositions):
+    """A Stage 2 stand-in under which the named items lose every source."""
+    async def fake_filter(claim, evidence, **kwargs):
+        for item in evidence:
+            for citation in item.citations:
+                citation.source.accessible = item.proposition not in propositions
+                citation.faithfulness = Faithfulness(assessment=1.0)
+                citation.temporal_validation = TemporalValidation(
+                    before_fact_check=True, before_claim=True)
+            apply_admissibility_to_item(item)
+        return [item for item in evidence if item.admissible]
+    return fake_filter
+
+
+@pytest.mark.asyncio
+async def test_losing_one_of_two_redundant_items_keeps_the_instance(wired, monkeypatch):
+    """Each item proves the point on its own, so neither is key: losing one
+    goes to the ensemble instead of rejecting the instance."""
+    wired["extracted"] = [
+        make_evidence(proposition="p1", role=EvidenceRole.AUXILIARY, decided=False),
+        make_evidence(proposition="p2", role=EvidenceRole.AUXILIARY, decided=False),
+    ]
+    wired["rationales"] = [make_rationale()]
+    monkeypatch.setattr(pipeline_module, "filter_evidence", _lose("p1"))
+    outcome = await reconstruct_claim(make_claim())
+
+    assert outcome.status == STATUS_ACCEPTED
+    assert outcome.n_key == 0
+    assert outcome.n_admissible == 1
+    assert dict(wired["sufficiency_calls"])[CONDITION_FACT_CHECK] == 1
+    assert wired["missing_key_seen"] == [0, 0]
+
+
+@pytest.mark.asyncio
+async def test_losing_every_redundant_item_is_left_to_the_ensemble(wired, monkeypatch):
+    """No gate knows that p1 and p2 were alternatives; the ensemble judges what is
+    left, and rejects the instance for insufficiency rather than for a lost item."""
+    wired["extracted"] = [
+        make_evidence(proposition="p1", role=EvidenceRole.AUXILIARY, decided=False),
+        make_evidence(proposition="p2", role=EvidenceRole.AUXILIARY, decided=False),
+    ]
+    wired["rationales"] = [make_rationale()]
+    wired["close"] = {CONDITION_CLAIM: False, CONDITION_FACT_CHECK: False}
+    monkeypatch.setattr(pipeline_module, "filter_evidence", _lose("p1", "p2"))
+    outcome = await reconstruct_claim(make_claim())
+
+    assert outcome.status == STATUS_REJECTED
+    assert outcome.reason == REJECT_INSUFFICIENT_EVIDENCE
+    assert len(wired["sufficiency_calls"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_redundant_window_item_does_not_short_circuit_e_claim(wired, monkeypatch):
+    """p2 only appeared after the claim, but p1 predates it and proves the same
+    point: E_c goes to the ensemble rather than being recorded as insufficient."""
+    wired["extracted"] = [
+        make_evidence(proposition="p1", role=EvidenceRole.AUXILIARY, decided=False),
+        make_evidence(proposition="p2", role=EvidenceRole.AUXILIARY, decided=False),
+    ]
+
+    async def fake_filter(claim, evidence, **kwargs):
+        for item in evidence:
+            for citation in item.citations:
+                citation.source.accessible = True
+                citation.faithfulness = Faithfulness(assessment=1.0)
+                citation.temporal_validation = TemporalValidation(
+                    before_fact_check=True, before_claim=item.proposition == "p1")
+            apply_admissibility_to_item(item, undated_policy="permissive")
+        return evidence
+
+    monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
+    await reconstruct_claim(make_claim())
+
+    sizes = dict(wired["sufficiency_calls"])
+    assert sizes[CONDITION_CLAIM] == 1
+    assert sizes[CONDITION_FACT_CHECK] == 2
+    assert wired["missing_key_seen"] == [0, 0]
 
 
 @pytest.mark.asyncio
@@ -389,3 +468,69 @@ def test_summarize_counts_statuses_and_reasons():
     assert summary["rejection_reasons"] == {REJECT_INSUFFICIENT_EVIDENCE: 1}
     assert summary["n_candidates"] == 8
     assert summary["n_admissible"] == 6
+
+
+# --- Shared sources ----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_citation_gone_stale_is_filtered_again(wired, monkeypatch):
+    """Another claim re-retrieved the shared source after this claim's citation was
+    judged: the stored judgement rests on content that is no longer the stored one."""
+    item = make_evidence()
+    citation = item.citations[0]
+    citation.source.accessed_at = citation.judged_at.replace(year=citation.judged_at.year + 1)
+    wired["db"].evidence = [item]
+
+    seen = []
+
+    async def fake_filter(claim, evidence, **kwargs):
+        seen.append([e.proposition for e in evidence])
+        for e in evidence:
+            apply_admissibility_to_item(e)
+        return evidence
+
+    monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
+    await reconstruct_claim(make_claim())
+    assert seen == [[item.proposition]]
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_item_is_not_filtered_again(wired, monkeypatch):
+    wired["db"].evidence = [make_evidence()]
+    seen = []
+
+    async def fake_filter(claim, evidence, **kwargs):
+        seen.append(evidence)
+        return evidence
+
+    monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
+    await reconstruct_claim(make_claim())
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_re_retrieve_refilters_and_is_passed_on(wired, monkeypatch):
+    wired["db"].evidence = [make_evidence()]
+    seen = []
+
+    async def fake_filter(claim, evidence, **kwargs):
+        seen.append(kwargs)
+        return evidence
+
+    monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
+    await reconstruct_claim(make_claim(), re_retrieve=True)
+    assert seen == [{"re_retrieve": True, "re_judge": False}]
+
+
+@pytest.mark.asyncio
+async def test_evidence_stored_in_the_legacy_format_is_re_extracted(wired):
+    """Items from before the Source/Citation split load without citations. Filtering
+    them would reject the claim for sources it still has, so it is re-extracted."""
+    from veritas.gold_evidence.models import Evidence
+
+    wired["db"].evidence = [Evidence(claim_id=1, proposition="Stored before the split.")]
+    wired["extracted"] = [make_evidence(decided=False)]
+    outcome = await reconstruct_claim(make_claim())
+
+    assert wired["extract_calls"] == [{"replace": True}]
+    assert outcome.status == STATUS_ACCEPTED

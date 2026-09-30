@@ -11,6 +11,7 @@ from veritas.common.publisher import Publisher
 from veritas.common.verdict import Verdict
 from veritas.db.base import Database
 from veritas.util import get_domain
+from veritas.util.url import ARCHIVE_TODAY_URL_SQL_PATTERN
 from veritas.util.util import hash_int32
 
 #: Matches an ezMM item reference such as `<image:42>` inside stored text. The ID
@@ -20,7 +21,8 @@ MEDIA_REF_PATTERN = r"<(image|video|audio):([0-9]{1,9})>"
 
 #: SQL predicate on `media`: the medium occurs at least once somewhere in VeriTaS.
 MEDIA_IS_USED = ("(CARDINALITY(claim_ids) > 0 OR CARDINALITY(appearance_ids) > 0 "
-                 "OR CARDINALITY(article_ids) > 0 OR CARDINALITY(evidence_ids) > 0)")
+                 "OR CARDINALITY(article_ids) > 0 OR CARDINALITY(evidence_ids) > 0 "
+                 "OR CARDINALITY(source_ids) > 0)")
 
 
 def _usage_agg(source: str) -> str:
@@ -270,6 +272,11 @@ class VeritasDB(Database):
             ALTER TABLE media ADD COLUMN IF NOT EXISTS appearance_ids INTEGER[] NOT NULL DEFAULT '{}';
             ALTER TABLE media ADD COLUMN IF NOT EXISTS article_ids    INTEGER[] NOT NULL DEFAULT '{}';
             ALTER TABLE media ADD COLUMN IF NOT EXISTS evidence_ids   INTEGER[] NOT NULL DEFAULT '{}';
+            -- Global gold-evidence sources (`sources`). Kept apart from
+            -- `evidence_ids`: a source outlives the items citing it and may be
+            -- cited again later, so its media are in use whether or not an item
+            -- currently cites it.
+            ALTER TABLE media ADD COLUMN IF NOT EXISTS source_ids     INTEGER[] NOT NULL DEFAULT '{}';
             ALTER TABLE media ADD COLUMN IF NOT EXISTS indexed_at     TIMESTAMP;
 
             CREATE INDEX IF NOT EXISTS media_kind_idx ON media (kind);
@@ -281,6 +288,8 @@ class VeritasDB(Database):
                 ON media USING GIN (article_ids);
             CREATE INDEX IF NOT EXISTS media_evidence_ids_idx
                 ON media USING GIN (evidence_ids);
+            CREATE INDEX IF NOT EXISTS media_source_ids_idx
+                ON media USING GIN (source_ids);
 
             DO
             $$
@@ -344,9 +353,9 @@ class VeritasDB(Database):
         )
 
         # Reconstructed gold evidence. `evidence` is the aggregation layer - one
-        # proposition and the role it plays - while `evidence_sources` holds the
-        # places that proposition can be read and everything Stage 2 decides about
-        # them. An item survives as long as one of its sources does.
+        # proposition and the role it plays. `evidence_sources` is the per-item
+        # table of sources this used to be paired with; it is superseded by the
+        # global `sources` and the `citations` relating them (created below).
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS evidence
@@ -479,6 +488,113 @@ class VeritasDB(Database):
 
             -- A compatibility view from the transition to `evidence_sources`.
             DROP VIEW IF EXISTS evidence_sources_view;
+            """
+        )
+
+        # Sources are global: one row per URL, however many evidence items of
+        # however many claims cite it, so that retrieval and dating happen once per
+        # URL. `citations` relates an evidence item to a source and holds what
+        # depends on both. `evidence_sources` above is the per-item predecessor of
+        # the two; it is kept as it is and no longer read or written.
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS sources
+            (
+                id               SERIAL PRIMARY KEY,
+                locator          TEXT NOT NULL,
+                -- SHA-1 of the normalized locator (`models.locator_key`); a 32-bit
+                -- hash would collide across a table of this scope.
+                locator_key      TEXT NOT NULL,
+                raw_content      TEXT,
+                available_since  TIMESTAMP,
+                dating_method    TEXT,
+                retrieval_method TEXT,
+                accessed_at      TIMESTAMP,
+                accessible       BOOLEAN,
+                is_fact_check    BOOLEAN,
+                retrieval_error  TEXT,
+                deferred_until   TIMESTAMP,
+                -- Everything except `raw_content`, which is stored once above.
+                full_source      JSONB,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_source_locator UNIQUE (locator_key)
+            );
+            CREATE INDEX IF NOT EXISTS sources_deferred_until_idx
+                ON sources (deferred_until);
+            CREATE INDEX IF NOT EXISTS sources_available_since_idx
+                ON sources (available_since);
+
+            CREATE TABLE IF NOT EXISTS citations
+            (
+                id                         SERIAL PRIMARY KEY,
+                evidence_id                INT  NOT NULL REFERENCES evidence (id) ON DELETE CASCADE,
+                claim_id                   INT  NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                -- NULL for a source the article never located (a tool without a
+                -- page, an interview, an unlinked citation).
+                source_id                  INT REFERENCES sources (id),
+                -- Identifies the citation within its item: the source's locator key,
+                -- or kind and name for a citation without a source.
+                citation_key               TEXT NOT NULL,
+                name                       TEXT,
+                kind                       TEXT,
+                proximity                  TEXT,
+                -- t_e of a tool or offline citation, which has no source to date.
+                date_as_cited              TIMESTAMP,
+                faithfulness_assessment    FLOAT,
+                faithfulness_reasoning     TEXT,
+                faithfulness_justification TEXT,
+                before_fact_check          BOOLEAN,
+                before_claim               BOOLEAN,
+                admissible                 BOOLEAN,
+                inadmissibility_reason     TEXT,
+                judged_at                  TIMESTAMP,
+                error                      TEXT,
+                full_citation              JSONB,
+                created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_citation UNIQUE (evidence_id, citation_key)
+            );
+            CREATE INDEX IF NOT EXISTS citations_evidence_idx ON citations (evidence_id);
+            CREATE INDEX IF NOT EXISTS citations_claim_idx ON citations (claim_id);
+            CREATE INDEX IF NOT EXISTS citations_source_idx ON citations (source_id);
+            CREATE INDEX IF NOT EXISTS citations_admissible_idx
+                ON citations (claim_id, admissible);
+
+            -- One flat row per citation with the columns `evidence_sources` had, for
+            -- read-only consumers (the web UI). Tools and offline citations are
+            -- never retrieved, so the state of a page they link is not theirs.
+            DROP VIEW IF EXISTS citation_rows;
+            CREATE VIEW citation_rows AS
+            SELECT c.id,
+                   c.evidence_id,
+                   c.claim_id,
+                   c.source_id,
+                   c.name,
+                   c.kind,
+                   s.locator,
+                   c.proximity,
+                   s.raw_content,
+                   CASE WHEN c.kind IN ('tool', 'offline') THEN c.date_as_cited
+                        ELSE s.available_since END              AS available_since,
+                   s.accessed_at,
+                   CASE WHEN c.kind IN ('tool', 'offline') THEN NULL
+                        ELSE s.accessible END                   AS accessible,
+                   c.faithfulness_assessment,
+                   c.faithfulness_reasoning,
+                   c.faithfulness_justification,
+                   c.before_fact_check,
+                   c.before_claim,
+                   c.admissible,
+                   c.inadmissibility_reason,
+                   s.deferred_until,
+                   COALESCE(c.error, s.retrieval_error)          AS dismissed_reason,
+                   COALESCE(s.full_source, '{}'::jsonb)
+                       || COALESCE(c.full_citation, '{}'::jsonb) AS full_source,
+                   c.created_at,
+                   c.updated_at
+            FROM citations c
+                     LEFT JOIN sources s ON s.id = c.source_id;
             """
         )
 
@@ -1066,10 +1182,10 @@ class VeritasDB(Database):
     # ------------------------------------------------------------------
 
     async def insert_evidence(self, evidence: "Evidence") -> int:
-        """Adds a reconstructed evidence item and its sources, and returns its ID.
+        """Adds a reconstructed evidence item and its citations, and returns its ID.
 
         One item per claim and proposition: a second extraction of the same
-        proposition updates the stored item and contributes its sources to it,
+        proposition updates the stored item and contributes its citations to it,
         which is how redundancy across two fact-checking articles is collected."""
         columns, values = _evidence_columns(evidence)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
@@ -1083,53 +1199,61 @@ class VeritasDB(Database):
                 RETURNING id;
                 """
         evidence_id = await self._fetchval(query, *values)
-        await self._save_evidence_sources(evidence, evidence_id)
+        await self._save_citations(evidence, evidence_id)
         return evidence_id
 
     async def update_evidence(self, evidence: "Evidence") -> None:
-        """Updates an existing evidence item and its sources."""
+        """Updates an existing evidence item and its citations."""
         assert evidence.id is not None, "Evidence must have an ID."
         columns, values = _evidence_columns(evidence)
         assignments = ", ".join(f"{c} = ${i + 1}" for i, c in enumerate(columns))
         query = (f"UPDATE evidence SET {assignments}, updated_at = CURRENT_TIMESTAMP "
                  f"WHERE id = ${len(values) + 1};")
         await self._execute(query, *values, evidence.id)
-        await self._save_evidence_sources(evidence, evidence.id)
+        await self._save_citations(evidence, evidence.id)
 
-    async def _save_evidence_sources(self, evidence: "Evidence", evidence_id: int) -> None:
-        """Writes the item's sources and removes the ones it no longer carries.
+    async def _save_citations(self, evidence: "Evidence", evidence_id: int) -> None:
+        """Writes the item's citations and removes the ones it no longer carries.
 
-        Sources are upserted rather than replaced, so their IDs - and with them any
-        link the UI holds - survive a re-filtering. One transaction, so an item is
-        never left with a half-written set of sources."""
-        keys = [_source_key_hash(source) for source in evidence.sources]
+        A cited source that has no ID yet is registered first (`_register_source`),
+        which never overwrites the state of a source another claim already stored:
+        sources are written by Stage 2 alone, through `update_source`. Citations are
+        upserted rather than replaced, so their IDs - and with them any link the UI
+        holds - survive a re-filtering. One transaction, so an item is never left
+        with a half-written set of citations."""
         async with self._transaction() as conn:
-            for source, key in zip(evidence.sources, keys):
-                source.evidence_id = evidence_id
-                columns, values = _source_columns(source, evidence_id, evidence.claim_id)
+            keys = []
+            for citation in evidence.citations:
+                source = citation.source
+                if source is not None and source.id is None:
+                    source.id = await self._register_source(source, conn)
+                citation.source_id = source.id if source is not None else None
+                citation.evidence_id = evidence_id
+                keys.append(citation.key)
+                columns, values = _citation_columns(citation, evidence_id, evidence.claim_id)
                 placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
                 updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns
-                                    if c not in ("evidence_id", "source_key_hash"))
-                source.id = await conn.fetchval(
+                                    if c not in ("evidence_id", "citation_key"))
+                citation.id = await conn.fetchval(
                     f"""
-                    INSERT INTO evidence_sources ({", ".join(columns)})
+                    INSERT INTO citations ({", ".join(columns)})
                     VALUES ({placeholders})
-                    ON CONFLICT ON CONSTRAINT unique_evidence_source DO UPDATE
+                    ON CONFLICT ON CONSTRAINT unique_citation DO UPDATE
                         SET {updates}, updated_at = CURRENT_TIMESTAMP
                     RETURNING id;
                     """,
                     *values)
             await conn.execute(
-                "DELETE FROM evidence_sources "
-                # An empty key list deletes every source, which is what an item
+                # An empty key list deletes every citation, which is what an item
                 # that lost all of them should end up with.
-                "WHERE evidence_id = $1 AND NOT (source_key_hash = ANY($2::INT[]));",
+                "DELETE FROM citations WHERE evidence_id = $1 "
+                "AND NOT (citation_key = ANY($2::TEXT[]));",
                 evidence_id, keys)
 
     async def get_evidence_by_id(self, evidence_id: int) -> "Evidence | None":
         row = await self._fetchrow("SELECT id, full_evidence FROM evidence WHERE id = $1", evidence_id)
         if row:
-            items = await self._attach_sources([row_to_evidence(row)])
+            items = await self._attach_citations([row_to_evidence(row)])
             return items[0]
 
     async def get_evidence_for_claim(self, claim_id: int,
@@ -1140,7 +1264,7 @@ class VeritasDB(Database):
             query += " AND admissible IS TRUE"
         query += " ORDER BY id;"
         rows = await self._fetch(query, claim_id)
-        return await self._attach_sources([row_to_evidence(row) for row in rows])
+        return await self._attach_citations([row_to_evidence(row) for row in rows])
 
     async def get_evidence_for_claims(self, claim_ids: list[int]) -> dict[int, list["Evidence"]]:
         """Bulk variant of `get_evidence_for_claim` for the analysis scripts."""
@@ -1151,27 +1275,115 @@ class VeritasDB(Database):
             claim_ids,
         )
         result: dict[int, list] = {claim_id: [] for claim_id in claim_ids}
-        items = await self._attach_sources([row_to_evidence(row) for row in rows])
+        items = await self._attach_citations([row_to_evidence(row) for row in rows])
         for row, item in zip(rows, items):
             result[row["claim_id"]].append(item)
         return result
 
-    async def _attach_sources(self, evidence: list["Evidence"]) -> list["Evidence"]:
-        """Loads the sources of the given items. They live in their own table, so
-        that Stage 2 can decide each of them separately and the UI can query them."""
+    async def _attach_citations(self, evidence: list["Evidence"]) -> list["Evidence"]:
+        """Loads the citations of the given items together with the sources they
+        cite. Citations of the same source share one `Source` instance, so that
+        Stage 2 retrieves it once and every citing item sees the outcome."""
         ids = [item.id for item in evidence if item.id is not None]
         if not ids:
             return evidence
         rows = await self._fetch(
-            "SELECT id, evidence_id, full_source FROM evidence_sources "
+            "SELECT id, evidence_id, source_id, full_citation FROM citations "
             "WHERE evidence_id = ANY($1) ORDER BY id;",
             ids)
+        sources = await self.get_sources_by_ids(
+            list({row["source_id"] for row in rows if row["source_id"] is not None}))
         by_evidence: dict[int, list] = {}
         for row in rows:
-            by_evidence.setdefault(row["evidence_id"], []).append(row_to_evidence_source(row))
+            citation = row_to_citation(row)
+            citation.source = sources.get(row["source_id"])
+            by_evidence.setdefault(row["evidence_id"], []).append(citation)
         for item in evidence:
-            item.sources = by_evidence.get(item.id, [])
+            item.citations = by_evidence.get(item.id, [])
         return evidence
+
+    # -- Sources --------------------------------------------------------------
+
+    async def _register_source(self, source: "Source", conn=None) -> int:
+        """Returns the ID of the stored source with the same locator, inserting this
+        one if there is none. An existing row is left exactly as it is: it may carry
+        another claim's retrieval, which this (unretrieved) instance must not
+        overwrite. Callers adopt the stored state through `get_source`."""
+        columns, values = _source_columns(source)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(values)))
+        query = f"""
+                INSERT INTO sources ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT ON CONSTRAINT unique_source_locator
+                    DO UPDATE SET locator_key = EXCLUDED.locator_key
+                RETURNING id;
+                """
+        if conn is not None:
+            return await conn.fetchval(query, *values)
+        return await self._fetchval(query, *values)
+
+    async def update_source(self, source: "Source") -> None:
+        """Stores what Stage 2 established about a source. Registers it first if it
+        has no ID yet."""
+        if source.id is None:
+            source.id = await self._register_source(source)
+        # The key identifies the row and never changes.
+        pairs = [(c, v) for c, v in zip(*_source_columns(source)) if c != "locator_key"]
+        assignments = ", ".join(f"{c} = ${i + 1}" for i, (c, _) in enumerate(pairs))
+        values = [v for _, v in pairs]
+        query = (f"UPDATE sources SET {assignments}, updated_at = CURRENT_TIMESTAMP "
+                 f"WHERE id = ${len(values) + 1};")
+        await self._execute(query, *values, source.id)
+
+    async def get_source(self, source_id: int) -> "Source | None":
+        sources = await self.get_sources_by_ids([source_id])
+        return sources.get(source_id)
+
+    async def get_sources_by_ids(self, source_ids: list[int]) -> dict[int, "Source"]:
+        if not source_ids:
+            return {}
+        rows = await self._fetch(
+            "SELECT id, raw_content, full_source FROM sources WHERE id = ANY($1);",
+            source_ids)
+        return {row["id"]: row_to_source(row) for row in rows}
+
+    async def get_source_by_locator(self, locator: str) -> "Source | None":
+        from veritas.gold_evidence.models import locator_key
+
+        row = await self._fetchrow(
+            "SELECT id, raw_content, full_source FROM sources WHERE locator_key = $1;",
+            locator_key(locator))
+        return row_to_source(row) if row else None
+
+    async def get_deferred_archive_today_sources(self) -> list["Source"]:
+        """Sources still deferred behind Archive.today's access check. See
+        `get_reviews_with_deferred_archive_today_appearances`."""
+        rows = await self._fetch(
+            """
+            SELECT id, raw_content, full_source
+            FROM sources
+            WHERE deferred_until IS NOT NULL
+              AND deferred_until > CURRENT_TIMESTAMP
+              AND locator ~* $1;
+            """,
+            ARCHIVE_TODAY_URL_SQL_PATTERN,
+        )
+        return [row_to_source(row) for row in rows]
+
+    async def get_claim_ids_citing_sources(self, source_ids: list[int]) -> list[int]:
+        """The claims with an evidence item citing any of the given sources."""
+        if not source_ids:
+            return []
+        rows = await self._fetch(
+            "SELECT DISTINCT claim_id FROM citations WHERE source_id = ANY($1);",
+            source_ids)
+        return [row["claim_id"] for row in rows]
+
+    async def get_claim_ids_with_deferred_archive_today_sources(self) -> list[int]:
+        """Claim IDs citing a source still deferred behind Archive.today's access
+        check."""
+        sources = await self.get_deferred_archive_today_sources()
+        return await self.get_claim_ids_citing_sources([s.id for s in sources])
 
     async def delete_evidence_for_claim(self, claim_id: int) -> int:
         """Removes all reconstructed evidence of a claim and returns how many rows
@@ -1407,11 +1619,16 @@ class VeritasDB(Database):
 
     async def insert(self, instance: VeritasBaseModel) -> int:
         """Inserts any (compatible) object into the database and returns the assigned ID."""
-        from veritas.gold_evidence.models import Evidence, VerdictRationale
+        from veritas.gold_evidence.models import Evidence, Source, VerdictRationale
 
         match instance:
             case Evidence():
                 return await self.insert_evidence(instance)
+            case Source():
+                source_id = await self._register_source(instance)
+                instance.id = source_id
+                await self.update_source(instance)
+                return source_id
             case VerdictRationale():
                 return await self.insert_verdict_rationale(instance)
             case Review():
@@ -1431,12 +1648,14 @@ class VeritasDB(Database):
 
     async def update(self, instance: VeritasBaseModel):
         """Updates any (compatible) object into the database."""
-        from veritas.gold_evidence.models import Evidence, VerdictRationale
+        from veritas.gold_evidence.models import Evidence, Source, VerdictRationale
 
         assert instance.id is not None, "Object must have an ID."
         match instance:
             case Evidence():
                 return await self.update_evidence(instance)
+            case Source():
+                return await self.update_source(instance)
             case VerdictRationale():
                 return await self.update_verdict_rationale(instance)
             case Review():
@@ -1576,6 +1795,23 @@ class VeritasDB(Database):
 
         rows = await self._fetch(query, stage, language, limit, dismissed, start_date, end_date)
 
+        return [Review.model_validate(dict(row)) for row in rows]
+
+    async def get_reviews_with_deferred_archive_today_appearances(self) -> list[Review]:
+        """Reviews with a still-deferred appearance pointing at Archive.today.
+
+        Candidates for `scripts/retry_deferred_archive_today.py`: once a human
+        has passed the access check (`scrapemm.configure_archive_today_session`),
+        these can be retried right away instead of waiting out their cooldown."""
+        query = """
+                SELECT DISTINCT r.*
+                FROM reviews r
+                         JOIN appearances a ON a.id = ANY(r.appearance_ids)
+                WHERE a.deferred_until IS NOT NULL
+                  AND a.deferred_until > CURRENT_TIMESTAMP
+                  AND (a.url ~* $1 OR a.archive_url ~* $1);
+                """
+        rows = await self._fetch(query, ARCHIVE_TODAY_URL_SQL_PATTERN)
         return [Review.model_validate(dict(row)) for row in rows]
 
     async def get_reviews_by_publisher_id(self, publisher_id: int) -> list[Review]:
@@ -1719,8 +1955,43 @@ class VeritasDB(Database):
                 row["archived_scraped_content"] = None
             return Appearance.model_validate(row)
 
+    async def get_appearances_missing_original_url(self) -> list[Appearance]:
+        """Appearances that only have an Archive.today snapshot and whose original
+        URL could not be resolved yet. Candidates for
+        `scripts/resolve_archive_today_original_urls.py`."""
+        query = """
+                SELECT * FROM appearances
+                WHERE url IS NULL
+                  AND archive_url IS NOT NULL
+                  AND archive_url ~* $1;
+                """
+        rows = await self._fetch(query, ARCHIVE_TODAY_URL_SQL_PATTERN)
+        appearances = []
+        for row in rows:
+            row = dict(row)
+            try:
+                if "original_scraped_content" in row:
+                    row["original_scraped_content"] = (
+                        MultimodalSequence(row["original_scraped_content"]) if row["original_scraped_content"] else None
+                    )
+                if "archived_scraped_content" in row:
+                    row["archived_scraped_content"] = (
+                        MultimodalSequence(row["archived_scraped_content"]) if row["archived_scraped_content"] else None
+                    )
+            except ValueError as e:
+                logger.warning(
+                    f"Broken reference in appearance {row.get('id')} scraped_content columns: {e}")
+                row["original_scraped_content"] = None
+                row["archived_scraped_content"] = None
+            appearances.append(Appearance.model_validate(row))
+        return appearances
+
     async def replace_appearance(self, to_replace_id: int, replacement_id: int):
-        """Replaces the appearance (ID to_replace_id) with the appearance (ID replacement_id)."""
+        """Replaces the appearance (ID to_replace_id) with the appearance (ID
+        replacement_id): repoints every review/claim referencing the old ID to the
+        new one and removes the now-superseded old row, so that the caller's own
+        (pending) write to `replacement_id` no longer collides with it on a unique
+        constraint (`url`/`archive_url`)."""
         if to_replace_id == replacement_id:
             return
 
@@ -1771,6 +2042,10 @@ class VeritasDB(Database):
             to_replace_id,
             replacement_id,
         )
+
+        # 5) The old row is now unreferenced; remove it so its `url`/`archive_url`
+        # no longer blocks the replacement row from taking that value.
+        await self._execute("DELETE FROM appearances WHERE id = $1;", to_replace_id)
 
     async def get_claim_by_id(self, claim_id: int) -> Claim | None:
         """Retrieve a claim by ID."""
@@ -2000,8 +2275,9 @@ class VeritasDB(Database):
         occur in VeriTaS, and returns the number of media that are in use.
 
         Scanned are `claims.data`, both scraped contents of an appearance, an
-        article's raw page and extracted content, and the gold evidence's raw
-        source content.
+        article's raw page and extracted content, the gold evidence's propositions,
+        the content of the (global) sources it cites, and the content stored in the
+        legacy per-item `evidence_sources` table.
 
         The scan runs entirely inside PostgreSQL, so none of the (potentially
         huge) scraped content ever has to cross the wire - but it does read every
@@ -2015,6 +2291,7 @@ class VeritasDB(Database):
                           appearance_ids = '{}',
                           article_ids    = '{}',
                           evidence_ids   = '{}',
+                          source_ids     = '{}',
                           indexed_at     = CURRENT_TIMESTAMP;
                       """
 
@@ -2037,7 +2314,13 @@ class VeritasDB(Database):
                 FROM articles ar, LATERAL regexp_matches(ar.extracted_article, $1, 'g') AS m(ref)
                 UNION ALL
                 SELECT 'evidence', e.id, ref[1], ref[2]::INTEGER
-                FROM evidence e, LATERAL regexp_matches(e.source_raw_content, $1, 'g') AS m(ref)
+                FROM evidence e, LATERAL regexp_matches(e.proposition, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'evidence', es.evidence_id, ref[1], ref[2]::INTEGER
+                FROM evidence_sources es, LATERAL regexp_matches(es.raw_content, $1, 'g') AS m(ref)
+                UNION ALL
+                SELECT 'source', src.id, ref[1], ref[2]::INTEGER
+                FROM sources src, LATERAL regexp_matches(src.raw_content, $1, 'g') AS m(ref)
             ),
                  aggregated AS (
                      SELECT kind,
@@ -2045,20 +2328,22 @@ class VeritasDB(Database):
                             {_usage_agg("claim")}      AS claim_ids,
                             {_usage_agg("appearance")} AS appearance_ids,
                             {_usage_agg("article")}    AS article_ids,
-                            {_usage_agg("evidence")}   AS evidence_ids
+                            {_usage_agg("evidence")}   AS evidence_ids,
+                            {_usage_agg("source")}     AS source_ids
                      FROM refs
                      GROUP BY kind, media_id
                  )
             INSERT INTO media (kind, media_id, claim_ids, appearance_ids, article_ids,
-                               evidence_ids, indexed_at)
+                               evidence_ids, source_ids, indexed_at)
             SELECT kind, media_id, claim_ids, appearance_ids, article_ids, evidence_ids,
-                   CURRENT_TIMESTAMP
+                   source_ids, CURRENT_TIMESTAMP
             FROM aggregated
             ON CONFLICT (kind, media_id) DO UPDATE
             SET claim_ids      = EXCLUDED.claim_ids,
                 appearance_ids = EXCLUDED.appearance_ids,
                 article_ids    = EXCLUDED.article_ids,
                 evidence_ids   = EXCLUDED.evidence_ids,
+                source_ids     = EXCLUDED.source_ids,
                 indexed_at     = EXCLUDED.indexed_at;
             """
 
@@ -2093,7 +2378,7 @@ class VeritasDB(Database):
 
     async def get_media_index_stats(self) -> dict:
         """Counts describing the media index: media per kind, and how many
-        claims, appearances, articles and evidence items refer to media."""
+        claims, appearances, articles, evidence items and sources refer to media."""
         per_kind_query = f"""
             SELECT kind,
                    COUNT(*)                                                AS n_media,
@@ -2102,6 +2387,7 @@ class VeritasDB(Database):
                    COUNT(*) FILTER (WHERE CARDINALITY(appearance_ids) > 0) AS n_in_appearances,
                    COUNT(*) FILTER (WHERE CARDINALITY(article_ids) > 0)    AS n_in_articles,
                    COUNT(*) FILTER (WHERE CARDINALITY(evidence_ids) > 0)   AS n_in_evidence,
+                   COUNT(*) FILTER (WHERE CARDINALITY(source_ids) > 0)     AS n_in_sources,
                    COUNT(*) FILTER (WHERE embedding IS NOT NULL)           AS n_with_embedding
             FROM media
             GROUP BY kind
@@ -2111,7 +2397,8 @@ class VeritasDB(Database):
             SELECT (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(claim_ids) FROM media) t)      AS n_claims,
                    (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(appearance_ids) FROM media) t) AS n_appearances,
                    (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(article_ids) FROM media) t)    AS n_articles,
-                   (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(evidence_ids) FROM media) t)   AS n_evidence;
+                   (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(evidence_ids) FROM media) t)   AS n_evidence,
+                   (SELECT COUNT(*) FROM (SELECT DISTINCT UNNEST(source_ids) FROM media) t)     AS n_sources;
             """
         per_kind = [dict(row) for row in await self._fetch(per_kind_query)]
         sources = dict(await self._fetchrow(sources_query))
@@ -2128,45 +2415,69 @@ database, user, password, host, port = database.values()
 db = VeritasDB(database=database, user=user, password=password, host=host, port=port)
 
 
-def row_to_evidence_source(row):
-    """Reconstructs an EvidenceSource from its JSONB round-trip blob."""
-    from veritas.gold_evidence.models import EvidenceSource
+def row_to_source(row):
+    """Reconstructs a Source from its JSONB blob and the content column."""
+    from veritas.gold_evidence.models import Source
 
     row = dict(row)
-    source = EvidenceSource.model_validate(row["full_source"])
+    source = Source.model_validate(row["full_source"])
+    source.raw_content = row.get("raw_content")
     if row.get("id") is not None:
         source.id = row["id"]
-    if row.get("evidence_id") is not None:
-        source.evidence_id = row["evidence_id"]
     return source
 
 
-def _source_key_hash(source) -> int:
-    """Identifies a source within its evidence item. Falls back to the name for
-    sources that have no locator (a tool without a page, an interview), so that the
-    uniqueness constraint covers those too."""
-    return hash_int32((source.locator or source.name or "").strip().lower())
+def row_to_citation(row):
+    """Reconstructs a Citation from its JSONB round-trip blob. The cited source is
+    attached by `_attach_citations`."""
+    from veritas.gold_evidence.models import Citation
+
+    row = dict(row)
+    citation = Citation.model_validate(row["full_citation"])
+    if row.get("id") is not None:
+        citation.id = row["id"]
+    if row.get("evidence_id") is not None:
+        citation.evidence_id = row["evidence_id"]
+    citation.source_id = row.get("source_id")
+    return citation
 
 
-def _source_columns(source, evidence_id: int, claim_id: int) -> tuple[list[str], list]:
-    """Flattens an EvidenceSource into (column names, values) for SQL.
+def _source_columns(source) -> tuple[list[str], list]:
+    """Flattens a Source into (column names, values) for SQL.
 
     The flat columns exist for querying and aggregation; `full_source` is the
-    authoritative round-trip representation (same pattern as `verdicts`)."""
-    faithfulness = source.faithfulness
-    temporal = source.temporal_validation
+    authoritative round-trip representation. The content is stored only once, in
+    its own column, since it is the bulk of the row."""
+    data = {
+        "locator": source.locator,
+        "locator_key": source.key,
+        "raw_content": source.raw_content,
+        "available_since": source.available_since,
+        "dating_method": source.dating_method,
+        "retrieval_method": source.retrieval_method,
+        "accessed_at": source.accessed_at,
+        "accessible": source.accessible,
+        "is_fact_check": source.is_fact_check,
+        "retrieval_error": source.retrieval_error,
+        "deferred_until": source.deferred_until,
+        "full_source": to_jsonb(source.model_dump(mode="json", exclude={"raw_content"})),
+    }
+    return list(data.keys()), list(data.values())
+
+
+def _citation_columns(citation, evidence_id: int, claim_id: int) -> tuple[list[str], list]:
+    """Flattens a Citation into (column names, values) for SQL."""
+    faithfulness = citation.faithfulness
+    temporal = citation.temporal_validation
     data = {
         "evidence_id": evidence_id,
         "claim_id": claim_id,
-        "name": source.name,
-        "kind": source.kind.value,
-        "locator": source.locator,
-        "source_key_hash": _source_key_hash(source),
-        "proximity": source.proximity.value,
-        "raw_content": source.raw_content,
-        "available_since": source.available_since,
-        "accessed_at": source.accessed_at,
-        "accessible": source.accessible,
+        "source_id": citation.source.id if citation.source is not None else None,
+        "citation_key": citation.key,
+        "name": citation.name,
+        "kind": citation.kind.value,
+        "proximity": citation.proximity.value,
+        "date_as_cited": citation.date_as_cited,
         "faithfulness_assessment": faithfulness.assessment if faithfulness else None,
         # `reasoning` is the provider's reasoning trace, `justification` the
         # short reason the model was asked to state.
@@ -2174,11 +2485,11 @@ def _source_columns(source, evidence_id: int, claim_id: int) -> tuple[list[str],
         "faithfulness_justification": faithfulness.justification if faithfulness else None,
         "before_fact_check": temporal.before_fact_check if temporal else None,
         "before_claim": temporal.before_claim if temporal else None,
-        "admissible": source.admissible,
-        "inadmissibility_reason": source.inadmissibility_reason,
-        "deferred_until": source.deferred_until,
-        "dismissed_reason": source.dismissed_reason,
-        "full_source": to_jsonb(source),
+        "admissible": citation.admissible,
+        "inadmissibility_reason": citation.inadmissibility_reason,
+        "judged_at": citation.judged_at,
+        "error": citation.error,
+        "full_citation": to_jsonb(citation),
     }
     return list(data.keys()), list(data.values())
 
@@ -2186,9 +2497,10 @@ def _source_columns(source, evidence_id: int, claim_id: int) -> tuple[list[str],
 def _evidence_columns(evidence) -> tuple[list[str], list]:
     """Flattens an Evidence item into (column names, values) for SQL.
 
-    The sources are written separately into `evidence_sources` and are therefore
-    excluded from `full_evidence`: keeping a second copy of every scraped source
-    inside the item's blob would duplicate the bulk of the table."""
+    The citations are written separately into `citations` (and the sources they
+    cite into `sources`), and are therefore excluded from `full_evidence`: keeping a
+    second copy of every scraped source inside the item's blob would duplicate the
+    bulk of the table."""
     later_event = evidence.later_event
     data = {
         "claim_id": evidence.claim_id,
@@ -2207,12 +2519,13 @@ def _evidence_columns(evidence) -> tuple[list[str], list]:
         "later_event_reasoning": later_event.reasoning if later_event else None,
         "later_event_justification": later_event.justification if later_event else None,
         "later_event_rater": later_event.rater if later_event else None,
-        "n_sources": len(evidence.sources),
-        "n_admissible_sources": len(evidence.admissible_sources),
+        # Counts of citations; the column names predate the Source/Citation split.
+        "n_sources": len(evidence.citations),
+        "n_admissible_sources": len(evidence.admissible_citations),
         "available_since": evidence.available_since,
         "dismissed": evidence.dismissed,
         "dismissed_reason": evidence.dismissed_reason,
-        "full_evidence": to_jsonb(evidence.model_dump(mode="json", exclude={"sources"})),
+        "full_evidence": to_jsonb(evidence.model_dump(mode="json")),
     }
     return list(data.keys()), list(data.values())
 
@@ -2241,13 +2554,13 @@ def row_to_verdict(row) -> Verdict:
 def row_to_evidence(row):
     """Reconstructs an Evidence object from its JSONB round-trip blob.
 
-    The returned item has no sources yet - they live in `evidence_sources` and are
-    attached by `_attach_sources`."""
+    The returned item has no citations yet - they live in `citations` and are
+    attached by `_attach_citations`."""
     from veritas.gold_evidence.models import Evidence
 
     row = dict(row)
     evidence = Evidence.model_validate(row["full_evidence"])
-    evidence.sources = []
+    evidence.citations = []
     if row.get("id") is not None:
         evidence.id = row["id"]
     return evidence

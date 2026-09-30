@@ -20,7 +20,7 @@ INSTANCE_REASON_ORDER = (
     "no_claim_time",
     "no_fact_check_time",
     "nothing_extracted",
-    "essential_evidence_lost",
+    "key_evidence_lost",
     "sufficiency_validation_failed",
     "insufficient_evidence",
 )

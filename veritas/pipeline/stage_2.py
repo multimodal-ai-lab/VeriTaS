@@ -3,10 +3,11 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 from scrapemm import retrieve
+from scrapemm.common.exceptions import ServerError
 
 from veritas.common import Prompt, Publisher, Review, SignatoryStatus
 from veritas import logger
-from veritas.models import gpt_cheap
+from veritas.models import QuotaExceededError, gpt_cheap
 from veritas.db import db
 from veritas.pipeline.util.signatories import save_publisher
 from veritas.pipeline.util.stage import Stage
@@ -60,6 +61,11 @@ async def identify_publishers(reviews: list[Review]):
                     assert publisher, "Unable to register publisher."
                 review.publisher_id = publisher.id
                 await review.save_to_db()
+            except QuotaExceededError:
+                # Run-level condition (e.g. scrapeMM unreachable): nothing was
+                # decided about this review, so leave it untouched for a later run
+                # instead of recording a false "could not identify publisher".
+                raise
             except Exception as e:
                 await review.dismiss(f"Could not identify publisher: {e}")
 
@@ -83,7 +89,13 @@ async def register_new_publisher(domain: str, name: Optional[str] = None) -> Opt
     # Read the publisher's homepage
     try:
         response = await retrieve(f"https://{domain}", show_progress=False)
-        scraped = response.content
+        scraped = response.content.multimodal if response.content else None
+    except ServerError as e:
+        # Run-level condition: every remaining publisher lookup would fail the
+        # same way, so this aborts the run instead of registering a publisher
+        # with no language/country because its homepage merely couldn't be
+        # reached right now.
+        raise QuotaExceededError(f"scrapeMM server unreachable: {e}") from e
     except Exception:
         scraped = None
 

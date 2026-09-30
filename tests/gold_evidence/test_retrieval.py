@@ -250,3 +250,99 @@ async def test_scrapemm_quota_aborts_the_run(scrapemm):
     scrapemm["response"] = failed_response(ScrapeQuota("no credits left"))
     with pytest.raises(QuotaExceededError):
         await retrieve_source("https://example.org/a")
+
+
+# --- Archive.today's access check -------------------------------------------
+
+@pytest.mark.asyncio
+async def test_archive_today_gate_is_reported_and_not_retried(scrapemm):
+    """A source gated behind Archive.today's access check is deferrable, not
+    inaccessible - like a rate limit, but resolved only once a human passes the
+    check (see `scripts/retry_deferred_archive_today.py`)."""
+    from scrapemm.common.exceptions import CaptchaEncounteredError
+
+    scrapemm["response"] = failed_response(CaptchaEncounteredError("captcha"),
+                                           url="https://archive.ph/abcde")
+    result = await retrieve_source("https://archive.ph/abcde")
+
+    assert result.accessible is False
+    assert result.gated is True
+    assert result.rate_limited is False
+    assert len(scrapemm["calls"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_captcha_on_a_non_archive_today_domain_is_not_deferred(scrapemm):
+    """Only Archive.today's access check is deferred: it is the one gate
+    scrapeMM buffers and later answers from a persistent cache. A CAPTCHA
+    anywhere else is recorded as a plain, permanent failure, as before."""
+    from scrapemm.common.exceptions import CaptchaEncounteredError
+
+    scrapemm["response"] = failed_response(CaptchaEncounteredError("captcha"),
+                                           url="https://example.org/gated")
+    result = await retrieve_source("https://example.org/gated")
+
+    assert result.accessible is False
+    assert result.gated is False
+
+
+@pytest.mark.asyncio
+async def test_raised_archive_today_captcha_is_caught(scrapemm, monkeypatch):
+    from scrapemm.common.exceptions import CaptchaEncounteredError
+
+    async def raising(*a, **k):
+        raise CaptchaEncounteredError("captcha")
+
+    monkeypatch.setattr(retrieval_module, "retrieve", raising)
+    result = await retrieve_source("https://archive.ph/abcde")
+    assert result.gated is True
+
+
+@pytest.mark.asyncio
+async def test_raised_captcha_on_another_domain_is_not_gated(scrapemm, monkeypatch):
+    from scrapemm.common.exceptions import CaptchaEncounteredError
+
+    async def raising(*a, **k):
+        raise CaptchaEncounteredError("captcha")
+
+    monkeypatch.setattr(retrieval_module, "retrieve", raising)
+    result = await retrieve_source("https://example.org/gated")
+    assert result.gated is False
+
+
+# --- An unreachable scrapeMM server aborts the run, like an exhausted quota ----
+
+@pytest.mark.asyncio
+async def test_raised_server_error_aborts_the_run(scrapemm, monkeypatch):
+    """Total unreachability is always raised directly out of `retrieve()`
+    (never placed in `response.errors`), so this is the path that matters."""
+    from scrapemm.common.exceptions import ServerError
+
+    from veritas.models import QuotaExceededError
+
+    async def raising(*a, **k):
+        raise ServerError("Could not reach the scrapeMM server at http://localhost:8080: timeout")
+
+    monkeypatch.setattr(retrieval_module, "retrieve", raising)
+    with pytest.raises(QuotaExceededError):
+        await retrieve_source("https://example.org/a")
+
+
+@pytest.mark.asyncio
+async def test_server_error_in_response_errors_also_aborts_the_run(scrapemm):
+    """The narrower case where the server reports a missing result mid-stream
+    rather than failing the whole call - still a run-level condition.
+
+    This also regression-tests a bug `test_scrapemm_quota_aborts_the_run`
+    happened not to catch: `_failed()` raises `veritas.models.QuotaExceededError`
+    directly (not scrapeMM's own exception class), and `retrieve_source`'s
+    `except Exception` clause used to catch it right back and record it as a
+    plain per-source failure instead of letting it propagate - see the
+    `except QuotaExceededError: raise` clause above the others."""
+    from scrapemm.common.exceptions import ServerError
+
+    from veritas.models import QuotaExceededError
+
+    scrapemm["response"] = failed_response(ServerError("The server did not return a result for this URL."))
+    with pytest.raises(QuotaExceededError):
+        await retrieve_source("https://example.org/a")

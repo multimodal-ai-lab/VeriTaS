@@ -31,7 +31,7 @@ def make_row(**overrides) -> dict:
         "source_proximity": "secondary",
         "source_domain": "reuters.com",
         "available_since": datetime(2024, 3, 5),
-        "role": "essential",
+        "role": "key",
         "accessed_at": datetime(2024, 6, 1),
         "extraction_confidence": 0.82,
         "accessible": True,

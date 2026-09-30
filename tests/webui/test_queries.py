@@ -61,6 +61,27 @@ def test_placeholders_are_numbered_consecutively():
         assert f"${index}" in where
 
 
+def test_the_reason_filter_also_matches_the_legacy_name():
+    where, args = build_claim_filters(reason="key_evidence_lost")
+    assert "c.gold_evidence_reason = ANY ($1::text[])" in where
+    assert args == [["key_evidence_lost", "essential_evidence_lost"]]
+
+
+def test_other_reasons_are_filtered_as_is():
+    where, args = build_claim_filters(reason="insufficient_evidence")
+    assert "c.gold_evidence_reason = ANY ($1::text[])" in where
+    assert args == [["insufficient_evidence"]]
+
+
+def test_reason_expr_reads_the_legacy_reason_under_the_current_name():
+    from webui.queries import CLAIM_REASON_SQL, reason_expr
+
+    assert reason_expr("c") == ("(CASE c.gold_evidence_reason "
+                                "WHEN 'essential_evidence_lost' THEN 'key_evidence_lost' "
+                                "ELSE c.gold_evidence_reason END)")
+    assert reason_expr("") in CLAIM_REASON_SQL
+
+
 def test_boolean_filters_use_fixed_fragments():
     where, args = build_claim_filters(released=True, media="none")
     assert "(c.released_quarter OR c.released_longitudinal)" in where

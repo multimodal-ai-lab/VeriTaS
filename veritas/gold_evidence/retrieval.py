@@ -17,9 +17,17 @@ API integration (social media, archiving services, video platforms) are retrieve
 like any other. Those carry no HTML page, so they are dated in step 3.
 
 A source that merely rate-limited us is *not* inaccessible: the retrieval reports
-``rate_limited`` and the caller defers that source (see `filtering.filter_source`).
+``rate_limited`` and the caller defers that source (see `filtering.settle_source`).
+Likewise, a source gated behind Archive.today's access check reports ``gated``
+and is deferred the same way - scrapeMM does not solve the CAPTCHA, but it
+buffers the URL and answers it from a persistent cache once a human passes the
+check, so retrying later (here, or on demand via
+`scripts/retry_deferred_archive_today.py`) succeeds without a second retrieval.
 An exhausted scrapeMM quota is a run-level condition and is raised as VeriTaS'
-``QuotaExceededError``.
+``QuotaExceededError`` - and so is a scrapeMM server that cannot be reached at
+all (``ServerError``): every remaining source would fail the exact same way, so
+this aborts the run instead of recording each one as a false "inaccessible"
+verdict for what the outage merely prevented from being checked.
 """
 
 from __future__ import annotations
@@ -31,8 +39,9 @@ from datetime import datetime
 from ezmm import MultimodalSequence
 from scrapemm import RateLimitError as ScrapeRateLimitError, retrieve
 from scrapemm.common import ScrapingResponse
+from scrapemm.common.exceptions import CaptchaEncounteredError
 from scrapemm.common.exceptions import QuotaExceededError as ScrapeQuotaExceededError
-from scrapemm.util import preprocess_url
+from scrapemm.common.exceptions import ServerError as ScrapeServerError
 
 from veritas.common import Prompt
 from veritas.common.appearance import is_sufficient_content
@@ -47,6 +56,7 @@ from veritas.gold_evidence.models import to_naive
 from veritas.models import QuotaExceededError
 from veritas.pipeline.stage_3 import extract_date_meta
 from veritas.util.parsing import determine_date
+from veritas.util.url import is_archive_today_url, preprocess_url
 
 logger = logging.getLogger("VeriTaS")
 
@@ -70,6 +80,9 @@ class SourceRetrieval:
     method: str | None = None
     error: str | None = None
     rate_limited: bool = False
+    #: Archive.today's access check is up; deferred like a rate limit (see
+    #: module docstring). Never set for a CAPTCHA on any other domain.
+    gated: bool = False
 
 
 async def retrieve_source(locator: str, determine_time: bool = True) -> SourceRetrieval:
@@ -81,13 +94,27 @@ async def retrieve_source(locator: str, determine_time: bool = True) -> SourceRe
 
     try:
         result = await _retrieve(url)
+    except QuotaExceededError:
+        # Raised by `_failed()` below when scrapeMM reported the fatal condition
+        # inside `response.errors` rather than by raising it directly - let it
+        # propagate exactly like the two clauses below, instead of falling into
+        # the generic `except Exception` and being recorded as a per-source
+        # failure.
+        raise
     except ScrapeRateLimitError as e:
         # Per-source condition: the item is deferred, not judged.
         return SourceRetrieval(accessible=False, error=str(e), rate_limited=True)
+    except CaptchaEncounteredError as e:
+        # Only Archive.today's access check is deferred (see module docstring);
+        # a CAPTCHA on any other domain is a plain, permanent failure.
+        return SourceRetrieval(accessible=False, error=str(e), gated=is_archive_today_url(url))
     except ScrapeQuotaExceededError as e:
         # Run-level condition: continuing would silently mark every remaining
         # source inaccessible, so it aborts the run like any other quota error.
         raise QuotaExceededError(f"scrapeMM quota exhausted: {e}") from e
+    except ScrapeServerError as e:
+        # Same reasoning: the server is unreachable, not this one source.
+        raise QuotaExceededError(f"scrapeMM server unreachable: {e}") from e
     except Exception as e:
         logger.debug(f"Retrieval of evidence source {url} failed: {type(e).__name__}: {e}")
         return SourceRetrieval(accessible=False, error=f"{type(e).__name__}: {e}")
@@ -140,14 +167,18 @@ def _failed(response: ScrapingResponse) -> SourceRetrieval:
     an exhausted quota is recognized here too and aborts the run either way."""
     error = None
     rate_limited = False
+    gated = False
     if response.errors:
         first = list(response.errors.values())[0]
         if isinstance(first, ScrapeQuotaExceededError):
             raise QuotaExceededError(f"scrapeMM quota exhausted: {first}")
+        if isinstance(first, ScrapeServerError):
+            raise QuotaExceededError(f"scrapeMM server unreachable: {first}")
         error = str(first) or type(first).__name__
         rate_limited = isinstance(first, ScrapeRateLimitError)
+        gated = isinstance(first, CaptchaEncounteredError) and is_archive_today_url(response.url)
     return SourceRetrieval(accessible=False, method=response.method,
-                           error=error, rate_limited=rate_limited)
+                           error=error, rate_limited=rate_limited, gated=gated)
 
 
 def _date_from_meta(html: str | None) -> datetime | None:

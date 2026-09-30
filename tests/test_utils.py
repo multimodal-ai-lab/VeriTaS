@@ -100,35 +100,17 @@ async def test_resolve_archive_url_long_format(input, target):
     assert result == target
 
 
-# Test for Archive Today short format URLs (requires network access and Decodo Advanced plan)
-# @pytest.mark.parametrize(
-#     "input,target",
-#     [
-#         ("https://archive.ph/nLdE3", "https://x.com/DerPhysiker21/status/1916960065073873035"),
-#         (
-#                 "https://archive.ph/zuhsW",
-#                 "https://www.facebook.com/themalaengtad/posts/pfbid0261K9XKx9sUbebr9BHkV8FSpXWRmkA5iLpK7ZirJomwsLz49jzDJKFMcUJASXrAarl"
-#         ),
-#         (
-#                 "https://archive.md/Pl8lU",
-#                 "https://twitter.com/mjavinod/status/1468050808281309188"
-#         ),
-#         (
-#                 "https://archive.ph/F4GGE",
-#                 "https://twitter.com/markiank/status/1704958766230159720"
-#         )
-#     ],
-# )
-# @pytest.mark.asyncio
-# async def test_resolve_archive_today_short_format(input, target):
-#     """Test resolving Archive Today short code format URLs.
-#     This test requires network access and Decodo Advanced plan subscription.
-#     Example: https://archive.ph/nLdE3 should resolve to the original URL.
-#     """
-#     result = await resolve_archiving_url(input)
-#     if result:
-#         result = result.get("original_url")
-#     assert result == target
+# Archive Today short-code URLs (https://archive.ph/nLdE3) cannot be resolved to
+# their original URL anymore: this used to go through scrapeMM's
+# `identify_snapshot()`, an ungated lookup via Archive.today's own metadata
+# endpoints, but scrapeMM's client/server split moved that lookup server-side
+# without exposing an equivalent over the client's HTTP API. Only the long form,
+# which embeds the original URL in the path itself, can still be resolved - see
+# `test_resolve_archive_url_long_format` above.
+@pytest.mark.asyncio
+async def test_resolve_archive_today_short_format_is_unresolvable():
+    result = await resolve_archiving_url("https://archive.ph/nLdE3")
+    assert result is None or result.get("original_url") is None
 
 
 @pytest.mark.parametrize(

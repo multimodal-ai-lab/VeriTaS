@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 import matplotlib.pyplot as plt
 
+from scripts.stats.quarters.archiving import plot_archiving_services
 from scripts.stats.quarters.authenticity import plot_authenticity
 from scripts.stats.quarters.appearances import plot_appearance_retrieval
 from scripts.stats.quarters.claims import plot_claim_integrity, plot_claim_languages, plot_claim_publishers
@@ -55,19 +56,23 @@ async def main_async(
     retrieval_figs = await plot_appearance_retrieval(start_d, end_d, q_keys, mode=mode)
     figs.extend(retrieval_figs)
 
-    # 4) Authenticity
+    # 4) Archiving Services
+    archiving_figs = await plot_archiving_services(start_d, end_d, q_keys, mode=mode)
+    figs.extend(archiving_figs)
+
+    # 5) Authenticity
     auth_figs = await plot_authenticity(start_d, end_d, q_keys, mode=mode)
     figs.extend(auth_figs)
 
-    # 5) Claims Integrity
+    # 6) Claims Integrity
     claim_figs = await plot_claim_integrity(start_d, end_d, q_keys, mode=mode)
     figs.extend(claim_figs)
 
-    # 6) Claim Languages
+    # 7) Claim Languages
     lang_figs = await plot_claim_languages(start_d, end_d, q_keys, top_languages, mode=mode)
     figs.extend(lang_figs)
 
-    # 7) Claim Publishers
+    # 8) Claim Publishers
     pub_figs = await plot_claim_publishers(start_d, end_d, q_keys, top_publishers, mode=mode)
     figs.extend(pub_figs)
 
@@ -87,7 +92,7 @@ if __name__ == "__main__":
     asyncio.run(
         main_async(
             start="2020-01-01",
-            end="2026-06-30",
+            end="2026-09-30",
             top_languages=9,
             top_publishers=9,
             save="plots/",

@@ -37,7 +37,7 @@ def make_row(**overrides) -> dict:
         "source_proximity": "secondary",
         "source_raw_content": "Report text with <video:8>.",
         "available_since": datetime(2024, 3, 5),
-        "role": "essential",
+        "role": "key",
         "accessed_at": datetime(2024, 6, 1),
         "extraction_reasoning": "Stated in the second paragraph.",
         "extraction_confidence": 0.82,
@@ -65,7 +65,7 @@ def make_row(**overrides) -> dict:
         },
         "full_evidence": {
             "proposition": "The bridge collapsed <image:5> on 3 March.",
-            "role": "essential",
+            "role": "key",
         },
     }
     row.update(overrides)
@@ -80,7 +80,7 @@ def make_item(**overrides) -> dict:
         "review_id": 7,
         "article_id": 9,
         "proposition": "The bridge collapsed <image:5> on 3 March.",
-        "role": "essential",
+        "role": "key",
         "extraction_reasoning": "Stated in the second paragraph.",
         "extraction_confidence": 0.82,
         "admissible": True,
@@ -167,7 +167,7 @@ def test_source_payload_carries_the_item_it_belongs_to():
     """A source is only interpretable together with the proposition it reports."""
     payload = evidence_source_payload(make_row(), FakeRegistry())
     assert payload["proposition"]["is_multimodal"] is True
-    assert payload["role"] == "essential"
+    assert payload["role"] == "key"
     assert payload["evidence_admissible"] is True
     assert payload["n_sources"] == 2
 
@@ -202,7 +202,7 @@ def test_item_payload_without_sources():
 
 def timeline_item(item_id: int, *sources: dict) -> dict:
     """An evidence item whose sources carry the dates the timeline plots."""
-    return {"id": item_id, "admissible": True, "role": "essential", "sources": list(sources)}
+    return {"id": item_id, "admissible": True, "role": "key", "sources": list(sources)}
 
 
 def timeline_source(source_id: int, available_since, **overrides) -> dict:

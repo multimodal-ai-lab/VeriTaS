@@ -116,13 +116,19 @@ export const STATUS_STYLE = {
     rejected: { tone: 'bad', icon: 'fa-circle-xmark' },
     filtered: { tone: 'info', icon: 'fa-filter' },
     extracted: { tone: 'violet', icon: 'fa-wand-magic-sparkles' },
-    pending: { tone: 'warn', icon: 'fa-hourglass-half' },
+    deferred: { tone: 'warn', icon: 'fa-clock' },
+    pending: { tone: 'plain', icon: 'fa-hourglass-half' },
 };
 
+/** Tone, icon and definition per evidence role. The definitions mirror the
+ *  extraction prompt; the `title` becomes the badge's tooltip. */
 export const ROLE_STYLE = {
-    essential: { tone: 'accent', icon: 'fa-star' },
-    auxiliary: { tone: 'info', icon: 'fa-star-half-stroke' },
-    background: { tone: 'plain', icon: 'fa-layer-group' },
+    key: { tone: 'accent', icon: 'fa-star',
+        title: 'Establishes a central factual premise underlying the gold verdict. Removing it likely breaks the verdict.' },
+    auxiliary: { tone: 'info', icon: 'fa-star-half-stroke',
+        title: 'Corroborates, qualifies, or strengthens the main justification without being its principal evidential basis. Removing it would not break the verdict.' },
+    background: { tone: 'plain', icon: 'fa-layer-group',
+        title: 'Context for understanding the claim or its circumstances, without directly contributing to the justification of the gold verdict.' },
 };
 
 export const PROXIMITY_STYLE = {
@@ -199,7 +205,7 @@ export const REASON_HELP = {
     no_claim_time: 'The claim has no date t_c.',
     no_fact_check_time: 'No review provides a publication time t_f.',
     nothing_extracted: 'Stage 1 returned neither evidence nor a verdict rationale.',
-    essential_evidence_lost: 'An essential evidence item lost every one of its sources in Stage 2.',
+    key_evidence_lost: 'A key evidence item (one without which the verdict likely breaks) lost every one of its sources in Stage 2.',
     sufficiency_validation_failed: 'The ensemble did not return a usable verdict.',
     insufficient_evidence: 'The predicted verdict was not close enough to the gold verdict.',
 };

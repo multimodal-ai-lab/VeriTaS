@@ -32,7 +32,7 @@ import asyncio
 import json
 from datetime import datetime
 
-from veritas import globals, logger
+from veritas import globals, log_to_console, logger
 from veritas.db import db
 from veritas.gold_evidence import (
     RESUMABLE_STATUSES,
@@ -63,6 +63,8 @@ include_unreleased: bool = bool(_get("include_unreleased", False))
 redo: bool = bool(_get("redo", False))
 re_extract: bool = bool(_get("re_extract", False))
 re_filter: bool = bool(_get("re_filter", False))
+#: Fetch the cited sources anew instead of reusing the stored (global) retrieval.
+re_retrieve: bool = bool(_get("re_retrieve", False))
 dry_run: bool = bool(_get("dry_run", False))
 log_level: str = _get("log_level", "INFO")
 
@@ -77,7 +79,7 @@ def date_range() -> tuple[datetime | None, datetime | None]:
 
 
 async def main() -> None:
-    logger.setLevel(log_level)
+    log_to_console(log_level)
     await db.connect_maybe_initialize(max_connections=4)
 
     start_date, end_date = date_range()
@@ -120,6 +122,7 @@ async def main() -> None:
                 threshold=proximity_threshold,
                 re_extract=re_extract,
                 re_filter=re_filter,
+                re_retrieve=re_retrieve,
             )
             all_outcomes.extend(outcomes)
             processed += len(claims)

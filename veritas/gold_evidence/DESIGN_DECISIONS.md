@@ -12,19 +12,45 @@ Notation: `t_c` = claim release time, `t_f` = fact-check publication time,
 
 ## 1. Evidence unit and representation
 
-**Decision.** An evidence item is one *atomic factual proposition*, together with
-**every source that reports it**, represented natively as an
-`ezMM.MultimodalSequence` with images, video and audio inline. Each source carries
-its name, a type from a closed vocabulary, a stable locator, a proximity level, the
-content as re-scraped at analysis time — and everything Stage 2 decides about it.
+**Decision.** An evidence item is one *atomic factual proposition*, represented
+natively as an `ezMM.MultimodalSequence` with images, video and audio inline,
+together with a **citation of every source that reports it**. Three records, each
+holding what depends on it alone:
 
-**Why the split.** Every filtering question is about a source (can it still be
-retrieved, when did it become available, does it still say this?), while the
-proposition and its probative role are properties of the evidence. Putting the
-source-level state on the item forced one item per source, which made a fact-check's
-redundant citations look like independent single points of failure. With sources as
-their own records, the item is the aggregation layer: it survives as long as one of
-its sources does.
+- a **source** is a publication identified by its URL — its content as re-scraped
+  at analysis time, its publication time, whether it can still be retrieved and
+  whether it is a professional fact-check;
+- a **citation** relates an item to a source — the source's name and type (from a
+  closed vocabulary) as the article cites it, its proximity to the proposition,
+  whether it still supports the proposition, and where it sits relative to the
+  citing claim's cutoffs;
+- the **item** holds the proposition, its probative role and the later-event
+  judgement.
+
+**Why the split.** Every filtering question is about either the page (can it still
+be retrieved, when did it become available?) or the page *as cited for a
+proposition* (does it still say this?), while the proposition and its role are
+properties of the evidence. Putting the source-level state on the item forced one
+item per source, which made a fact-check's redundant citations look like
+independent single points of failure. With citations as their own records, the item
+is the aggregation layer: it survives as long as one of its citations does.
+
+**Why sources are global.** Fact-checks cite the same page for several propositions,
+and different claims — a rectified claim and its original in particular — cite the
+same pages. Stored per citation, one URL was retrieved and dated as often as it was
+cited, and could come out accessible for one item and inaccessible for another, or
+dated differently by the model fallback (§10). Nothing about retrieval or dating
+depends on the citing claim, so a source is stored once per URL and every citation
+shares the outcome. The cutoffs *do* depend on the claim (`t_c`, `t_f`) and are
+therefore computed per citation; so is faithfulness, which is relative to the
+proposition.
+
+**Write-once.** Other claims' decisions rest on what was stored about a source, so
+a retrieved source is never refetched implicitly: a re-filtering re-judges the
+citations against the stored content. An explicit re-retrieval replaces it, and
+every citation judged before the new retrieval then counts as stale and is judged
+again when its claim is next processed. Concurrent claims citing one URL retrieve it
+once: its stored state is re-read under a per-URL lock before any retrieval.
 
 **Rationale.** Separating the proposition from the source lets faithfulness be
 tested (does the source still support the proposition?) independently of
@@ -32,10 +58,12 @@ availability (can the source still be reached?) and of timing (when did it becom
 available?). Bundling them would conflate three distinct failure modes that the
 paper needs to report separately.
 
-**Consequence for reporting.** Counts exist at both levels and mean different
-things: a *source* rejection is link rot or a leak, while an *evidence* loss is a
-hole in the argument. The exports are per source, with the item's outcome on every
-row, and `share_sources_rejected_fatally` separates the two.
+**Consequence for reporting.** Counts exist at three levels and mean different
+things: a *source* failure is link rot or a leak, a *citation* rejection can also be
+unfaithfulness or a cutoff, while an *evidence* loss is a hole in the argument. The
+exports are per citation, with the item's outcome and the `source_id` on every row;
+`share_sources_rejected_fatally` separates rejections that cost the item from those
+that did not, and `n_distinct_sources` states how many distinct URLs were cited.
 
 ## 2. Source proximity as a three-level scale
 
@@ -49,16 +77,50 @@ output), `SECONDARY` (reporting, analysis or aggregation of primary material),
 sufficiency prompt an explicit instruction to weight primary material higher,
 rather than leaving that to model idiosyncrasy.
 
-## 3. Evidence role as a three-level scale, judged against the rationale
+## 3. Evidence role as a three-level scale, relative to the gold verdict
 
-**Decision.** `ESSENTIAL` (the verdict rationale breaks without it), `AUXILIARY`
-(corroborates or refines essential evidence), `BACKGROUND` (context only, no
-probative weight).
+**Decision.** Roles are assigned once the evidence list of an article is complete:
+`KEY` (establishes a central factual premise underlying the gold verdict; removing
+it from the list likely breaks the verdict), `AUXILIARY` (corroborates, qualifies,
+or strengthens the main justification without being its principal evidential basis;
+removing it would not break the verdict), `BACKGROUND` (context for understanding
+the claim or its circumstances, without directly contributing to the justification).
+The prompt states that only one or two items — or none — are typically `key`.
 
 **Rationale.** Reconstruction recall is not uniform: losing a background item is
-inconsequential, losing an essential one should predict a failed reconstruction.
-Reporting the role distribution of *rejected* items therefore says more about the
-severity of evidence decay than a raw rejection rate does.
+inconsequential, losing a key one should predict a failed reconstruction. Reporting
+the role distribution of *rejected* items therefore says more about the severity of
+evidence decay than a raw rejection rate does.
+
+**Why relative to the verdict, not to the rationale.** An earlier definition — "the
+rationale breaks without it" — was judged against a rationale the extractor had just
+written from all its strong evidence, and the prompt told it to mark whatever that
+rationale leaned on as essential. Every item the rationale mentioned became
+essential, so a fact-check that proved one point three independent ways had three
+single points of failure. The rationale no longer contains evidence at all (§19), so
+the role is judged against the verdict directly: removing a key item from the list
+likely breaks it; removing an auxiliary one does not, whether because another item
+establishes the same point or because it only corroborates. Losing a key item is
+what disqualifies (§20); losing the others is not decided by a rule at all but by the
+sufficiency ensemble (§12), which decides acceptance anyway.
+
+**Why not record the alternatives.** Which item can replace which is not stored —
+neither as a group label (§20) nor as alternative sufficient sets. The one case the
+roles cannot decide on their own — every alternative for a point lost at once —
+reaches the ensemble with whatever evidence is left, which is the question the
+ensemble exists to answer.
+
+**Errors fail safe.** An auxiliary item mislabeled key makes the rule stricter than
+necessary. A key item mislabeled auxiliary costs an ensemble call, and nothing
+leaks: the rationale contains no evidence (§19). The extractor states in each item's
+`reasoning` how it bears on the verdict and the outcome of the leave-one-out test,
+so the labels can be audited.
+
+**Legacy rows.** Items extracted before the rename carry the role `essential`, and
+instances rejected for losing one carry the reason `essential_evidence_lost`. The
+stored rows are not rewritten; the model (`EvidenceRole._missing_`,
+`normalize_reason`) and the web UI's queries read them as `key` and
+`key_evidence_lost`.
 
 ## 4. Extraction operates on the stored fact-check article only
 
@@ -176,10 +238,11 @@ the evidence sets — and it removes a model judgement that was hard to audit.
 
 ## 8. Admissibility is evaluated once, against the loose cutoff
 
-**Decision.** A *source* is admissible iff it is accessible, faithful above
-threshold, datable under the undated policy, available by `t_f`, and not itself a
-professional fact-check. An *item* is admissible iff at least one of its sources is
-and it does not rest on a later event (§7). `E_f` is the admissible set; `E_c` is the
+**Decision.** A *citation* is admissible iff its source is accessible, datable under
+the undated policy, available by the citing claim's `t_f` and not a professional
+fact-check, and the source supports the proposition above the faithfulness
+threshold. An *item* is admissible iff at least one of its citations is and it does
+not rest on a later event (§7). `E_f` is the admissible set; `E_c` is the
 pure sub-filter `t_e <= t_c`.
 
 **Rationale.** `t_c <= t_f` always, and the leakage and later-event criteria are
@@ -193,9 +256,9 @@ in a fixed order (verdict leak → inaccessible → undated → unfaithful → a
 → later event), so the reported rejection reasons partition the rejected items
 rather than double-counting them.
 
-**`t_e` of an item.** The earliest `available_since` among its sources: from that
+**`t_e` of an item.** The earliest `available_since` among its citations: from that
 moment on the proposition could be read somewhere. Condition membership is still
-decided per source (an item enters `E_c` through whichever source predates `t_c`),
+decided per citation (an item enters `E_c` through whichever source predates `t_c`),
 but the later-event gate and the exports use this single item-level `t_e`.
 
 **Sources that cannot be retrieved.** Tools and offline evidence (a phone call, an
@@ -263,10 +326,10 @@ preferred over any model reading. Forbidding inference is what makes the undated
 category meaningful: an item is undated because the source states no date, not
 because the model was unsure.
 
-## 11. One retrieval per source, entirely through scrapeMM
+## 11. One retrieval per URL, entirely through scrapeMM
 
 **Decision.** Every source is retrieved through scrapeMM; nothing fetches a URL on
-its own. The order is: request the source in scrapeMM's `multimodal` output format;
+its own, and a URL is retrieved once however many citations point at it (§1). The order is: request the source in scrapeMM's `multimodal` output format;
 read the publication time off the meta tags of the raw HTML that the *same* response
 carries; and only if the meta tags carried no date, have a cheap model read one off
 the retrieved content.
@@ -291,6 +354,15 @@ entirely unjudged and retried after `defer_hours`; the claim it belongs to is pu
 status `deferred` rather than rejected. Recording a temporary condition as a
 permanent one would inflate the reported `inaccessible` share and reject instances
 on an incomplete evidence set.
+
+**Archive.today's access check is deferred, not inaccessible, too.** Archive.today
+gates snapshot pages with a CAPTCHA that scrapeMM does not solve; it buffers the
+gated URL and answers it from a persistent cache once a human passes the check
+(possibly hours later - a captcha is solved on human time, not on `defer_hours`'
+schedule). `retrieval.SourceRetrieval.gated` marks this outcome and `filter_source`
+defers the source exactly like a rate limit. `scripts/retry_deferred_archive_today.py`
+clears the deferral and retries immediately once the check has been passed, instead
+of waiting for `defer_hours` to elapse on its own.
 
 **Media are downloaded.** Images and video referenced by an evidence source are
 retrieved and inlined, so the sufficiency validator sees what the fact-checker saw.
@@ -400,14 +472,16 @@ the analysis reports.
 ## 17. Reported statistics
 
 Per claim: `t_c`, `t_f`, `t_f − t_c`, candidate/admissible/in-window counts,
-undated count, rationale count, essential evidence items and how many of them were
-lost, per-condition evidence-set sizes, per-condition recoverability and maximum
-property distance, gold scores, status and rejection reason.
+undated count, rationale count, key evidence items and how many of them were
+lost, how many auxiliary items were lost, per-condition evidence-set sizes,
+per-condition recoverability and maximum property distance, gold scores, status and
+rejection reason.
 
-Per source: the proposition and role of the item it belongs to, whether that item
-survived, how many sources it has, plus the source's name, type, proximity, locator,
-`t_e`, `t_e − t_c`, `t_e − t_f`, in-window flag, faithfulness, the temporal flags,
-admissibility, rejection reason and whether it is currently deferred.
+Per citation: the proposition and role of the item it belongs to, whether that item
+survived, how many citations it has, plus the source's ID, name, type, proximity,
+locator, `t_e` and how it was dated, `t_e − t_c`, `t_e − t_f`, in-window flag,
+faithfulness, the temporal flags, admissibility, rejection reason and whether the
+source is currently deferred.
 
 Aggregate: share of claims with post-claim/pre-fact-check evidence; number and
 fraction of items in the interval; distributions of `t_e − t_c`, `t_e − t_f`,
@@ -470,13 +544,16 @@ prompt states both explicitly, and the judge prompt tells the ensemble that the
 rationale carries no facts of its own and is to be followed only as far as the
 evidence supports it.
 
-**Bound to essential evidence.** The rationale may build only on the items marked
-`essential` and on the claim itself. This closes the leak that would otherwise
-affect `E_c`: a rationale is valid exactly as long as every essential item is
-available, an instance is discarded exactly when an essential item is lost, and a
-*condition* is recorded as insufficient exactly when it cannot supply one (§21). The
-ensemble therefore never sees a rationale that rests on evidence the condition it is
-judging does not have.
+**No evidence in it.** The rationale carries reasoning and commonsense knowledge
+only: it must not restate the evidence, must not refer to specific evidence items,
+and must not introduce externally available information; if the verdict follows
+trivially from the evidence, it says so. This closes the leak that would otherwise
+affect `E_c`: whatever items a condition lacks, the rationale cannot carry their
+content into it, so the ensemble never sees a rationale that rests on evidence the
+condition it is judging does not have, and whenever both conditions reach the
+ensemble they see the same rationale. The extractor assigns the roles *before*
+writing the rationale — the output schema lists the evidence first — so the role
+judgement is not shaped by the argument it is about to write.
 
 **Residual risk, to report.** The rationale is still the fact-checker's own
 reasoning, so the ensemble is not reasoning wholly independently: a rationale that
@@ -488,9 +565,9 @@ recoverability rates can be reported with and without them.
 
 ## 20. Redundancy lives inside an evidence item
 
-**Decision.** All sources a fact-check gives for one proposition belong to one
-evidence item. The item is discarded only when every one of its sources was, and an
-instance is disqualified only when an *essential* item is discarded.
+**Decision.** All sources a fact-check gives for one proposition are cited by one
+evidence item. The item is discarded only when every one of its citations was, and
+an instance is disqualified only when a *key* item is discarded.
 
 **Rationale.** Fact-checks cite redundantly on purpose: two outlets for one fact, a
 register plus a screenshot of it. Treating each citation as a separate evidence item
@@ -503,39 +580,53 @@ the intended semantics: the *proposition* must survive, not each of its sources.
 interchangeable items with a shared "corroboration group". That worked, but it
 carried the grouping as metadata a model had to assign consistently, scoped to a
 single article, and it left `available_since`, `accessible`, `faithfulness` and the
-temporal validation on an item that could have several of each. Making sources first
-class removes the label, the scoping question and the duplication at once.
+temporal validation on an item that could have several of each. Making citations
+first class removes the label, the scoping question and the duplication at once;
+making sources global (§1) removes the remaining duplication across items.
 
 **Merging across articles.** Two fact-checks of the same claim that state the same
-proposition are merged into one item carrying both sets of sources, and the stricter
-role wins: if one article's rationale leans on the proposition, losing it breaks
-that article's argument.
+proposition are merged into one item carrying both sets of citations, and the stricter
+role wins: if one article's verdict breaks without the proposition, losing it
+breaks that article's case.
 
-## 21. A condition without its essential evidence needs no ensemble call
+**Redundancy between propositions.** Different propositions that prove the same
+point — a dated news photo, a reverse-image hit, the photographer's statement — are
+not merged: they are different facts, each checked against its own sources. Their
+redundancy is expressed by the role instead (§3): none of them is key, so
+losing any of them costs the instance nothing unless the ensemble finds that what
+remains no longer carries the verdict.
 
-**Decision.** If an essential item has no source inside a condition's evidence set,
-that condition is recorded as insufficient (`is_close = False`) without querying the
+## 21. A condition without its key evidence needs no ensemble call
+
+**Decision.** If a key item has no source inside a condition's evidence set, that
+condition is recorded as insufficient (`is_close = False`) without querying the
 ensemble.
 
-**Rationale.** The rationale rests on exactly those propositions (§19), so a
-condition that cannot supply one cannot support the argument the fact-check made.
+**Rationale.** A key item establishes a central premise of the verdict (§3), so a
+condition that cannot supply one cannot support the verdict the fact-check reached.
 Asking the ensemble anyway would measure how well four models guess a verdict with a
 premise missing — an answer that says nothing about whether the evidence of that
 period sufficed. It also saves the majority of `E_c` calls on precisely the claims
-the analysis is about, and it removes the last way a rationale could reach a judge
-that is missing the evidence it refers to.
+the analysis is about.
 
-**Consequence for reporting.** `E_c` failures now split into two kinds: an essential
-item that only appeared during the fact-checking period (recorded in `error`), and a
-genuine ensemble failure to recover the verdict. Both count as "not recoverable from
-`E_c`" in the headline test; the distinction is available in the stored results.
+**Only key items short-circuit.** An auxiliary item that appeared during the
+fact-checking period does not carry the verdict by definition, so it must not make
+`E_c` insufficient: such an `E_c` goes to the ensemble with whatever evidence
+predates `t_c`. Under the earlier, rationale-relative definition, a redundant item
+did short-circuit, and every such claim landed in the "recoverable only from `E_f`"
+cell — inflating exactly the effect the paper reports.
+
+**Consequence for reporting.** `E_c` failures split into two kinds: a key item that
+only appeared during the fact-checking period (recorded in `error`), and a genuine
+ensemble failure to recover the verdict. Both count as "not recoverable from `E_c`"
+in the headline test; the distinction is available in the stored results.
 
 ## 22. An empty evidence set is a result, not a failure
 
 **Decision.** A claim whose reconstruction yields no evidence is analyzed normally,
 as long as a rationale carries the argument. The instance is rejected only if Stage 1
-produced nothing at all (`nothing_extracted`) or if an essential evidence item lost
-every source (`essential_evidence_lost`).
+produced nothing at all (`nothing_extracted`) or if a key evidence item lost every
+source (`key_evidence_lost`).
 
 **Rationale.** The earlier rule — reject when the admissible set is empty — conflated
 "the fact-checker needed no external source" with "we failed to reconstruct the
@@ -543,6 +634,56 @@ sources". The first is a legitimate, and interesting, category of instance; the
 second is a failure. The rejection reasons now separate them, and the exports carry
 `share_claims_without_admissible_evidence` so the size of the first category is
 visible rather than hidden in a rejection count.
+
+## 23. A rectified claim is assembled counterfactually, not reconstructed
+
+**Decision.** Rectified claims — the corrected variants produced to balance the
+dataset, which share their original's fact-checking articles — enter the
+reconstruction like any other claim. Stage 1, however, is told that the article
+checked a *different* claim, is shown both, and is asked to assemble the case that
+bears on the rectified claim instead of reproducing the fact-checker's own
+reasoning. It states the difference between the two claims first, extracts only
+evidence that speaks to the rectified one, and writes the rationale about it. For
+an original claim the prompt renders byte for byte as it did before.
+
+**Rationale.** Without this, three things go wrong, in increasing severity. The
+prompt opens on a false premise ("this article establishes a verdict about the
+Claim shown below"), which the model has to silently reconcile. Only part of the
+article's evidence bears on the corrected statement, so the candidate set is
+padded with propositions that exist only to refute the original. And the rationale
+— the worst of the three — would argue *against* the original claim, while the gold
+verdict of a rectified claim is intact by construction: `validate_verdict` dismisses
+any rectified claim that does not come out positive. Since the rationale is handed
+to the Stage 3 ensemble as a Reasoning Aid (§19), reconstructing the article's
+argument would point the ensemble at the opposite of the gold verdict for the whole
+intact half of the dataset.
+
+**Why it also distorts the roles.** `key` is defined relative to the verdict
+(§3). An extraction scoped to the wrong claim yields the wrong key set, and
+that set decides whether an instance is disqualified (§22) and whether a condition
+is sent to the ensemble at all (§21). The error would not stay local to the prompt;
+it would reach the headline numbers.
+
+**Verdict leakage.** The rectified prompt forbids stating or implying what the
+fact-checker concluded about the claim they checked. That conclusion is the verdict
+of a different assertion, and it is the *opposite* of this claim's gold verdict, so
+reproducing it would be a leak in the sense of §7 — arriving through the rationale
+rather than through a source.
+
+**Not a reconstruction.** For an original claim, Stage 1 recovers a case the
+fact-checker actually made. For a rectified claim no such case exists: the
+fact-checker never assembled evidence for the corrected statement. The instance
+therefore answers a slightly different question — *could the fact-checker's findings
+have supported the corrected statement?* rather than *did the evidence they cited
+suffice?* — and a thin or empty evidence set is a correspondingly ordinary outcome
+here (§22).
+
+**Where it does not apply.** Stage 3 needs no equivalent treatment: it never sees
+the article, only the evidence, the rationale and the claim. Once extraction is
+scoped to the right claim there is nothing left to disambiguate downstream.
+
+**Limitation to state.** The two populations are not strictly comparable and should
+be reported separately; the analysis rows carry `is_rectified` for exactly that.
 
 ---
 
@@ -569,6 +710,19 @@ visible rather than hidden in a rejection count.
    platforms) are retrieved like any other (§11) but carry no meta tags, so their
    `t_e` rests on the model reading a stated date off the content, or they stay
    undated. The undated share is therefore not uniform across source types.
+7. **Rectified claims are a different question.** For corrected claim variants the
+   fact-checker never built a case, so their reconstruction is counterfactual
+   (§23): it measures whether the article's findings *could* support the corrected
+   statement. Evidence sets are expected to be thinner than for original claims,
+   and the two populations should be reported separately rather than pooled.
+8. **Roles are a model judgement.** The roles (§3) are assigned
+   by the extractor, per article. When every alternative for a point is lost at
+   once, no rule catches it and the instance rests on the ensemble's judgement of
+   the remaining evidence. The exports report `n_auxiliary_lost` and
+   `share_accepted_despite_lost_evidence`, so the size of that reliance is visible.
+   Extractions made under earlier definitions (`essential`, read as `key`) and
+   their rationales, which could still restate evidence, should be re-extracted
+   before results are pooled.
 9. **Later-event judgement is the hardest call.** Distinguishing "the source
    describes pre-existing facts, published later" from "the source reports a new
    event that settles the claim" requires world knowledge; the stored reasoning

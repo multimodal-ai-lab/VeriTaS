@@ -15,9 +15,10 @@ from veritas.common.annotation.rating import RatingAggregated
 from veritas.common.verdict import MediumVerdict
 from veritas.gold_evidence.admissibility import apply_admissibility_to_item
 from veritas.gold_evidence.models import (
+    Citation,
     Evidence,
     EvidenceRole,
-    EvidenceSource,
+    Source,
     Faithfulness,
     LaterEventCheck,
     ProximityLevel,
@@ -64,6 +65,25 @@ def make_gold_verdict(*, veracity: float | None = None,
 
 def make_source(
         *,
+        locator: str = "https://example.org/record/1",
+        accessible: bool | None = True,
+        content: str | None = "The record.",
+        available_since=datetime(2024, 4, 15),
+        is_fact_check: bool | None = False,
+        retrieved: bool = True,
+) -> Source:
+    """A (global) source, by default retrieved, accessible and dated."""
+    source = Source(locator=locator, available_since=available_since)
+    if retrieved:
+        source.accessible = accessible
+        source.raw_content = content if accessible else None
+        source.accessed_at = datetime(2024, 6, 1)
+        source.is_fact_check = is_fact_check
+    return source
+
+
+def make_citation(
+        *,
         locator: str | None = "https://example.org/record/1",
         name: str = "Example",
         kind: SourceKind = SourceKind.NEWS_ARTICLE,
@@ -74,19 +94,27 @@ def make_source(
         before_claim: bool = True,
         before_fact_check: bool = True,
         filtered: bool = True,
-) -> EvidenceSource:
-    """A source, by default retrievable, faithful and available before the claim."""
-    source = EvidenceSource(name=name, kind=kind, locator=locator, proximity=proximity,
-                            available_since=available_since)
+        source: Source | None = None,
+) -> Citation:
+    """A citation, by default of a retrievable source that is faithful to the
+    proposition and available before the claim. `filtered=False` leaves both the
+    source and the citation as Stage 1 produced them. Pass `source` to cite an
+    existing (shared) source instead of building one from `locator`."""
+    if source is None and locator:
+        source = make_source(locator=locator, accessible=accessible,
+                             available_since=available_since, retrieved=filtered)
+    citation = Citation(source=source, name=name, kind=kind, proximity=proximity)
+    if citation.exempt:
+        # Not a publication: a known date is the citation's own, not a page's.
+        citation.date_as_cited = available_since
     if filtered:
-        source.accessible = accessible
         if faithfulness is not None:
-            source.faithfulness = Faithfulness(assessment=faithfulness, reasoning="r")
-        source.temporal_validation = TemporalValidation(
+            citation.faithfulness = Faithfulness(assessment=faithfulness, reasoning="r")
+        citation.temporal_validation = TemporalValidation(
             before_fact_check=before_fact_check,
             before_claim=before_claim,
         )
-    return source
+    return citation
 
 
 def make_evidence(
@@ -94,25 +122,25 @@ def make_evidence(
         claim_id: int = 1,
         review_id: int | None = 7,
         proposition: str = "The mayor signed the decree on 3 May.",
-        role: EvidenceRole = EvidenceRole.ESSENTIAL,
+        role: EvidenceRole = EvidenceRole.KEY,
         confidence: float = 0.9,
-        sources: list[EvidenceSource] | None = None,
+        citations: list[Citation] | None = None,
         later_event: bool | None = None,
         decided: bool = True,
-        **source_kwargs,
+        **citation_kwargs,
 ) -> Evidence:
     """An evidence item, by default admissible and pre-claim.
 
-    Without `sources` it gets a single source built from the remaining keyword
+    Without `citations` it gets a single citation built from the remaining keyword
     arguments, which keeps the common one-source case short. `decided=False`
-    leaves the sources unfiltered, i.e. as Stage 1 produced them."""
-    if sources is None:
-        sources = [make_source(filtered=decided, **source_kwargs)]
+    leaves the citations unjudged, i.e. as Stage 1 produced them."""
+    if citations is None:
+        citations = [make_citation(filtered=decided, **citation_kwargs)]
     evidence = Evidence(
         claim_id=claim_id,
         review_id=review_id,
         proposition=proposition,
-        sources=sources,
+        citations=citations,
         role=role,
         extraction_confidence=confidence,
         later_event=(None if later_event is None

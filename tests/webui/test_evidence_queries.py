@@ -29,12 +29,43 @@ def test_enum_filters_are_parameterized():
     where, args = build_evidence_filters(
         kinds=["news_article", "fact_check"],
         proximities=["primary"],
-        roles=["essential"],
+        roles=["key"],
     )
     assert "s.kind = ANY ($1::text[])" in where
     assert "s.proximity = ANY ($2::text[])" in where
     assert "e.role = ANY ($3::text[])" in where
-    assert args == [["news_article", "fact_check"], ["primary"], ["essential"]]
+    # Rows stored before the rename still say `essential`; they match `key` too.
+    assert args == [["news_article", "fact_check"], ["primary"], ["key", "essential"]]
+
+
+def test_a_role_filter_without_a_legacy_name_is_passed_as_is():
+    where, args = build_evidence_filters(roles=["auxiliary", "background"])
+    assert where == "e.role = ANY ($1::text[])"
+    assert args == [["auxiliary", "background"]]
+
+
+def test_legacy_names_are_widened_only_once():
+    selected = queries.with_legacy_names(["key", "essential"], queries.LEGACY_ROLES)
+    assert selected == ["key", "essential"]
+    assert queries.with_legacy_names([], queries.LEGACY_ROLES) == []
+
+
+def test_role_expr_reads_the_legacy_role_as_key():
+    expression = queries.role_expr("e")
+    assert expression == "(CASE e.role WHEN 'essential' THEN 'key' ELSE e.role END)"
+    assert queries.role_expr("") == "(CASE role WHEN 'essential' THEN 'key' ELSE role END)"
+
+
+def test_every_role_column_is_read_through_the_legacy_mapping():
+    """The UI knows only the current names, so no query may hand it the raw column."""
+    for block in (queries.SOURCE_COLUMNS, queries.EVIDENCE_ITEM_COLUMNS,
+                  queries.EVIDENCE_ITEM_SUMMARY_COLUMNS, queries.EVIDENCE_SUMMARY_COLUMNS):
+        assert f"{queries.role_expr('e')} AS role" in block
+    assert queries.role_expr("e") in queries.EVIDENCE_FACET_SQL["roles"]
+
+
+def test_roles_are_displayed_in_the_new_order():
+    assert queries.ROLE_ORDER == ("key", "auxiliary", "background")
 
 
 def test_language_filters_on_the_joined_claim():
@@ -52,7 +83,7 @@ def test_search_term_never_reaches_the_sql_text():
 
 def test_domain_is_compared_against_the_same_expression_that_counts_facets():
     # The locator lives on the source, so both the filter and the facet count
-    # must derive the domain from `evidence_sources`.
+    # must derive the domain from `citation_rows`.
     where, args = build_evidence_filters(domain="bbc.co.uk")
     assert f"{domain_expr('s')} = $1" in where
     assert args == ["bbc.co.uk"]
@@ -117,7 +148,7 @@ def test_placeholders_are_numbered_consecutively():
         claim_id=12,
         kinds=["news_article"],
         proximities=["primary"],
-        roles=["essential"],
+        roles=["key"],
         languages=["en"],
         reason="unfaithful",
         domain="bbc.co.uk",

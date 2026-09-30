@@ -6,11 +6,12 @@ from typing import TYPE_CHECKING
 from asyncpg import UniqueViolationError
 from ezmm import MultimodalSequence
 from pydantic import HttpUrl
+from scrapemm.common.exceptions import ServerError
 
 from veritas.common.base_model import VeritasBaseModel, Deferrable, Dismissable
 from veritas.common.platforms import PLATFORMS
 from veritas.util import get_domain
-from veritas.util.url import resolve_archiving_url, unshorten, is_archiving_url
+from veritas.util.url import resolve_archiving_url, resolve_archive_today_url, unshorten, is_archiving_url
 
 if TYPE_CHECKING:
     from veritas.common.review import Review
@@ -132,7 +133,7 @@ class Appearance(Dismissable, Deferrable, VeritasBaseModel):
         # Only if both appearances already have a row in the DB, delete the existing (old) one
         if self.id != existing.id:
             # Remove the existing appearance from the DB
-            await db.replace_appearance(to_replace=existing.id, replacement=self.id)
+            await db.replace_appearance(to_replace_id=existing.id, replacement_id=self.id)
 
         await super().save_to_db()  # Should run now without any unique constraint violation
 
@@ -147,7 +148,16 @@ async def appearance_from_url(url: HttpUrl | str) -> Appearance | None:
     # Resolve archive URL
     if is_archiving_url(url_unshortened):
         archive_url = url_unshortened
-        result = await resolve_archiving_url(url_unshortened)
+        try:
+            result = await resolve_archiving_url(url_unshortened)
+        except ServerError as e:
+            # Run-level condition: imported locally to avoid a circular import
+            # (this module sits upstream of `veritas.models` in the import
+            # graph). Every remaining URL would fail to resolve the same way,
+            # so this propagates instead of being recorded as an appearance
+            # with no original URL.
+            from veritas.models import QuotaExceededError
+            raise QuotaExceededError(f"scrapeMM server unreachable: {e}") from e
         app_url = result.get("original_url") if result else None
         scraped_archive_content = result.get("scraped_content") if result else None
     else:
@@ -165,6 +175,37 @@ async def appearance_from_url(url: HttpUrl | str) -> Appearance | None:
     await appearance.save_to_db()  # Handles unique constraint violation if appearance already exists
 
     return appearance
+
+
+async def resolve_missing_archive_today_original_urls() -> tuple[int, int]:
+    """Backfills `url` for every appearance that only has an Archive.today
+    snapshot and whose original URL could not be resolved yet. Returns
+    `(n_candidates, n_resolved)`.
+
+    Meant to be run once `resolve_archive_today_url` becomes able to answer
+    URLs it could not resolve before, so the backlog does not sit unresolved
+    until the appearance happens to be touched again - see
+    `scripts/resolve_archive_today_original_urls.py`."""
+    from veritas.db import db
+
+    appearances = await db.get_appearances_missing_original_url()
+    n_resolved = 0
+    for app in appearances:
+        try:
+            result = await resolve_archive_today_url(str(app.archive_url))
+        except Exception as e:
+            logger.debug(f"Could not resolve {app.archive_url}: {type(e).__name__}: {e}")
+            continue
+
+        original_url = result.get("original_url") if result else None
+        if not original_url:
+            continue
+
+        app.url = HttpUrl(original_url)
+        await app.save_to_db()  # merges with an existing appearance of the same URL, if any
+        n_resolved += 1
+
+    return len(appearances), n_resolved
 
 
 def is_sufficient_content(content: MultimodalSequence | None) -> bool:

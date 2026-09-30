@@ -17,16 +17,17 @@ GOLD_VERDICT_WORDS = ("compromised", "intact", "the verdict is", "gold verdict",
                       "fact-checker concluded", "rating:")
 
 
-def render_extract_evidence() -> str:
-    return str(Prompt(
-        f"{PROMPT_DIR}/extract_evidence.md.j2",
+def render_extract_evidence(**overrides) -> str:
+    kwargs = dict(
         article="The post at https://x.com/a/status/1 said X.",
         claim="Someone claimed X.",
         claim_date="May 01, 2024",
         fact_check_date="May 21, 2024",
         publisher_name="Example FactCheck",
         source_kinds=[kind.value for kind in SourceKind],
-    ))
+    )
+    kwargs.update(overrides)
+    return str(Prompt(f"{PROMPT_DIR}/extract_evidence.md.j2", **kwargs))
 
 
 def render_faithfulness() -> str:
@@ -98,7 +99,7 @@ def test_assessment_template_renders_for_every_property(property_name):
 
 def test_assessment_template_handles_an_empty_evidence_set():
     rendered = render_assessment(with_evidence=False)
-    assert "No evidence is available" in rendered
+    assert "No evidence items are available" in rendered
 
 
 def test_assessment_template_shows_source_metadata():
@@ -110,13 +111,13 @@ def test_assessment_template_shows_source_metadata():
 
 
 def test_assessment_template_lists_every_source_of_a_proposition():
-    from tests.gold_evidence.conftest import make_evidence, make_source
+    from tests.gold_evidence.conftest import make_citation, make_evidence
     from veritas.common import Prompt
     from veritas.common.annotation import PROPERTIES
 
-    evidence = [make_evidence(sources=[
-        make_source(name="Reuters", locator="https://a/1"),
-        make_source(name="City Register", locator="https://a/2"),
+    evidence = [make_evidence(citations=[
+        make_citation(name="Reuters", locator="https://a/1"),
+        make_citation(name="City Register", locator="https://a/2"),
     ])]
     rendered = str(Prompt(f"{PROMPT_DIR}/assess_from_evidence.md.j2",
                           evidence=evidence, rationales=[], claim="Someone claimed X.",
@@ -136,21 +137,60 @@ def test_extraction_template_asks_for_the_rationale_and_sources():
     rendered = render_extract_evidence()
     assert "verdict_rationale" in rendered
     assert '"sources"' in rendered
-    # The narrowed definition of "essential" is what the roles are judged against.
-    assert "the Verdict Rationale breaks without this proposition" in rendered
+
+
+def test_extraction_template_defines_the_three_roles_against_the_verdict():
+    """`key` is judged by what removing the item does to the gold verdict, not by
+    whether the rationale mentions it."""
+    rendered = render_extract_evidence()
+    assert "- `key`: Evidence that establishes a central factual premise" in rendered
+    assert "Removing this item from the list likely breaks the verdict." in rendered
+    assert "Removing this item from the list would not break the verdict." in rendered
+    assert "- `background`: Evidence that provides context" in rendered
+    assert "the Verdict Rationale breaks without this proposition" not in rendered
+
+
+def test_extraction_template_no_longer_offers_the_old_role_name():
+    rendered = render_extract_evidence()
+    assert '"role": "one of: key, auxiliary, background"' in rendered
+    assert "`essential`" not in rendered
+    assert "essential, auxiliary, background" not in rendered
+
+
+def test_extraction_template_keeps_the_key_set_small():
+    """Nothing in the prompt pushes items into `key`; it says the opposite."""
+    lowered = render_extract_evidence().lower()
+    assert "only one or two items — or none at all — are `key`" in lowered
+    assert "mark that item `essential` instead" not in lowered
+
+
+def test_extraction_template_asks_for_the_evidence_before_the_rationale():
+    """The roles are fixed before the rationale is written, not judged against it."""
+    rendered = render_extract_evidence()
+    assert rendered.index('"evidence": [') < rendered.index('"verdict_rationale":')
+    assert rendered.index("## 3. Evidence Roles") < rendered.index("## 4. Verdict Rationale")
 
 
 def test_extraction_template_forbids_a_verdict_in_the_rationale():
     lowered = render_extract_evidence().lower()
     assert "must **not** state or imply the verdict" in lowered
-    assert "must **not** introduce a new externally verifiable factual premise" in lowered
+    assert "must **not** introduce external information" in lowered
 
 
-def test_extraction_template_binds_the_rationale_to_essential_evidence():
-    """The rationale may only build on what the instance is disqualified for
-    losing, so it can never outlive the evidence it rests on."""
+def test_extraction_template_keeps_the_evidence_out_of_the_rationale():
+    """The rationale carries reasoning only, so it cannot leak a proposition into a
+    condition that lacks it - whichever items that condition supplies."""
     lowered = render_extract_evidence().lower()
-    assert "may build **only on propositions you marked `essential`**" in lowered
+    assert "do not include the evidence in the rationale" in lowered
+    assert "do not refer to specific evidence items" in lowered
+    assert "only reasoning and commonsense knowledge" in lowered
+    # The old binding to a subset of the evidence is gone.
+    assert "may build **only on propositions you marked" not in lowered
+
+
+def test_extraction_template_scopes_the_rationale_to_the_rectified_claim():
+    rendered = render_extract_evidence(is_rectified=True, original_claim="Someone claimed Y.")
+    assert "Write that reasoning about the **Claim to Analyze**." in rendered
 
 
 def test_assessment_template_shows_the_rationale_when_there_is_one():
@@ -159,7 +199,9 @@ def test_assessment_template_shows_the_rationale_when_there_is_one():
     rendered = render_assessment(rationales=[make_rationale()])
     assert "Reasoning Aid" in rendered
     assert "3 May is before 5 May" in rendered
-    assert "asserts **no facts of its own**" in rendered
+    # The rationale is a hint to interpret the evidence by, not a substitute for it.
+    assert "**only as an unverified hint**" in rendered
+    assert "**never as a substitute for it or your own reasoning.**" in rendered
 
 
 def test_assessment_template_omits_the_section_without_a_rationale():
@@ -187,9 +229,46 @@ def test_extraction_template_keeps_provenance_out_of_the_proposition():
     assert "named attribution is different" in lowered
 
 
+# --- Rectified claims ------------------------------------------------------
+
+def test_extraction_template_is_unchanged_for_an_original_claim():
+    """Rectification support is additive: the prompt the overwhelming majority of
+    claims are extracted with must render exactly as it did before."""
+    rendered = render_extract_evidence()
+
+    assert rendered == render_extract_evidence(is_rectified=False, original_claim=None)
+    for phrase in ("Claim to Analyze", "Claim Differences",
+                   "Claim Checked in the Article"):
+        assert phrase not in rendered
+
+
+def test_extraction_template_separates_the_two_claims_when_rectified():
+    """The article ruled on the original claim, not on this one: the extractor has
+    to see both, and must not carry the article's argument over."""
+    rendered = render_extract_evidence(
+        is_rectified=True, original_claim="Someone claimed Y in a misleading way.")
+
+    assert "## The Claim Checked in the Article" in rendered
+    assert "Someone claimed Y in a misleading way." in rendered
+    assert "## The Claim to Analyze" in rendered
+    assert "Someone claimed X." in rendered
+    assert "**not** the one you are asked about" in rendered
+    assert "## 0. Claim Differences" in rendered
+
+    lowered = rendered.lower()
+    assert "do not reproduce the article's argument against the claim it checked" in lowered
+    assert "extract only what bears on the **claim to analyze**" in lowered
+
+
+def test_extraction_template_tolerates_a_missing_original_claim():
+    """The variant may be unavailable; the warning must still reach the model."""
+    rendered = render_extract_evidence(is_rectified=True, original_claim=None)
+    assert "identify it from the article itself" in rendered
+    assert "## The Claim to Analyze" in rendered
+
+
 def test_extraction_template_states_the_exclusion_rules():
     rendered = render_extract_evidence().lower()
-    assert "do not extract" in rendered
     assert "original source" in rendered
     assert "independently locatable" in rendered
     assert "tool" in rendered
@@ -274,7 +353,7 @@ def test_temporal_prompt_separates_reporting_from_a_changing_world():
 def test_assessment_prompt_forbids_recalling_the_fact_check():
     lowered = render_assessment().lower()
     assert "do not rely on your own recollection" in lowered
-    assert "base your reasoning **only** on the evidence" in lowered
+    assert "base your reasoning **only** on the material above" in lowered
 
 
 def test_dating_prompt_excludes_modification_times():

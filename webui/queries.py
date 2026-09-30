@@ -43,6 +43,42 @@ MEDIA_FILTERS = {
 }
 
 
+#: Values of earlier pipeline versions that may still be stored, mapped to their
+#: current names. Mirror `veritas.gold_evidence.models.LEGACY_*_ALIASES`. Stored
+#: rows are never rewritten; every query reads them through `legacy_expr`.
+LEGACY_ROLES = {"essential": "key"}
+LEGACY_REASONS = {"essential_evidence_lost": "key_evidence_lost"}
+
+#: The order in which roles are displayed.
+ROLE_ORDER = ("key", "auxiliary", "background")
+
+
+def legacy_expr(column: str, aliases: dict[str, str]) -> str:
+    """SQL reading `column` under the current names of its legacy values. The
+    aliases come from the fixed tables above, never from a request."""
+    cases = " ".join(f"WHEN '{old}' THEN '{new}'" for old, new in aliases.items())
+    return f"(CASE {column} {cases} ELSE {column} END)"
+
+
+def role_expr(alias: str = "e") -> str:
+    """`<alias>.role` under its current name."""
+    return legacy_expr(f"{alias}.role" if alias else "role", LEGACY_ROLES)
+
+
+def reason_expr(alias: str = "c") -> str:
+    """`<alias>.gold_evidence_reason` under its current name."""
+    column = f"{alias}.gold_evidence_reason" if alias else "gold_evidence_reason"
+    return legacy_expr(column, LEGACY_REASONS)
+
+
+def with_legacy_names(values: list[str], aliases: dict[str, str]) -> list[str]:
+    """The selected values plus every legacy value that now reads as one of them,
+    so that a filter on a current name also matches the rows stored under the old."""
+    selected = list(values)
+    selected += [old for old, new in aliases.items() if new in values and old not in values]
+    return selected
+
+
 def media_clause(column: str, media: str) -> str:
     """A regex test on `column` for one of the `MEDIA_FILTERS` values.
 
@@ -111,7 +147,7 @@ REFERENCE_TIMES_SQL = """
 
 #: Counted per claim. The item-level numbers describe propositions, the
 #: source-level ones where those propositions could be read and when - which is
-#: why the window counts come from `evidence_sources`.
+#: why the window counts come from `citation_rows`.
 EVIDENCE_COUNTS_SQL = f"""
     SELECT COUNT(*)                                                   AS n_evidence,
            COUNT(*) FILTER (WHERE e.admissible)                       AS n_admissible,
@@ -121,10 +157,10 @@ EVIDENCE_COUNTS_SQL = f"""
            COUNT(*) FILTER (WHERE e.proposition ~ '{IMAGE_REF_SQL}')  AS n_with_images,
            COUNT(*) FILTER (WHERE e.proposition ~ '{VIDEO_REF_SQL}')  AS n_with_videos,
            COALESCE(SUM(e.n_sources), 0)                              AS n_sources,
-           (SELECT COUNT(*) FROM evidence_sources s
+           (SELECT COUNT(*) FROM citation_rows s
              WHERE s.claim_id = c.id AND s.admissible AND s.before_claim)
                                                                       AS n_before_claim,
-           (SELECT COUNT(*) FROM evidence_sources s
+           (SELECT COUNT(*) FROM citation_rows s
              WHERE s.claim_id = c.id AND s.admissible AND s.before_fact_check
                AND s.before_claim IS FALSE)                           AS n_in_window
     FROM evidence e
@@ -176,7 +212,8 @@ async def list_claims(
     page_sql = f"""
         WITH page AS (
             SELECT c.id, c.data, c.date, c.language, c.review_ids,
-                   c.gold_evidence_status, c.gold_evidence_reason, c.gold_evidence_updated_at,
+                   c.gold_evidence_status, {reason_expr("c")} AS gold_evidence_reason,
+                   c.gold_evidence_updated_at,
                    c.released_quarter, c.released_longitudinal, c.is_rectified, c.variant_id
             FROM claims c
             WHERE {where}
@@ -253,7 +290,8 @@ def build_claim_filters(
         clauses.append("c.gold_evidence_status IS NOT NULL")
 
     if reason:
-        add("c.gold_evidence_reason = ${n}", reason)
+        args.append(with_legacy_names([reason], LEGACY_REASONS))
+        clauses.append(f"c.gold_evidence_reason = ANY (${len(args)}::text[])")
     if languages:
         add("c.language = ANY (${n}::text[])", languages)
     if query:
@@ -314,7 +352,8 @@ async def get_claim(claim_id: int) -> dict | None:
     """Everything the detail view shows for one claim."""
     claim_sql = f"""
         SELECT c.id, c.data, c.date, c.language, c.review_ids, c.appearance_ids,
-               c.gold_evidence_status, c.gold_evidence_reason, c.gold_evidence_updated_at,
+               c.gold_evidence_status, {reason_expr("c")} AS gold_evidence_reason,
+               c.gold_evidence_updated_at,
                c.released_quarter, c.released_longitudinal, c.is_rectified, c.variant_id,
                c.dismissed, c.dismissed_reason, c.media_origin,
                tf.t_f, ev.*
@@ -447,14 +486,15 @@ async def get_results_for_claim(claim_id: int) -> list[dict]:
 # Evidence
 # ---------------------------------------------------------------------------
 
-#: The evidence tables: one item per proposition, one row per source that reports
-#: it. Everything Stage 2 decides belongs to the source, the proposition and its
-#: role to the item, so the browser lists sources and names their item alongside.
-EVIDENCE_FROM = "evidence_sources s JOIN evidence e ON e.id = s.evidence_id"
+#: The evidence tables: one item per proposition, one row per citation of a source
+#: that reports it. `citation_rows` is a read-only view joining each citation with
+#: the (global) source it cites, flattened into the columns the browser lists. The
+#: proposition and its role belong to the item, which is named alongside.
+EVIDENCE_FROM = "citation_rows s JOIN evidence e ON e.id = s.evidence_id"
 
 #: Aliased so that a row reads like one flat record: `source_*` for the source,
 #: the item's own fields under their own names.
-SOURCE_COLUMNS = """
+SOURCE_COLUMNS = f"""
     s.id, s.evidence_id, s.claim_id,
     s.name AS source_name, s.kind AS source_kind, s.locator AS source_locator,
     s.proximity AS source_proximity, s.raw_content AS source_raw_content,
@@ -463,15 +503,15 @@ SOURCE_COLUMNS = """
     s.before_fact_check, s.before_claim,
     s.admissible, s.inadmissibility_reason, s.deferred_until, s.dismissed_reason,
     s.full_source, s.created_at, s.updated_at,
-    e.review_id, e.article_id, e.proposition, e.role, e.extraction_reasoning,
+    e.review_id, e.article_id, e.proposition, {role_expr('e')} AS role, e.extraction_reasoning,
     e.extraction_confidence, e.admissible AS evidence_admissible, e.n_sources,
     e.later_event, e.later_event_reasoning, e.later_event_justification,
     e.later_event_rater, e.dismissed, e.full_evidence
 """
 
 #: The evidence items of one claim, without the sources (fetched separately).
-EVIDENCE_ITEM_COLUMNS = """
-    e.id, e.claim_id, e.review_id, e.article_id, e.proposition, e.role,
+EVIDENCE_ITEM_COLUMNS = f"""
+    e.id, e.claim_id, e.review_id, e.article_id, e.proposition, {role_expr('e')} AS role,
     e.extraction_reasoning, e.extraction_confidence, e.admissible,
     e.inadmissibility_reason, e.n_sources, e.n_admissible_sources,
     e.later_event, e.later_event_reasoning, e.later_event_justification,
@@ -488,8 +528,8 @@ EVIDENCE_ITEM_COLUMNS = """
 # disclosure. The claim view therefore asks only for what a collapsed card shows;
 # `get_evidence_item` fetches the rest when one is expanded.
 
-EVIDENCE_ITEM_SUMMARY_COLUMNS = """
-    e.id, e.claim_id, e.review_id, e.article_id, e.proposition, e.role,
+EVIDENCE_ITEM_SUMMARY_COLUMNS = f"""
+    e.id, e.claim_id, e.review_id, e.article_id, e.proposition, {role_expr('e')} AS role,
     e.extraction_confidence, e.admissible, e.inadmissibility_reason,
     e.n_sources, e.n_admissible_sources, e.available_since,
     e.later_event, e.later_event_justification,
@@ -516,7 +556,7 @@ async def get_evidence_for_claim(claim_id: int) -> list[dict]:
             f"WHERE e.claim_id = $1 ORDER BY e.id;",
             claim_id),
         database.fetch(
-            f"SELECT {SOURCE_SUMMARY_COLUMNS} FROM evidence_sources s "
+            f"SELECT {SOURCE_SUMMARY_COLUMNS} FROM citation_rows s "
             f"WHERE s.claim_id = $1 ORDER BY s.evidence_id, s.id;",
             claim_id),
     )
@@ -559,14 +599,14 @@ async def get_evidence_source(source_id: int) -> dict | None:
 
 #: The list view never needs the long texts (reasoning traces, scraped content,
 #: the JSONB blobs), so a page of sources stays small.
-EVIDENCE_SUMMARY_COLUMNS = """
+EVIDENCE_SUMMARY_COLUMNS = f"""
     s.id, s.evidence_id, s.claim_id, s.name AS source_name, s.kind AS source_kind,
     s.locator AS source_locator, s.proximity AS source_proximity,
     s.available_since, s.accessed_at, s.accessible, s.faithfulness_assessment,
     s.faithfulness_justification, s.before_fact_check, s.before_claim,
     s.admissible, s.inadmissibility_reason,
     s.deferred_until, s.dismissed_reason, s.created_at, s.updated_at,
-    e.review_id, e.article_id, e.proposition, e.role, e.extraction_confidence,
+    e.review_id, e.article_id, e.proposition, {role_expr('e')} AS role, e.extraction_confidence,
     e.admissible AS evidence_admissible, e.n_sources, e.later_event,
     e.later_event_justification, e.dismissed
 """
@@ -701,7 +741,7 @@ def build_evidence_filters(
     if proximities:
         add("s.proximity = ANY (${n}::text[])", proximities)
     if roles:
-        add("e.role = ANY (${n}::text[])", roles)
+        add("e.role = ANY (${n}::text[])", with_legacy_names(roles, LEGACY_ROLES))
     if languages:
         add("c.language = ANY (${n}::text[])", languages)
     if reason:
@@ -738,24 +778,24 @@ def build_evidence_filters(
 #: dashboard, which describes the admissible ones - because the browser must be
 #: able to reach every stored source.
 EVIDENCE_FACET_SQL = {
-    "source_kinds": "SELECT kind AS label, COUNT(*) AS count FROM evidence_sources GROUP BY 1;",
-    "proximities": "SELECT proximity AS label, COUNT(*) AS count FROM evidence_sources GROUP BY 1;",
+    "source_kinds": "SELECT kind AS label, COUNT(*) AS count FROM citation_rows GROUP BY 1;",
+    "proximities": "SELECT proximity AS label, COUNT(*) AS count FROM citation_rows GROUP BY 1;",
     "roles":
-        "SELECT e.role AS label, COUNT(*) AS count "
+        f"SELECT {role_expr('e')} AS label, COUNT(*) AS count "
         f"FROM {EVIDENCE_FROM} GROUP BY 1;",
     "inadmissibility_reasons":
         "SELECT inadmissibility_reason AS label, COUNT(*) AS count "
-        "FROM evidence_sources WHERE admissible IS FALSE GROUP BY 1;",
+        "FROM citation_rows WHERE admissible IS FALSE GROUP BY 1;",
     "languages":
         "SELECT c.language AS label, COUNT(*) AS count "
-        "FROM evidence_sources s JOIN claims c ON c.id = s.claim_id GROUP BY 1;",
+        "FROM citation_rows s JOIN claims c ON c.id = s.claim_id GROUP BY 1;",
 }
 
 EVIDENCE_ADMISSIBILITY_SQL = f"""
     SELECT COUNT(*) FILTER (WHERE {ADMISSIBILITY_SQL["admissible"]})   AS admissible,
            COUNT(*) FILTER (WHERE {ADMISSIBILITY_SQL["inadmissible"]}) AS inadmissible,
            COUNT(*) FILTER (WHERE {ADMISSIBILITY_SQL["unfiltered"]})   AS unfiltered
-    FROM evidence_sources s;
+    FROM citation_rows s;
 """
 
 EVIDENCE_ZONE_SQL = f"""
@@ -763,12 +803,12 @@ EVIDENCE_ZONE_SQL = f"""
            COUNT(*) FILTER (WHERE {ZONE_SQL["in_window"]})        AS in_window,
            COUNT(*) FILTER (WHERE {ZONE_SQL["after_fact_check"]}) AS after_fact_check,
            COUNT(*) FILTER (WHERE {ZONE_SQL["unvalidated"]})      AS unvalidated
-    FROM evidence_sources s;
+    FROM citation_rows s;
 """
 
 EVIDENCE_DOMAINS_SQL = f"""
     SELECT {domain_expr("s")} AS label, COUNT(*) AS count
-    FROM evidence_sources s
+    FROM citation_rows s
     WHERE s.locator IS NOT NULL AND s.locator <> ''
     GROUP BY 1 ORDER BY 2 DESC LIMIT 40;
 """
@@ -790,7 +830,7 @@ async def get_evidence_filter_options() -> dict:
         "zones": counted(zones, ZONE_SQL),
         "source_kinds": series(rows["source_kinds"]),
         "proximities": series(rows["proximities"], order=("primary", "secondary", "tertiary")),
-        "roles": series(rows["roles"], order=("essential", "auxiliary", "background")),
+        "roles": series(rows["roles"], order=ROLE_ORDER),
         "inadmissibility_reasons": series(rows["inadmissibility_reasons"], order=REASON_ORDER),
         "languages": series(rows["languages"]),
         "domains": series(domains),
@@ -818,8 +858,8 @@ CLAIM_STATUS_SQL = """
     FROM claims WHERE gold_evidence_status IS NOT NULL GROUP BY 1;
 """
 
-CLAIM_REASON_SQL = """
-    SELECT gold_evidence_reason AS label, COUNT(*) AS count
+CLAIM_REASON_SQL = f"""
+    SELECT {reason_expr("")} AS label, COUNT(*) AS count
     FROM claims WHERE gold_evidence_reason IS NOT NULL GROUP BY 1;
 """
 
@@ -854,14 +894,14 @@ EVIDENCE_TOTALS_SQL = f"""
                                        AND before_claim IS FALSE)       AS n_in_window,
                     COUNT(*) FILTER (WHERE raw_content IS NOT NULL)     AS n_with_content,
                     COUNT(DISTINCT locator)                             AS n_distinct_locators
-             FROM evidence_sources
+             FROM citation_rows
          )
     SELECT * FROM items, sources;
 """
 
 TOP_DOMAINS_SQL = f"""
     SELECT {domain_expr("s")} AS label, COUNT(*) AS count
-    FROM evidence_sources s
+    FROM citation_rows s
     WHERE s.locator IS NOT NULL AND s.locator <> ''
     GROUP BY 1 ORDER BY 2 DESC LIMIT 15;
 """
@@ -869,7 +909,7 @@ TOP_DOMAINS_SQL = f"""
 DELTAS_SQL = """
     SELECT EXTRACT(EPOCH FROM (s.available_since - c.date)) / 86400.0   AS to_claim,
            EXTRACT(EPOCH FROM (s.available_since - ref.t_f)) / 86400.0  AS to_fact_check
-    FROM evidence_sources s
+    FROM citation_rows s
     JOIN claims c ON c.id = s.claim_id
     LEFT JOIN LATERAL (
         SELECT MAX(r.published) AS t_f FROM reviews r
@@ -919,7 +959,7 @@ RESULTS_META_SQL = """
 """
 
 
-def _admissible_distribution(column: str, table: str = "evidence_sources") -> str:
+def _admissible_distribution(column: str, table: str = "citation_rows") -> str:
     """Distribution of a column over the admissible rows of one evidence table."""
     return (f"SELECT {column} AS label, COUNT(*) AS count "
             f"FROM {table} WHERE admissible GROUP BY 1;")
@@ -935,14 +975,14 @@ async def get_overview() -> dict:
         database.fetchrow(EVIDENCE_TOTALS_SQL),
         database.fetch(_admissible_distribution("kind")),
         database.fetch(_admissible_distribution("proximity")),
-        database.fetch(_admissible_distribution("role", table="evidence")),
+        database.fetch(_admissible_distribution(role_expr(""), table="evidence")),
         database.fetch(
             "SELECT inadmissibility_reason AS label, COUNT(*) AS count "
-            "FROM evidence_sources WHERE admissible IS FALSE GROUP BY 1;"),
+            "FROM citation_rows WHERE admissible IS FALSE GROUP BY 1;"),
         database.fetch(TOP_DOMAINS_SQL),
         database.fetch(
             "SELECT round(faithfulness_assessment::numeric, 3) AS value, COUNT(*) AS count "
-            "FROM evidence_sources WHERE faithfulness_assessment IS NOT NULL GROUP BY 1 ORDER BY 1;"),
+            "FROM citation_rows WHERE faithfulness_assessment IS NOT NULL GROUP BY 1 ORDER BY 1;"),
         database.fetch(
             "SELECT round(extraction_confidence::numeric, 2) AS value, COUNT(*) AS count "
             "FROM evidence WHERE extraction_confidence IS NOT NULL GROUP BY 1 ORDER BY 1;"),
@@ -1004,7 +1044,7 @@ async def get_overview() -> dict:
             "in_window_rate": share(n_in_window, n_admissible),
             "source_kinds": series(source_kinds),
             "proximities": series(proximities, order=("primary", "secondary", "tertiary")),
-            "roles": series(roles, order=("essential", "auxiliary", "background")),
+            "roles": series(roles, order=ROLE_ORDER),
             "inadmissibility_reasons": series(inadmissibility, order=REASON_ORDER),
             "top_domains": series(domains),
             "faithfulness": weighted_series(faithfulness),

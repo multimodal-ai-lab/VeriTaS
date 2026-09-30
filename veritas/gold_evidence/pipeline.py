@@ -8,8 +8,9 @@ rejected instance remains a valid VeriTaS claim.
 An *empty* evidence set is not a rejection: a verdict can rest on arithmetic, on a
 contradiction inside the claim, or on what the claim's own media shows, and the
 verdict rationale carries those cases. What disqualifies an instance is a broken
-argument - an essential evidence item that Stage 2 left without a single admissible
-source, so that the rationale no longer has a reconstructible basis.
+argument - a key evidence item, i.e. one without which the verdict likely breaks,
+that Stage 2 left without a single admissible source. Auxiliary items may be lost
+without that: whether what remains still suffices is for Stage 3 to decide.
 """
 
 from __future__ import annotations
@@ -34,9 +35,9 @@ from veritas.gold_evidence import (
     proximity_threshold as default_threshold,
 )
 from veritas.gold_evidence.admissibility import (
-    essential,
-    lost_essential,
-    missing_essential,
+    key_evidence,
+    lost_key,
+    missing_key,
     restrict_to_condition,
 )
 from veritas.gold_evidence.extraction import extract_evidence
@@ -54,8 +55,8 @@ REJECT_NO_CLAIM_TIME = "no_claim_time"
 REJECT_NO_FACT_CHECK_TIME = "no_fact_check_time"
 #: Stage 1 produced neither evidence nor a rationale - nothing to analyze at all.
 REJECT_NOTHING_EXTRACTED = "nothing_extracted"
-#: An essential evidence item lost every one of its sources in Stage 2.
-REJECT_ESSENTIAL_EVIDENCE_LOST = "essential_evidence_lost"
+#: A key evidence item lost every one of its sources in Stage 2.
+REJECT_KEY_EVIDENCE_LOST = "key_evidence_lost"
 REJECT_ENSEMBLE_FAILED = "sufficiency_validation_failed"
 REJECT_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
@@ -71,10 +72,10 @@ class ClaimOutcome:
     n_admissible: int = 0
     n_deferred: int = 0
     n_rationales: int = 0
-    #: Evidence items the verdict rationale depends on, and how many of them lost
-    #: every source in Stage 2. The latter is what rejects an instance.
-    n_essential: int = 0
-    n_essential_lost: int = 0
+    #: Key evidence items (those the verdict likely breaks without), and how many
+    #: of them lost every source in Stage 2. The latter is what rejects an instance.
+    n_key: int = 0
+    n_key_lost: int = 0
     results: dict[str, SufficiencyResult] = field(default_factory=dict)
 
     @property
@@ -99,9 +100,16 @@ async def reconstruct_claim(
         threshold: float = None,
         re_extract: bool = False,
         re_filter: bool = False,
+        re_retrieve: bool = False,
 ) -> ClaimOutcome:
     """Runs stages 1-3 for a single claim. Resumable: work already stored in the
-    DB is reused unless `re_extract`/`re_filter` force it to be redone."""
+    DB is reused unless `re_extract`/`re_filter` force it to be redone.
+
+    `re_filter` judges every citation again against the stored sources. Sources are
+    global and write-once, so it does not fetch them anew; `re_retrieve` does, and
+    implies re-judging this claim's citations. Other claims citing a re-retrieved
+    source notice that their citations became stale the next time they are
+    processed."""
     if mode is None:
         mode = default_ensemble_mode
     if threshold is None:
@@ -127,6 +135,14 @@ async def reconstruct_claim(
     # orchestration talks to one injectable database handle.
     evidence: list[Evidence] = await db.get_evidence_for_claim(claim.id)
     rationales: list[VerdictRationale] = await db.get_verdict_rationales_for_claim(claim.id)
+    if any(not item.citations for item in evidence):
+        # Extraction never stores an item without a citation, so such an item comes
+        # from before sources and citations had tables of their own: its sources
+        # sit in the legacy `evidence_sources` table, which is no longer read.
+        # Filtering it would reject the claim for "losing" sources it still has.
+        logger.info(f"Claim {claim.id} has evidence stored in the legacy format; "
+                    f"re-extracting it.")
+        re_extract = True
     if re_extract or not (evidence or rationales):
         extraction = await extract_evidence(claim, replace=re_extract)
         evidence, rationales = extraction.evidence, extraction.rationales
@@ -140,16 +156,19 @@ async def reconstruct_claim(
     await db.set_gold_evidence_status(claim.id, STATUS_EXTRACTED)
 
     # --- Stage 2 -----------------------------------------------------------
-    # Items waiting out a rate limit are left alone until their window expires.
+    # Items waiting out a rate limit are left alone until their window expires. An
+    # item counts as unfiltered also when a citation went stale, i.e. its source
+    # was re-retrieved (possibly for another claim) after the citation was judged.
+    redo = re_filter or re_retrieve
     pending = [e for e in evidence
-               if (re_filter or not e.filtered) and not e.deferred]
-    if re_filter:
-        # Redoing Stage 2 includes the item-level judgement: the dates it was
-        # gated on are about to be re-established.
-        for item in pending:
+               if (redo or not e.filtered) and not e.deferred]
+    for item in pending:
+        if redo or any(citation.stale for citation in item.citations):
+            # Redoing Stage 2 includes the item-level judgement: the dates it was
+            # gated on are about to be re-established.
             item.later_event = None
     if pending:
-        await filter_evidence(claim, pending)
+        await filter_evidence(claim, pending, re_retrieve=re_retrieve, re_judge=re_filter)
 
     outcome.n_deferred = sum(1 for e in evidence if e.deferred)
     if outcome.n_deferred:
@@ -157,21 +176,22 @@ async def reconstruct_claim(
         # can be decided yet. Rejecting here would blame the claim for a throttled
         # source, and that rejection would be recorded permanently.
         logger.debug(f"Claim {claim.id} deferred: {outcome.n_deferred} evidence "
-                     f"item(s) wait for a rate-limited source.")
+                     f"item(s) cite a rate-limited source.")
         return await _finish(claim, outcome, STATUS_DEFERRED, None)
 
     outcome.n_admissible = sum(1 for item in evidence if item.admissible)
 
-    # The argument is broken when a proposition the rationale rests on has no
-    # admissible source left. Redundancy saves it: an item survives as long as one
-    # of its sources does.
-    outcome.n_essential = len(essential(evidence))
-    lost = lost_essential(evidence)
-    outcome.n_essential_lost = len(lost)
+    # The argument is broken when a key proposition has no admissible source
+    # left. Redundancy saves it at two levels: an item survives as long as one of
+    # its sources does, and an auxiliary item may be lost altogether, since the
+    # verdict does not break without it - Stage 3 judges whether the rest suffices.
+    outcome.n_key = len(key_evidence(evidence))
+    lost = lost_key(evidence)
+    outcome.n_key_lost = len(lost)
     if lost:
-        logger.debug(f"Claim {claim.id} rejected: {len(lost)} essential item(s) lost "
+        logger.debug(f"Claim {claim.id} rejected: {len(lost)} key item(s) lost "
                      f"every source, e.g. {lost[0].proposition[:120]!r}")
-        return await _finish(claim, outcome, STATUS_REJECTED, REJECT_ESSENTIAL_EVIDENCE_LOST)
+        return await _finish(claim, outcome, STATUS_REJECTED, REJECT_KEY_EVIDENCE_LOST)
     await db.set_gold_evidence_status(claim.id, STATUS_FILTERED)
 
     # --- Stage 3 -----------------------------------------------------------
@@ -180,9 +200,9 @@ async def reconstruct_claim(
         result = await validate_sufficiency(
             claim, subset, gold, condition=condition, mode=mode, threshold=threshold,
             rationales=rationales,
-            # A condition that cannot supply an essential proposition cannot support
-            # the rationale either, so there is nothing for the ensemble to decide.
-            missing_essential=missing_essential(evidence, condition),
+            # A condition that cannot supply a key proposition cannot carry the
+            # verdict, so there is nothing for the ensemble to decide.
+            missing_key=missing_key(evidence, condition),
         )
         outcome.results[condition] = result
         await db.save_gold_evidence_result(result.to_db_dict())
@@ -228,6 +248,33 @@ async def reconstruct_claims(claims: list[Claim], **kwargs) -> list[ClaimOutcome
     return [o for o in outcomes if o is not None]
 
 
+async def retry_deferred_archive_today_sources(**kwargs) -> list[ClaimOutcome]:
+    """Clears the deferral of every source still waiting behind Archive.today's
+    access check and re-runs reconstruction for the claims citing them, instead of
+    waiting out `defer_hours`. Sources are global, so each is cleared once however
+    many claims cite it.
+
+    Meant to be run once a human has passed the check (e.g. via scrapeMM's
+    `configure_archive_today_session()`). `kwargs` are forwarded to
+    `reconstruct_claims` (e.g. `mode`, `threshold`). See
+    `veritas.pipeline.stage_4.retry_deferred_archive_today_appearances` for the
+    main-pipeline counterpart, and `scripts/retry_deferred_archive_today.py`
+    for the entry point that runs both."""
+    sources = await db.get_deferred_archive_today_sources()
+    if not sources:
+        return []
+
+    for source in sources:
+        source.deferred_until = None
+        await db.update_source(source)
+
+    claim_ids = await db.get_claim_ids_citing_sources([source.id for source in sources])
+    if not claim_ids:
+        return []
+    claims = await db.get_claims_by_ids(claim_ids)
+    return await reconstruct_claims(claims, **kwargs)
+
+
 async def claim_reference_times(claim: Claim):
     """Convenience re-export so scripts need only import from this module."""
     return await get_reference_times(claim)
@@ -251,8 +298,8 @@ def summarize(outcomes: list[ClaimOutcome]) -> dict:
         "n_admissible": sum(o.n_admissible for o in outcomes),
         "n_deferred_evidence": sum(o.n_deferred for o in outcomes),
         "n_rationales": sum(o.n_rationales for o in outcomes),
-        "n_essential": sum(o.n_essential for o in outcomes),
-        "n_essential_lost": sum(o.n_essential_lost for o in outcomes),
+        "n_key": sum(o.n_key for o in outcomes),
+        "n_key_lost": sum(o.n_key_lost for o in outcomes),
         "recoverable": {
             condition: {str(k): v for k, v in counter.items()}
             for condition, counter in recoverable.items()

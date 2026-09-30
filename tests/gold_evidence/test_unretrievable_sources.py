@@ -2,18 +2,18 @@
 
 They are not publications: there is nothing to retrieve and nothing to re-read, and
 they need carry neither a locator nor a publication time. But once a `t_e` *is*
-known, they sit on the timeline like any other evidence and are validated against
-the cutoffs and for later events.
+known (`Citation.date_as_cited`), they sit on the timeline like any other evidence
+and are validated against the cutoffs and for later events.
 """
 
 from datetime import datetime
 
 import pytest
 
-from tests.gold_evidence.conftest import make_evidence, make_source
+from tests.gold_evidence.conftest import make_citation, make_evidence
 from veritas.common import Claim
 from veritas.gold_evidence import filtering as filtering_module
-from veritas.gold_evidence.admissibility import source_in_condition
+from veritas.gold_evidence.admissibility import citation_in_condition
 from veritas.gold_evidence.models import SourceKind
 from veritas.gold_evidence import CONDITION_CLAIM, CONDITION_FACT_CHECK
 
@@ -56,16 +56,18 @@ def stage_2(monkeypatch):
 
 
 async def filter_item(**kwargs):
-    """Filters the item's single source and returns that source."""
+    """Judges the item's single citation and returns it. Tools, offline evidence
+    and unlocated sources have no source to settle, so this is all of Stage 2 for
+    them."""
     evidence = make_evidence(decided=False, **kwargs)
-    return await filtering_module.filter_source(evidence.sources[0], evidence=evidence,
-                                                claim=CLAIM, t_c=T_C, t_f=T_F)
+    return await filtering_module.judge_citation(evidence.citations[0], evidence=evidence,
+                                                 t_c=T_C, t_f=T_F)
 
 
 async def check_item(**kwargs):
     """Runs the item-level later-event check and returns the item."""
     evidence = make_evidence(**kwargs)
-    await filtering_module.check_later_event(evidence, claim=CLAIM, t_c=T_C)
+    await filtering_module.check_later_event(evidence, claim=CLAIM)
     return evidence
 
 
@@ -73,15 +75,15 @@ async def check_item(**kwargs):
 
 @pytest.mark.parametrize("kind", [SourceKind.TOOL, SourceKind.OFFLINE])
 @pytest.mark.asyncio
-async def test_an_undated_source_is_admitted_untouched(stage_2, kind):
-    source = await filter_item(kind=kind, locator=None, available_since=None)
+async def test_an_undated_citation_is_admitted_untouched(stage_2, kind):
+    citation = await filter_item(kind=kind, locator=None, available_since=None)
 
     assert stage_2["retrievals"] == []
     assert stage_2["model"].prompts == []
-    assert source.temporal_validation is None
-    assert source.admissible is True
-    assert source_in_condition(source, CONDITION_CLAIM)
-    assert source_in_condition(source, CONDITION_FACT_CHECK)
+    assert citation.temporal_validation is None
+    assert citation.admissible is True
+    assert citation_in_condition(citation, CONDITION_CLAIM)
+    assert citation_in_condition(citation, CONDITION_FACT_CHECK)
 
 
 # --- With a publication time -----------------------------------------------
@@ -90,25 +92,25 @@ async def test_an_undated_source_is_admitted_untouched(stage_2, kind):
 @pytest.mark.asyncio
 async def test_a_dated_source_is_validated_against_both_cutoffs(stage_2, kind):
     """Available before the claim: on the timeline, and no model call needed."""
-    source = await filter_item(kind=kind, locator=None,
+    citation = await filter_item(kind=kind, locator=None,
                                  available_since=datetime(2024, 4, 15))
 
-    assert source.temporal_validation is not None
-    assert source.temporal_validation.before_claim is True
-    assert source.temporal_validation.before_fact_check is True
+    assert citation.temporal_validation is not None
+    assert citation.temporal_validation.before_claim is True
+    assert citation.temporal_validation.before_fact_check is True
     assert stage_2["model"].prompts == []  # the cutoffs are computed, not predicted
-    assert source.admissible is True
-    assert source_in_condition(source, CONDITION_CLAIM)
+    assert citation.admissible is True
+    assert citation_in_condition(citation, CONDITION_CLAIM)
 
 
 @pytest.mark.parametrize("kind", [SourceKind.TOOL, SourceKind.OFFLINE])
 @pytest.mark.asyncio
 async def test_a_source_dated_after_the_fact_check_is_inadmissible(stage_2, kind):
-    source = await filter_item(kind=kind, locator=None,
+    citation = await filter_item(kind=kind, locator=None,
                                  available_since=datetime(2024, 6, 1))
 
-    assert source.admissible is False
-    assert source.inadmissibility_reason == "after_fact_check"
+    assert citation.admissible is False
+    assert citation.inadmissibility_reason == "after_fact_check"
     assert stage_2["model"].prompts == []
 
 
@@ -139,13 +141,11 @@ async def test_a_later_event_makes_the_item_inadmissible(stage_2):
 @pytest.mark.asyncio
 async def test_the_check_runs_once_however_many_sources_report_the_proposition(stage_2):
     """It is the proposition that rests on a later event, not one place it is read."""
-    from tests.gold_evidence.conftest import make_source
-
-    item = await check_item(sources=[
-        make_source(locator="https://a/1", available_since=datetime(2024, 5, 10),
-                    before_claim=False),
-        make_source(locator="https://a/2", available_since=datetime(2024, 5, 12),
-                    before_claim=False),
+    item = await check_item(citations=[
+        make_citation(locator="https://a/1", available_since=datetime(2024, 5, 10),
+                      before_claim=False),
+        make_citation(locator="https://a/2", available_since=datetime(2024, 5, 12),
+                      before_claim=False),
     ])
     assert len(stage_2["model"].prompts) == 1
     # Both sources are named in that one prompt.
@@ -186,10 +186,9 @@ def test_an_item_that_lost_every_source_is_not_worth_the_call():
 @pytest.mark.asyncio
 async def test_an_unlocated_source_is_discarded_without_a_retrieval(stage_2):
     """A news article the fact-check cites but never links: nothing to retrieve."""
-    source = await filter_item(kind=SourceKind.NEWS_ARTICLE, locator=None)
+    citation = await filter_item(kind=SourceKind.NEWS_ARTICLE, locator=None)
 
     assert stage_2["retrievals"] == []
-    assert source.accessible is False
-    assert source.admissible is False
-    assert source.inadmissibility_reason == "inaccessible"
-    assert "without locating it" in source.dismissed_reason
+    assert citation.source is None
+    assert citation.admissible is False
+    assert citation.inadmissibility_reason == "inaccessible"

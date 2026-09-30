@@ -8,7 +8,6 @@ from asyncpg import DataError, UniqueViolationError
 from bs4 import BeautifulSoup
 from langdetect import detect
 from pydantic import HttpUrl, ValidationError
-from scrapemm.util import URL_REGEX
 
 from veritas import logger
 from veritas.common import Appearance, Review
@@ -21,7 +20,7 @@ from veritas.pipeline.util.stage import Stage
 from veritas.util import run_with_semaphore
 from veritas.util.parsing import get_lang_from_code, determine_date
 from veritas.util.scraping import get_static_htmls
-from veritas.util.url import get_domain, is_domain_root
+from veritas.util.url import URL_REGEX, get_domain, is_domain_root
 from veritas.util.util import validate, get_quarter_start_date
 
 datacommons = DataCommonsFeedRetriever()
