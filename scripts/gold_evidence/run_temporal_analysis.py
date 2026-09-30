@@ -92,7 +92,7 @@ async def collect(args) -> tuple[list, list[dict]]:
                 result = await validate_sufficiency(
                     claim, subset, gold, condition=condition, mode=args.mode,
                     threshold=args.threshold, rationales=rationales,
-                    missing_key=missing_key(evidence, condition))
+                    n_key_missing=len(missing_key(evidence, condition)))
                 await db.save_gold_evidence_result(result.to_db_dict())
                 stored[condition] = result.to_db_dict()
 
@@ -153,6 +153,7 @@ def render_markdown(aggregates: dict, mode: str) -> str:
         f"| Claims with a verdict rationale | {_pct(aggregates['share_claims_with_rationale'])} |",
         f"| Claims without admissible evidence | {_pct(aggregates['share_claims_without_admissible_evidence'])} |",
         f"| Key evidence items (lost) | {aggregates['n_key']} ({aggregates['n_key_lost']}) |",
+        f"| Accepted instances that lost a key item | {_pct(aggregates['share_accepted_despite_lost_key'])} |",
         f"| Auxiliary evidence items lost | {aggregates['n_auxiliary_lost']} |",
         f"| Accepted instances that lost an evidence item | {_pct(aggregates['share_accepted_despite_lost_evidence'])} |",
         "",

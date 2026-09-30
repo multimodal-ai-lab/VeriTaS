@@ -94,6 +94,41 @@ uvicorn webui.main:app --reload --port 8080
 The health indicator in the top bar shows whether the database and the media
 registry were found; hover it for the resolved paths.
 
+### Public access over TLS
+
+The UI can be served publicly over HTTPS by an optional [Caddy](https://caddyserver.com)
+front (`webui-tls` in `docker-compose.yaml`), which obtains and renews the
+certificate from Let's Encrypt on its own. It is off by default and switched on in
+`.env`:
+
+```dotenv
+COMPOSE_PROFILES=tls
+WEBUI_DOMAIN=veritas.example.org
+# Keep plain HTTP on WEBUI_PORT local, so the UI is only reachable via HTTPS.
+WEBUI_BIND=127.0.0.1
+```
+
+Then `docker compose up -d` starts both services, and the UI is at
+`https://veritas.example.org`. Requirements:
+
+- `WEBUI_DOMAIN` resolves (A/AAAA record) to this host's public address.
+- Ports 80 and 443 are reachable from the internet - 80 for Let's Encrypt's HTTP
+  challenge and the redirect to HTTPS - and not used by another web server.
+- On a podman host (`COMPOSE_FILE=docker-compose.yaml:docker-compose.podman.yaml`)
+  the front shares the host's network like the UI. Rootless podman can bind 80 and
+  443 only after `sudo sysctl net.ipv4.ip_unprivileged_port_start=80` (persist it
+  in `/etc/sysctl.d/`). There, `WEBUI_BIND=127.0.0.1` makes the UI itself bind
+  the loopback only.
+
+Certificates live in the `caddy_data` volume, so a restart does not request new
+ones. `WEBUI_UPSTREAM` overrides where the front finds the UI (default `webui:<port>`
+on Docker, `127.0.0.1:<port>` on a podman host).
+
+**The UI has no login.** Serving it publicly makes every stored claim, evidence item,
+source and model reasoning trace readable by anyone who knows the address - it is
+read-only, but not private. Restrict access (e.g. Caddy `basic_auth`, or an IP
+allow-list in the firewall) if the data must not be public yet.
+
 ## What it shows
 
 **Overview** — claim statuses and rejection reasons, evidence admissibility and

@@ -1,0 +1,32 @@
+# Task
+Below is the raw scraping result of a web source: a news article, a social media post, an official record or register entry, a database page, a document rendered as text, a video page, or similar. Besides the source's own content, the scrape usually contains page clutter. **Your task is to identify the lines that make up the source's main content.** Each line is prefixed with its line number.
+
+Media are shown as inline references like `<image:N>` or `<video:N>`, where `N` is a number. Treat them as part of the line they stand on.
+
+## What to Keep
+- The title or headline
+- The author, account name, byline and date line
+- The main text: article body, post text, record or table contents, document text, video description or transcript
+- The media that belong to the content itself: images, videos and embedded posts that the source presents as part of its content, together with their captions and credits
+- For social media posts: the post itself, including its media, even if they are shown above the text
+
+## What to Remove
+- Navigation, menus, breadcrumbs and search bars
+- Ads and sponsored content
+- Cookie, consent and privacy notices
+- Newsletter, subscription and app download prompts
+- Share, like and follow buttons, and other UI elements
+- "Related", "Recommended", "Most read", "Read also" and similar lists of other content, including their thumbnails
+- Comments and replies by other users
+- Footers, legal notices and copyright lines
+- Login, paywall and "sign up to continue" text
+
+## Scraped Source ({{ n_lines }} lines)
+{{ page }}
+
+# Response Format
+Answer with the line ranges of the main content, each written as `start-end` (both inclusive) and enclosed in single backticks, e.g. `12-57`. Usually one range suffices. Give several ranges only if the main content is interrupted by clutter, e.g. `12-40` `46-57`, or if the media of a post are separated from its text.
+
+Do not rewrite, summarize or quote any content; the lines are taken over exactly as they are. If the scrape contains no main content at all (e.g. only an error message or a login wall), answer `none`.
+
+# Your Response

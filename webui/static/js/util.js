@@ -195,6 +195,7 @@ export function mediaSelect(state, key, apply) {
 export const REASON_HELP = {
     not_filtered: 'Stage 2 did not complete for this item.',
     low_extraction_confidence: 'Extraction confidence below the configured minimum.',
+    locator_missing: 'The article cites the source without a locator, so there is nothing to retrieve (§3.1).',
     inaccessible: 'The source could not be re-retrieved (§3.1).',
     undated_source: 'No publication time could be determined (see undated_policy).',
     unfaithful: 'The retrieved source no longer supports the proposition (§3.2).',
@@ -204,8 +205,10 @@ export const REASON_HELP = {
     no_gold_verdict: 'The claim has no current gold verdict.',
     no_claim_time: 'The claim has no date t_c.',
     no_fact_check_time: 'No review provides a publication time t_f.',
-    nothing_extracted: 'Stage 1 returned neither evidence nor a verdict rationale.',
-    key_evidence_lost: 'A key evidence item (one without which the verdict likely breaks) lost every one of its sources in Stage 2.',
+    no_fact_check_article: 'None of the reviews of the claim has a readable fact-checking article to extract evidence from.',
+    extraction_failed: 'Evidence extraction failed for every article; the claim is retried on the next run.',
+    nothing_extracted: 'No longer assigned: Stage 1 returned neither evidence nor a verdict rationale.',
+    key_evidence_lost: 'No longer assigned: a key evidence item lost every one of its sources in Stage 2.',
     sufficiency_validation_failed: 'The ensemble did not return a usable verdict.',
     insufficient_evidence: 'The predicted verdict was not close enough to the gold verdict.',
 };

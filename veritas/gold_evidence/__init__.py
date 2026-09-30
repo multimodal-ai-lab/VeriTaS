@@ -24,9 +24,13 @@ def _get(key: str, default):
 
 # --- Models -------------------------------------------------------------------
 
-#: Model used for Stage 1 evidence extraction. "auto" selects `gemini_strong` for
-#: articles containing videos and `gpt_strong` otherwise (as in stage 5).
+#: Model used for Stage 1 evidence extraction of articles without videos.
+#: "auto" selects `gpt_strong` (as in stage 5).
 extraction_model: str = _get("extraction_model", "auto")
+
+#: Model used for Stage 1 evidence extraction of articles containing videos. Must be
+#: able to read videos natively. "auto" selects `gemini_strong` (as in stage 5).
+extraction_video_model: str = _get("extraction_video_model", "auto")
 
 #: Model used for the Stage 2 faithfulness and temporal assessments.
 filtering_model: str = _get("filtering_model", "auto")
@@ -34,7 +38,13 @@ filtering_model: str = _get("filtering_model", "auto")
 #: Cheap model used for the (optional) LLM fallback that determines `available_since`.
 dating_model: str = _get("dating_model", "auto")
 
-#: Ensemble members of the Stage 3 sufficiency validator. None -> global singleton.
+#: Cheap model that trims a retrieved source down to its main content (the page's
+#: own text and media, without navigation, ads, cookie notices, comments ...).
+#: "auto" -> `gpt_nano`, as for the fact-checking articles in the main pipeline.
+cleaning_model: str = _get("cleaning_model", "auto")
+
+#: Ensemble members of the Stage 3 sufficiency validator. None -> the global
+#: ensemble singleton, whose members are configured under `models.ensemble`.
 ensemble_models: list[str] | None = _cfg.get("ensemble_models")
 
 # --- Reasoning effort ---------------------------------------------------------
@@ -46,6 +56,7 @@ ensemble_models: list[str] | None = _cfg.get("ensemble_models")
 #: evidence alone needs the most.
 reasoning_effort_extraction: str | None = _cfg.get("reasoning_effort_extraction", "medium")
 reasoning_effort_dating: str | None = _cfg.get("reasoning_effort_dating", None)
+reasoning_effort_cleaning: str | None = _cfg.get("reasoning_effort_cleaning", None)
 reasoning_effort_faithfulness: str | None = _cfg.get("reasoning_effort_faithfulness", "low")
 reasoning_effort_temporal: str | None = _cfg.get("reasoning_effort_temporal", "medium")
 reasoning_effort_sufficiency: str | None = _cfg.get("reasoning_effort_sufficiency", "high")
@@ -87,6 +98,13 @@ min_ensemble_ratings: int = int(_get("min_ensemble_ratings", 3))
 max_evidence_per_claim: int = int(_get("max_evidence_per_claim", 20))
 max_reviews_per_claim: int = int(_get("max_reviews_per_claim", 2))
 max_source_content_length: int = int(_get("max_source_content_length", 30_000))
+#: How much of a retrieved source the cleaning model is shown, in characters. Larger
+#: than `max_source_content_length`: the noise it removes is what made pages long.
+max_cleaning_input_length: int = int(_get("max_cleaning_input_length", 100_000))
+#: At most this many of a source's media are attached to one citation - and hence
+#: injected into the proposition it supports - so that media-heavy pages (galleries,
+#: feeds) cannot flood the sufficiency prompt.
+max_media_per_citation: int = int(_get("max_media_per_citation", 4))
 max_article_length: int = int(_get("max_article_length", 50_000))
 
 # --- Concurrency --------------------------------------------------------------

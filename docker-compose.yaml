@@ -25,8 +25,10 @@ services:
     restart: unless-stopped
     ports:
       # Mapped to itself, so the port is the same inside and outside the
-      # container and `WEBUI_PORT` means one thing everywhere.
-      - "${WEBUI_PORT:-8080}:${WEBUI_PORT:-8080}"
+      # container and `WEBUI_PORT` means one thing everywhere. `WEBUI_BIND`
+      # selects the host interface: set it to 127.0.0.1 when the UI is served
+      # publicly over TLS (below), so that plain HTTP stays local.
+      - "${WEBUI_BIND:-0.0.0.0}:${WEBUI_PORT:-8080}:${WEBUI_PORT:-8080}"
     environment:
       # The port uvicorn binds. Also honoured where there is no port mapping,
       # see docker-compose.podman.yaml.
@@ -51,5 +53,30 @@ services:
       # Lets `host.docker.internal` resolve on Linux, too.
       - "host.docker.internal:host-gateway"
 
+  # Optional TLS front: serves the web UI publicly over HTTPS under WEBUI_DOMAIN,
+  # with a certificate Caddy obtains and renews from Let's Encrypt. Off unless
+  # `.env` sets `COMPOSE_PROFILES=tls` (and `WEBUI_DOMAIN`); see webui/README.md.
+  webui-tls:
+    image: caddy:2
+    profiles: [ "tls" ]
+    restart: unless-stopped
+    depends_on:
+      - webui
+    ports:
+      - "80:80"      # ACME HTTP challenge, and the redirect to HTTPS
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    environment:
+      WEBUI_DOMAIN: ${WEBUI_DOMAIN:-}
+      # The web UI as seen from this container.
+      WEBUI_UPSTREAM: ${WEBUI_UPSTREAM:-webui:${WEBUI_PORT:-8080}}
+    volumes:
+      - ./webui/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account; kept so a restart does not request new ones.
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:

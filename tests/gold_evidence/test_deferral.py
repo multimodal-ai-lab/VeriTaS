@@ -45,7 +45,7 @@ def retrieval(monkeypatch):
     retrievals."""
     state = {"result": SourceRetrieval(accessible=False, rate_limited=True,
                                        error="slow down"),
-             "calls": [], "db": FakeSourceDB()}
+             "calls": [], "db": FakeSourceDB(), "cleaned": [], "judged_on": []}
 
     async def fake_retrieve(locator, determine_time=True):
         state["calls"].append(locator)
@@ -64,13 +64,19 @@ def retrieval(monkeypatch):
     async def faithful(proposition, source_str):
         from veritas.gold_evidence.models import Faithfulness
 
+        state["judged_on"].append(source_str)
         return Faithfulness(assessment=1.0)
+
+    async def fake_clean(raw_content):
+        state["cleaned"].append(raw_content)
+        return f"MAIN: {raw_content}"
 
     monkeypatch.setattr(filtering_module, "retrieve_source", fake_retrieve)
     monkeypatch.setattr(filtering_module, "db", state["db"])
     monkeypatch.setattr(filtering_module, "get_reference_times", fake_times)
     monkeypatch.setattr(filtering_module, "_is_fact_checking_org", not_a_fact_checker)
     monkeypatch.setattr(filtering_module, "assess_faithfulness", faithful)
+    monkeypatch.setattr(filtering_module, "clean_source_content", fake_clean)
     monkeypatch.setattr(filtering_module, "_retrieved_anew", set())
     monkeypatch.setattr(type(make_evidence()), "save_to_db", fake_save)
     return state
@@ -380,3 +386,138 @@ async def test_retry_without_gated_sources_does_nothing(monkeypatch):
     monkeypatch.setattr(pipeline_module, "reconstruct_claims", fake_reconstruct)
 
     assert await pipeline_module.retry_deferred_archive_today_sources() == []
+
+
+# --- Automatic retry at startup -------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_every_deferred_claim_is_retried_now(monkeypatch):
+    """At startup, deferred claims are reconstructed whatever the run is configured
+    for - and the windows of the sources they wait for are cleared, or the retry
+    would find them all still waiting and change nothing."""
+    from veritas.common import Claim
+    from veritas.gold_evidence import STATUS_DEFERRED
+    from veritas.gold_evidence import pipeline as pipeline_module
+
+    waiting = make_source(locator="https://slow.example/a", retrieved=False)
+    waiting.id = 4
+    waiting.deferred_until = datetime.now() + timedelta(hours=20)
+    claims = [Claim(id=i, data="A claim", date=T_C, appearance_ids=set(), review_ids={1})
+              for i in (7, 9)]
+
+    class FakeDB:
+        saved = []
+
+        async def get_claim_ids_with_gold_evidence_status(self, status):
+            assert status == STATUS_DEFERRED
+            return [7, 9]
+
+        async def get_deferred_sources_cited_by(self, claim_ids):
+            assert claim_ids == [7, 9]
+            return [waiting]
+
+        async def update_source(self, source):
+            self.saved.append((source.id, source.deferred_until))
+
+        async def get_claims_by_ids(self, claim_ids):
+            return claims
+
+    reconstructed = []
+
+    async def fake_reconstruct(claims, **kwargs):
+        reconstructed.append((claims, kwargs))
+        return ["outcome"]
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(pipeline_module, "db", fake_db)
+    monkeypatch.setattr(pipeline_module, "reconstruct_claims", fake_reconstruct)
+
+    outcomes = await pipeline_module.retry_deferred_claims(mode="integrity")
+
+    assert fake_db.saved == [(4, None)]
+    assert reconstructed == [(claims, {"mode": "integrity"})]
+    assert outcomes == ["outcome"]
+
+
+@pytest.mark.asyncio
+async def test_without_deferred_claims_nothing_is_retried(monkeypatch):
+    from veritas.gold_evidence import pipeline as pipeline_module
+
+    class FakeDB:
+        async def get_claim_ids_with_gold_evidence_status(self, status):
+            return []
+
+    async def fake_reconstruct(claims, **kwargs):
+        raise AssertionError("nothing to retry")
+
+    monkeypatch.setattr(pipeline_module, "db", FakeDB())
+    monkeypatch.setattr(pipeline_module, "reconstruct_claims", fake_reconstruct)
+    assert await pipeline_module.retry_deferred_claims() == []
+
+
+def test_the_reconstruction_script_retries_deferred_claims_before_its_batches():
+    """Also with `limit: 0`: the retry precedes the batch loop, which the limit
+    governs, instead of being one of its batches."""
+    import inspect
+
+    import scripts.gold_evidence.run_reconstruction as script
+
+    source = inspect.getsource(script.main)
+    assert source.index("retry_deferred_claims(") < source.index("while processed < limit")
+
+
+# --- Cleaning of the retrieved content -------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_retrieved_source_is_cleaned_once_and_judged_on_the_cleaned_content(retrieval):
+    from veritas.gold_evidence.extraction import share_sources
+
+    retrieval["result"] = accessible()
+    items = share_sources([make_evidence(proposition=p, decided=False, locator="https://a/1")
+                           for p in ("p1", "p2")])
+    await filtering_module.filter_evidence(None, items)
+
+    assert retrieval["cleaned"] == ["The page says X."]
+    source = items[0].citations[0].source
+    assert source.cleaned_content == "MAIN: The page says X."
+    assert source.raw_content == "The page says X."  # the raw scrape is kept
+    assert source.cleaned_at is not None
+    assert retrieval["judged_on"] == ["MAIN: The page says X."] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_source_stored_before_cleaning_is_cleaned_without_a_refetch(retrieval):
+    """Backfill: cleaning works on the stored content, so write-once holds."""
+    stored = make_source(locator="https://a/1", content="Old page text.")
+    await retrieval["db"].update_source(stored)
+
+    evidence = make_evidence(decided=False, locator="https://a/1")
+    await filtering_module.filter_evidence(None, [evidence])
+
+    assert retrieval["calls"] == []  # no retrieval
+    assert retrieval["cleaned"] == ["Old page text."]
+    assert evidence.citations[0].source.cleaned_content == "MAIN: Old page text."
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cleaning_is_not_retried_and_the_raw_content_applies(retrieval, monkeypatch):
+    async def refusing_clean(raw_content):
+        retrieval["cleaned"].append(raw_content)
+        return None
+
+    monkeypatch.setattr(filtering_module, "clean_source_content", refusing_clean)
+    retrieval["result"] = accessible()
+    await filtering_module.filter_evidence(None, [make_evidence(decided=False, locator="https://a/1")])
+    second = make_evidence(decided=False, locator="https://a/1", claim_id=2)
+    await filtering_module.filter_evidence(None, [second])
+
+    assert retrieval["cleaned"] == ["The page says X."]  # attempted once
+    assert second.citations[0].source.main_content == "The page says X."
+    assert retrieval["judged_on"][-1] == "The page says X."
+
+
+@pytest.mark.asyncio
+async def test_an_inaccessible_source_is_not_cleaned(retrieval):
+    retrieval["result"] = SourceRetrieval(accessible=False, error="404")
+    await filtering_module.filter_evidence(None, [make_evidence(decided=False)])
+    assert retrieval["cleaned"] == []

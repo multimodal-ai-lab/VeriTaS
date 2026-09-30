@@ -113,10 +113,12 @@ def test_min_extraction_confidence_is_applied_when_configured():
            is InadmissibilityReason.LOW_CONFIDENCE
 
 
-def test_a_source_without_a_locator_is_inaccessible_at_once():
-    """There is nothing to retrieve, now or ever - Stage 2 never even tries."""
+def test_a_source_without_a_locator_is_rejected_as_such_at_once():
+    """There is nothing to retrieve, now or ever - Stage 2 never even tries. It is
+    reported as a missing locator, not as link rot: no retrieval ever failed."""
     source = make_citation(locator=None, filtered=False)
-    assert determine_inadmissibility(source) is InadmissibilityReason.INACCESSIBLE
+    assert determine_inadmissibility(source) is InadmissibilityReason.LOCATOR_MISSING
+    assert InadmissibilityReason.LOCATOR_MISSING.value == "locator_missing"
 
 
 @pytest.mark.parametrize("kind", [SourceKind.TOOL, SourceKind.OFFLINE])

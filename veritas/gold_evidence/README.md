@@ -18,7 +18,7 @@ their rationale.
 | Stage | Module | What it does |
 | --- | --- | --- |
 | 1 | `extraction.py` | An MLLM reads the stored fact-check article and returns candidate `Evidence` items (an atomic proposition plus a `Citation` of every source that reports it) **and** the `VerdictRationale` that turns those propositions into a verdict. |
-| 2 | `filtering.py`, `retrieval.py` | Per **source**, i.e. once per URL: re-retrieve it through scrapeMM and date it (§3.1), and check the publisher registry for a verdict leak (§3.3). Per **citation**: check the source still supports the proposition (§3.2) and compute the two cutoffs of the citing claim (§3.3). Per **item**, once its citations are dated: does the proposition rest on a change of the world that happened only after `t_c`? Tools and offline evidence skip retrieval and faithfulness; a rate-limited or Archive.today-gated source defers every item citing it. |
+| 2 | `filtering.py`, `retrieval.py`, `dating.py`, `cleaning.py` | Per **source**, i.e. once per URL: re-retrieve it through scrapeMM, date it (§3.1), trim it to its main content, and check the publisher registry for a verdict leak (§3.3). Per **citation**: check the source still supports the proposition (§3.2), name the source's media that show it, and compute the two cutoffs of the citing claim (§3.3). Per **item**, once its citations are dated: does the proposition rest on a change of the world that happened only after `t_c`? Tools and offline evidence skip retrieval and faithfulness; a rate-limited or Archive.today-gated source defers every item citing it. |
 | 3 | `sufficiency.py`, `closeness.py` | A cross-family ensemble predicts a verdict from claim + retained evidence + rationale, and `is_close` compares it to the gold verdict. |
 | — | `analysis.py` | Aggregation for the temporal analysis, including the paired recoverability test. |
 
@@ -45,7 +45,7 @@ rationale says just that. It is handed to the sufficiency ensemble alongside the
 evidence, which is what makes an **empty evidence set** analyzable instead of
 looking like a failed reconstruction.
 
-## Evidence, sources, and what disqualifies an instance
+## Evidence, sources, and roles
 
 An **evidence item** is one proposition; a **source** is a publication, identified
 by its URL; a **citation** records that an item cites a source for its proposition.
@@ -64,8 +64,10 @@ The three levels follow the questions Stage 2 asks:
 - **Item** — the proposition, its role, and whether it rests on a later event.
 
 A source the article cites without linking becomes a citation without a source and
-is settled as `inaccessible` straight away - unless it is a tool or offline
-evidence, which need no locator. An item therefore **survives as long as one of its
+is settled as `locator_missing` straight away - unless it is a tool or offline
+evidence, which need no locator. That is kept apart from `inaccessible`, which means
+a retrieval was tried and failed (link rot), not that the article never said where
+the material came from. An item therefore **survives as long as one of its
 citations does**, and losing a source costs the reconstruction nothing as long as
 another still reports the proposition.
 
@@ -92,20 +94,27 @@ removing the item from that list would do to the gold verdict:
 - **background** — context for understanding the claim or its circumstances,
   without directly contributing to the justification.
 
-Only one or two items — or none — are typically `key`. An instance is disqualified
-**not** when its evidence set ends up empty, but when a key item loses *every*
-citation (`key_evidence_lost`). Losing an auxiliary item never disqualifies it;
-whether the remaining evidence still carries the verdict is for the sufficiency
-ensemble to judge.
+Only one or two items — or none — are typically `key`. The roles are **recorded,
+not enforced**: an instance is not discarded because a key item lost every citation,
+and a condition lacking a key item is not recorded as insufficient in advance.
+Whether the remaining evidence still carries the verdict is decided by one judge
+only, the sufficiency ensemble. The exports report how many key items each instance
+lost (`n_key_lost`) and how many each condition lacked (`n_key_missing`), and
+`share_accepted_despite_lost_key` says how often the ensemble recovered the verdict
+anyway.
 
-The same rule decides the two conditions without asking the ensemble: if a key item
-has no citation inside `E_c`, that condition cannot carry the verdict, so it is
-recorded as insufficient directly. That is a finding about the claim, not a defect
-of the reconstruction.
+Neither is an empty extraction a rejection. An article that yields no evidence and
+no rationale leaves the ensemble to judge the claim on its own. Only two outcomes of
+Stage 1 are not analyzed: a claim without any readable fact-checking article is
+rejected (`no_fact_check_article`), and a claim for which the extractor *failed* on
+every article (an error or an unusable response - not an empty result) stays
+`pending` (`extraction_failed`) and is extracted again on the next run.
 
 Rows written before the rename carry the role `essential` and the rejection reason
 `essential_evidence_lost`. They are left untouched in the database and read as `key`
 and `key_evidence_lost` (`models.LEGACY_ROLE_ALIASES`, `LEGACY_REASON_ALIASES`).
+`key_evidence_lost` and `nothing_extracted` are no longer assigned; claims processed
+before carry them until they are reconstructed again.
 
 ## Reference times
 
@@ -131,10 +140,13 @@ another claim - even one running concurrently - already retrieved is adopted
 instead of fetched again:
 
 1. `retrieve(url, output_format="multimodal")`
-2. publication time from the meta tags of the raw HTML that the *same* response
-   carries in `response.content.html` (reuses `stage_3.extract_date_meta`)
+2. publication time from the markup of the raw HTML that the *same* response
+   carries in `response.content.html` (`dating.extract_publication_time`): JSON-LD,
+   Open Graph, microdata and other publication meta tags - never modified or
+   updated fields, and never a partial or implausible date
 3. only if step 2 found nothing: a cheap model reads a stated publication time off
-   the retrieved content, and returns nothing rather than guessing
+   the retrieved content, shown together with the HTML's remaining `<time>` markup,
+   and returns nothing rather than guessing
 
 scrapeMM produces every format preceding the requested one, so `content.multimodal`
 and `content.html` come out of one call — no second retrieval, no separate
@@ -145,8 +157,12 @@ HTML page, are dated in step 3.
 
 A source that only *rate-limited* us is not inaccessible: it is deferred for
 `defer_hours`, and so is every item citing it; their claims end on status
-`deferred`, which a later run picks up again. An exhausted scrapeMM quota, like an exhausted model quota, aborts the run
-instead of being recorded against the claim that hit it.
+`deferred`. **Every reconstruction run starts by retrying all deferred claims** -
+independent of its date range, claim IDs and `limit`, so also with `limit: 0` - and
+clears the deferral windows of the sources they wait for, so that the retry actually
+retrieves them. A source that is still throttled simply defers again. An exhausted
+scrapeMM quota, like an exhausted model quota, aborts the run instead of being
+recorded against the claim that hit it.
 
 A source gated behind Archive.today's access check is deferred the same way -
 scrapeMM buffers the URL and answers it from a persistent cache once a human
@@ -154,6 +170,36 @@ passes the CAPTCHA, which can take much longer than `defer_hours`. Once that has
 happened, `python -m scripts.retry_deferred_archive_today` clears the deferral
 of every affected source (and every affected Stage 4 appearance) and retries it
 right away, instead of waiting for the next scheduled run to notice.
+
+## Source media in the evidence
+
+Fact-checks often only *link* the post, photo or video a proposition is about, so
+the medium is in the source, not in the article Stage 1 reads. Stage 1 therefore
+stays article-only, and the media are added in Stage 2, where a proposition first
+meets its sources:
+
+1. Each retrieved source is **cleaned** once (`cleaning.py`): a cheap model names
+   the line ranges of the page's main content - title, byline, text, its own media
+   and captions - and everything else (navigation, ads, consent notices, related
+   articles, comments) is cut. Lines are never rewritten, so media references
+   survive verbatim. The result is `Source.cleaned_content`; `raw_content` is kept,
+   and a cleaning that fails or would lose substance leaves the raw content in use.
+   Sources retrieved before are cleaned from their stored content, without a refetch.
+2. The **faithfulness judge**, which sees one proposition next to one source's
+   (cleaned) content, also names the source's media that show what the proposition
+   states (`Faithfulness.media`, at most `max_media_per_citation`). A reference that
+   does not occur in the content the judge was shown is dropped.
+3. Once a citation is **admissible**, its media references are put in front of the
+   proposition (`models.prepend_media`), so every later step - the later-event check,
+   the sufficiency ensemble, the web UI - sees the proposition with its media.
+   Prepending is idempotent: judging an item again does not repeat a medium.
+
+Because the media become part of the proposition, they are shown in every condition
+the item is in. An item in `E_c` through an early citation also shows the media of a
+source that only appeared later (see DESIGN_DECISIONS §24).
+
+Existing citations get media when they are next judged (`re_filter: True`); no
+source needs to be fetched again.
 
 ## Running it
 
@@ -200,6 +246,21 @@ and mode, reasoning effort per task, thresholds, the undated-source policy, the
 per-claim budgets and the concurrency limits. Every key has a default, so an
 un-updated `config.yaml` still works.
 
+Model *versions* are set once for all of VeriTaS, in the top-level `models:`
+section (`gpt_strong`, `gpt_cheap`, `gpt_nano`, `gpt_transcribe`, `text_embedder`,
+`gemini_strong`, `gemini_cheap`, and the members of the global `ensemble`). A
+`gold_evidence` model key set to `auto` uses those: `extraction_model` → `gpt_strong`,
+`extraction_video_model` (articles with videos; must read video natively) →
+`gemini_strong`, `filtering_model` → `gpt_strong`, `dating_model` → `gpt_nano`, and
+`ensemble_models: null` → `models.ensemble`. Note that `models.ensemble` lists its
+members explicitly, so changing `gpt_strong` alone does not change the ensemble.
+
+The scrapeMM server is set in the top-level `scrapemm:` section (`api_url`,
+`api_key`) and configured for the running process on import. The environment
+variables `SCRAPEMM_API_URL` / `SCRAPEMM_API_KEY` take precedence over it.
+`python -m scripts.configure_scrapemm` saves the same values as scrapeMM's
+persistent client configuration, for tools that do not import VeriTaS.
+
 The concurrency limits nest: `claim_concurrency` claims are reconstructed at once
 and each filters up to `evidence_concurrency` of its evidence items at once, so the
 peak number of in-flight retrievals and LLM calls is their product.
@@ -221,9 +282,10 @@ Additive only:
 - `evidence` — one row per reconstructed evidence item (proposition, role, and the
   outcome derived from its sources), with a `full_evidence` JSONB blob as the
   authoritative representation of the item itself.
-- `sources` — one row per URL, global: the retrieved content, `available_since`
-  and how it was dated, accessibility, the registry's fact-check finding and any
-  deferral, with a `full_source` blob. Unique on a SHA-1 of the normalized URL.
+- `sources` — one row per URL, global: the retrieved content, its cleaned main
+  content (`cleaned_content`), `available_since` and how it was dated,
+  accessibility, the registry's fact-check finding and any deferral, with a
+  `full_source` blob. Unique on a SHA-1 of the normalized URL.
 - `citations` — one row per (evidence item, source): name, kind and proximity as
   cited, faithfulness, the cutoffs of the citing claim and the admissibility, with a
   `full_citation` blob. A citation of a source the article never located has no

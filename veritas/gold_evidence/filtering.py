@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 
 import json_repair
@@ -47,6 +48,7 @@ from veritas.gold_evidence import (
     defer_hours,
     evidence_concurrency,
     filtering_model,
+    max_media_per_citation,
     max_source_content_length,
     reasoning_effort_faithfulness,
     reasoning_effort_temporal,
@@ -57,6 +59,7 @@ from veritas.gold_evidence.admissibility import (
     compute_temporal_bounds,
     select,
 )
+from veritas.gold_evidence.cleaning import clean_source_content
 from veritas.gold_evidence.llm import FATAL_ERRORS, resolve_model
 from veritas.gold_evidence.models import (
     Citation,
@@ -65,6 +68,8 @@ from veritas.gold_evidence.models import (
     LaterEventCheck,
     Source,
     TemporalValidation,
+    media_references,
+    prepend_media,
     to_naive,
 )
 from veritas.gold_evidence.retrieval import retrieve_source
@@ -178,6 +183,11 @@ async def settle_source(source: Source, *, re_retrieve: bool = False) -> Source:
         if re_retrieve and source.key not in _retrieved_anew:
             source.reset_retrieval()
         elif source.decided or source.deferred:
+            # Retrieved before sources were cleaned: clean the stored content now.
+            # That needs no refetch, so it does not break write-once.
+            if needs_cleaning(source):
+                await clean_source(source)
+                await db.update_source(source)
             return source
 
         persist = True
@@ -234,6 +244,36 @@ async def settle_source(source: Source, *, re_retrieve: bool = False) -> Source:
             if persist:
                 await db.update_source(source)
 
+        # After the retrieval is stored: a quota error while cleaning must not
+        # discard a retrieval that already succeeded.
+        if needs_cleaning(source):
+            await clean_source(source)
+            await db.update_source(source)
+
+    return source
+
+
+def needs_cleaning(source: Source) -> bool:
+    """Whether the source has retrieved content that was never put through
+    cleaning. Attempted once: a page cleaning cannot handle keeps its raw content."""
+    return bool(source.accessible and source.raw_content and source.cleaned_at is None)
+
+
+async def clean_source(source: Source) -> Source:
+    """Trims the source's content to its main content (`cleaning`), in place. The
+    judges then read the cleaned content, see `Source.main_content`; a failed or
+    refused cleaning leaves `cleaned_content` empty, i.e. the raw content applies."""
+    try:
+        cleaned = await clean_source_content(source.raw_content)
+        # A page short enough to need no cleaning comes back as it is; storing it a
+        # second time would only duplicate the raw content.
+        source.cleaned_content = cleaned if cleaned != source.raw_content else None
+    except FATAL_ERRORS:
+        raise
+    except Exception as e:
+        logger.debug(f"Cleaning source {source.locator} failed: {type(e).__name__}: {e}")
+        source.cleaned_content = None
+    source.cleaned_at = datetime.now()
     return source
 
 
@@ -244,8 +284,14 @@ async def judge_citation(citation: Citation, *,
     """Runs §3.2 and §3.3 on one citation, against the settled state of the source
     it cites, and sets its admissibility."""
     def decide() -> Citation:
-        return apply_admissibility(citation, undated_policy=undated_policy,
-                                   extraction_confidence=evidence.extraction_confidence)
+        apply_admissibility(citation, undated_policy=undated_policy,
+                            extraction_confidence=evidence.extraction_confidence)
+        # The media the judge found go in front of the proposition - only from a
+        # citation that stays: an unfaithful or inaccessible source's media do not
+        # show what the proposition states.
+        if citation.admissible and citation.media:
+            evidence.proposition = prepend_media(evidence.proposition, citation.media)
+        return citation
 
     citation.error = None
     citation.faithfulness = None
@@ -267,7 +313,9 @@ async def judge_citation(citation: Citation, *,
             return decide()
 
         # --- §3.2 Faithfulness ------------------------------------------------------
-        source_str = (source.raw_content or "")[:max_source_content_length]
+        # The cleaned content: without navigation, ads and the like, the budget
+        # goes to the page itself, and so do the media the judge may attach.
+        source_str = (source.main_content or "")[:max_source_content_length]
         citation.faithfulness = await assess_faithfulness(evidence.proposition, source_str)
 
         # --- §3.3 Cutoffs -----------------------------------------------------------
@@ -326,12 +374,20 @@ async def assess_faithfulness(proposition: str, source_str: str) -> Faithfulness
     """Determines whether the retrieved source still entails the proposition.
 
     Receives proposition + source content only - no claim, no gold verdict, no
-    fact-checker reasoning - to rule out circular validation."""
+    fact-checker reasoning - to rule out circular validation.
+
+    The same call names the source's media that show what the proposition states
+    (`Faithfulness.media`): it is the one judgement that sees a proposition next to
+    a source, media included. Only references that occur in `source_str` - the
+    content the judge was shown - are kept, at most `max_media_per_citation`."""
     model = _resolve_filtering_model()
+    available_media = media_references(source_str)
     prompt = Prompt(
         FAITHFULNESS_PROMPT_PATH,
         proposition=proposition,
         source=source_str,
+        has_media=bool(available_media),
+        max_media=max_media_per_citation,
     )
     try:
         response, reasoning = await model.generate(
@@ -347,8 +403,35 @@ async def assess_faithfulness(proposition: str, source_str: str) -> Faithfulness
     score, justification = parse_faithfulness_response(str(response))
     if score is None:
         return None
+    media = parse_cited_media(str(response), available=available_media,
+                              limit=max_media_per_citation)
     return Faithfulness(assessment=score, reasoning=reasoning,
-                        justification=justification, rater=model.specifier)
+                        justification=justification, rater=model.specifier,
+                        media=media)
+
+
+#: One line of the judge's media answer: `Medium: <image:12>`. Plain lines rather
+#: than a fenced or backticked block, so that it cannot be mistaken for the category
+#: (backticked) or the explanation (the last fenced block). Anything after the
+#: reference on the line is ignored.
+_MEDIUM_LINE = re.compile(
+    r"^[ \t*\-]*Medium:[ \t]*(<(?:image|video|audio):\d{1,9}>)",
+    flags=re.IGNORECASE | re.MULTILINE)
+
+
+def parse_cited_media(output: str, *, available: list[str],
+                      limit: int | None = None) -> list[str]:
+    """The media references the judge named, in its order: only those in
+    `available` (the ones that occur in the content it was shown - anything else
+    would be invented), each once, at most `limit`."""
+    allowed = set(available)
+    media: list[str] = []
+    for reference in _MEDIUM_LINE.findall(output or ""):
+        if reference in allowed and reference not in media:
+            media.append(reference)
+            if limit is not None and len(media) >= limit:
+                break
+    return media
 
 
 def parse_faithfulness_response(output: str) -> tuple[float | None, str | None]:
@@ -464,7 +547,7 @@ def _source_briefs(evidence: Evidence) -> list[dict]:
     briefs = []
     for citation in citations:
         source = citation.source
-        content = ((source.raw_content if source and not citation.exempt else None)
+        content = ((source.main_content if source and not citation.exempt else None)
                    or "").strip()
         available_since = citation.available_since
         briefs.append({

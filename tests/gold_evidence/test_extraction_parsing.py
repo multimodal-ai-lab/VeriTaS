@@ -373,3 +373,74 @@ def test_a_rationale_with_a_hallucinated_medium_is_dropped():
 
 # --- Corroboration groups --------------------------------------------------
 
+
+
+# --- Empty result vs. failed extraction ---------------------------------------
+
+@pytest.mark.parametrize("response, expected", [
+    ('```json\n{"evidence": [], "verdict_rationale": ""}\n```', True),   # empty result
+    ('{"evidence": [{"proposition": "p"}]}', True),
+    ('[]', True),
+    ("I'm sorry, I cannot help with that.", False),                    # refusal
+    ("", False),
+])
+def test_an_empty_result_is_told_apart_from_an_unusable_response(response, expected):
+    from veritas.gold_evidence.extraction import is_structured_response
+
+    assert is_structured_response(response) is expected
+
+
+class _FakeArticleContent:
+    id = 3
+    dismissed = False
+    content = "An article."
+
+
+class _FakeReviewWithArticle(FakeReview):
+    @property
+    async def article(self):
+        return _FakeArticleContent()
+
+
+@pytest.mark.parametrize("outcomes, n_failed, failed", [
+    (["ok", "ok"], 0, False),
+    (["fail", "ok"], 1, False),
+    (["fail", "fail"], 2, True),
+])
+@pytest.mark.asyncio
+async def test_extraction_counts_the_articles_that_failed(monkeypatch, outcomes, n_failed, failed):
+    from veritas.gold_evidence import extraction as extraction_module
+    from veritas.gold_evidence.extraction import ExtractionFailed, extract_evidence
+
+    answers = iter(outcomes)
+
+    async def fake_reviews(claim):
+        return [_FakeReviewWithArticle() for _ in outcomes]
+
+    async def fake_extract(claim, review, article):
+        if next(answers) == "fail":
+            raise ExtractionFailed("no usable response")
+        return [], None
+
+    monkeypatch.setattr(extraction_module, "_select_reviews", fake_reviews)
+    monkeypatch.setattr(extraction_module, "extract_from_article", fake_extract)
+
+    extraction = await extract_evidence(FakeClaim())
+    assert extraction.n_articles == 2
+    assert extraction.n_failed == n_failed
+    assert extraction.failed is failed
+    assert extraction.is_empty
+
+
+@pytest.mark.asyncio
+async def test_no_readable_article_is_not_a_failure(monkeypatch):
+    from veritas.gold_evidence import extraction as extraction_module
+    from veritas.gold_evidence.extraction import extract_evidence
+
+    async def no_reviews(claim):
+        return []
+
+    monkeypatch.setattr(extraction_module, "_select_reviews", no_reviews)
+    extraction = await extract_evidence(FakeClaim())
+    assert extraction.n_articles == 0
+    assert extraction.failed is False

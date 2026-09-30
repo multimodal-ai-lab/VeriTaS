@@ -38,6 +38,10 @@ class InadmissibilityReason(str, Enum):
 
     NOT_FILTERED = "not_filtered"  # Stage 2 did not complete for this citation
     LOW_CONFIDENCE = "low_extraction_confidence"  # §2
+    #: The article cites the source without giving a locator for it, so there is
+    #: nothing to retrieve. Not `INACCESSIBLE`: that means a retrieval was tried and
+    #: failed (link rot), which is a different finding than a citation practice.
+    LOCATOR_MISSING = "locator_missing"  # §3.1
     INACCESSIBLE = "inaccessible"  # §3.1
     UNDATED = "undated_source"  # §3.1 / §3.3, see `undated_policy`
     UNFAITHFUL = "unfaithful"  # §3.2
@@ -52,6 +56,7 @@ class InadmissibilityReason(str, Enum):
 #: the reported reasons partition the rejected items rather than double-counting.
 REASON_ORDER = (
     InadmissibilityReason.VERDICT_LEAK,  # decidable from the source alone
+    InadmissibilityReason.LOCATOR_MISSING,  # decidable from the extraction alone
     InadmissibilityReason.NOT_FILTERED,
     InadmissibilityReason.LOW_CONFIDENCE,
     InadmissibilityReason.INACCESSIBLE,
@@ -144,7 +149,7 @@ def determine_inadmissibility(
     # recorded rather than dropped at extraction, so that "the fact-check cited
     # something it did not link" shows up in the numbers instead of vanishing.
     if not exempt and source is None:
-        return InadmissibilityReason.INACCESSIBLE
+        return InadmissibilityReason.LOCATOR_MISSING
 
     if not exempt and source.accessible is None:
         return InadmissibilityReason.NOT_FILTERED

@@ -26,6 +26,11 @@ they come from `gold_evidence.ensemble_mode` / `gold_evidence.proximity_threshol
 By default only *released* claims are processed; once none are left in the given
 range, the remaining verdict-complete claims (reviews at stage 6, or 7 for
 rectified claims) follow. The gold verdict is never modified.
+
+Every run starts by retrying all *deferred* claims - whatever the date range, the
+claim IDs or the limit say, including `limit: 0` - so that a claim waiting for a
+rate-limited or Archive.today-gated source is never left parked because later runs
+were configured for other claims. They do not count towards `limit`.
 """
 
 import asyncio
@@ -36,10 +41,11 @@ from veritas import globals, log_to_console, logger
 from veritas.db import db
 from veritas.gold_evidence import (
     RESUMABLE_STATUSES,
+    STATUS_DEFERRED,
     ensemble_mode,
     proximity_threshold,
 )
-from veritas.gold_evidence.pipeline import reconstruct_claims, summarize
+from veritas.gold_evidence.pipeline import reconstruct_claims, retry_deferred_claims, summarize
 from veritas.models import QuotaExceededError, RateLimitError
 from veritas.util.util import get_quarter_date_range
 
@@ -86,6 +92,9 @@ async def main() -> None:
     statuses = None if redo else RESUMABLE_STATUSES
 
     if dry_run:
+        deferred = await db.get_claim_ids_with_gold_evidence_status(STATUS_DEFERRED)
+        print(f"{len(deferred)} deferred claim(s) would be retried first"
+              f"{': ' + ', '.join(map(str, deferred)) if deferred else '.'}")
         claims = await db.get_claims_for_gold_evidence(
             limit=limit, start_date=start_date, end_date=end_date,
             statuses=statuses, released_first=not include_unreleased,
@@ -105,6 +114,12 @@ async def main() -> None:
     # touched keeps the batches moving forward instead of re-serving the same rows.
     handled: list[int] = []
     try:
+        # Deferred claims first, independent of range and limit (see module docs).
+        retried = await retry_deferred_claims(mode=ensemble_mode,
+                                              threshold=proximity_threshold)
+        all_outcomes.extend(retried)
+        handled.extend(outcome.claim_id for outcome in retried)
+
         while processed < limit:
             this_batch_size = min(batch_size, limit - processed)
             claims = await db.get_claims_for_gold_evidence(

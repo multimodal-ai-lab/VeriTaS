@@ -100,9 +100,17 @@ essential, so a fact-check that proved one point three independent ways had thre
 single points of failure. The rationale no longer contains evidence at all (§19), so
 the role is judged against the verdict directly: removing a key item from the list
 likely breaks it; removing an auxiliary one does not, whether because another item
-establishes the same point or because it only corroborates. Losing a key item is
-what disqualifies (§20); losing the others is not decided by a rule at all but by the
-sufficiency ensemble (§12), which decides acceptance anyway.
+establishes the same point or because it only corroborates.
+
+**Recorded, not enforced.** The roles do not decide anything on their own: losing a
+key item does not discard an instance (§20), and a condition lacking one is still
+judged by the ensemble (§21). "The verdict likely breaks without it" is the
+extractor's prediction, made while reading the whole article; the sufficiency
+ensemble (§12) tests the same question directly on the evidence that is left, and it
+decides acceptance anyway. Enforcing the prediction as a gate would replace that
+test with a single model's guess - and discard exactly the instances in which the
+guess was wrong. The roles remain as a description: the exports report how many key
+items an instance lost and how often it was recovered regardless.
 
 **Why not record the alternatives.** Which item can replace which is not stored —
 neither as a group label (§20) nor as alternative sufficient sets. The one case the
@@ -110,9 +118,9 @@ roles cannot decide on their own — every alternative for a point lost at once 
 reaches the ensemble with whatever evidence is left, which is the question the
 ensemble exists to answer.
 
-**Errors fail safe.** An auxiliary item mislabeled key makes the rule stricter than
-necessary. A key item mislabeled auxiliary costs an ensemble call, and nothing
-leaks: the rationale contains no evidence (§19). The extractor states in each item's
+**Errors are harmless.** Since no decision rests on the role, a mislabeled item
+changes only the descriptive statistics, and nothing leaks either way: the rationale
+contains no evidence (§19). The extractor states in each item's
 `reasoning` how it bears on the verdict and the outcome of the leave-one-out test,
 so the labels can be audited.
 
@@ -191,6 +199,11 @@ the model to state; `reasoning` is the model's actual reasoning trace, read from
 the dedicated field the provider's API returns it in (see §18). They are stored
 separately because they are different evidence about the judgement: the first is
 what the model claims, the second is how it got there.
+
+**It also names the media.** The same call lists the source's media that show what
+the proposition states (§24). That keeps the judgement blind - it still sees only
+the proposition and the source - and costs no extra call. It is judged on the
+source's cleaned main content where there is one (§24).
 
 ## 7. Verdict leakage is decided by the registry, later events by one call per item
 
@@ -271,11 +284,13 @@ categorically, rather than on their merits.
 **Sources the article never located.** A fact-check sometimes cites material it
 neither links nor names. Such a source is *extracted* - with an empty locator, and
 with the extraction reasoning stating that the article provided none - and then
-settled as `inaccessible` without any retrieval attempt, unless it is a tool or
+settled as `locator_missing` without any retrieval attempt, unless it is a tool or
 offline evidence, which are not expected to carry a locator anyway. Dropping those
 sources at extraction time would have hidden them: as records they show up in the
 rejection statistics, which is where "the fact-check did not say where this came
-from" belongs.
+from" belongs. It is a reason of its own rather than `inaccessible`, because the two
+measure different things - the outlet's citation practice versus link rot - and
+link rot is time-asymmetric (limitation 2) while citation practice is not.
 
 **But a known `t_e` is binding.** The temporal criteria are *not* waived: as soon as
 such an item carries a publication time, it is placed on the timeline like any other
@@ -316,15 +331,36 @@ default and `strict` is advisable.
 
 ## 10. Publication time is read from the page, not inferred
 
-**Decision.** `t_e` is taken from the page's standard publication meta tags where
-present. Otherwise a cheap model reads an explicitly stated publication time off
-the retrieved content, and is instructed to return "none" rather than guess. Times
-of last modification, access and of the *described events* are explicitly excluded.
+**Decision.** `t_e` is taken from the page's own machine-readable markup where
+present (`gold_evidence/dating.py`), in this order: JSON-LD `datePublished` /
+`uploadDate` of the page's primary node (`dateCreated` only for posts); Open Graph /
+article tags (`article:published_time`, `og:video:release_date`, ...); microdata
+`itemprop="datePublished"`, `<time pubdate>` and the `published` microformat class;
+further publication meta tags (scholarly `citation_publication_date`, Dublin Core
+`DC.date.issued`, Parse.ly, ...); and last, publication keys in the page's embedded
+script JSON, only if all of them agree. Only fields that explicitly denote the
+publication count; modification, update and access fields are never read. A value
+is dropped rather than completed if its day, month or year is missing, if its
+day/month order is ambiguous, or if it is implausible (before 1990 or in the
+future). Otherwise a cheap model reads an explicitly stated publication time off the
+retrieved content, shown alongside the page's remaining date-bearing markup
+(`<time>` elements and the like, with the text preceding them, excluding anything
+labelled as an update), because datelines are often page chrome that content
+extraction strips. It is instructed to return "none" rather than guess, and its
+answer is parsed as strictly as the markup. `dating_method` records `meta` or `llm`.
 
-**Rationale.** Meta tags are the publisher's own machine-readable assertion and are
-preferred over any model reading. Forbidding inference is what makes the undated
-category meaningful: an item is undated because the source states no date, not
-because the model was unsure.
+**Rationale.** Markup is the publisher's own machine-readable assertion and is
+preferred over any model reading. An earlier version read only six meta tags, under
+one fixed attribute and case-sensitively, stopped at the first match even if it
+could not be parsed, and ignored JSON-LD - where most news sites and CMSs state the
+date - so that many dated pages ended up undated, inflating the undated share (§9).
+Forbidding inference is what makes the undated category meaningful: an item is
+undated because the source states no date, not because the model was unsure; for
+the same reason a partial date is not completed with today's day or month.
+
+**Consequence.** Sources are write-once (§1), and only their content, not their
+HTML, is stored. Sources retrieved before this change keep their `t_e` (or its
+absence) until they are retrieved again (`re_retrieve`).
 
 ## 11. One retrieval per URL, entirely through scrapeMM
 
@@ -566,8 +602,8 @@ recoverability rates can be reported with and without them.
 ## 20. Redundancy lives inside an evidence item
 
 **Decision.** All sources a fact-check gives for one proposition are cited by one
-evidence item. The item is discarded only when every one of its citations was, and
-an instance is disqualified only when a *key* item is discarded.
+evidence item. The item is discarded only when every one of its citations was; an
+instance is never disqualified for losing items, key or not (§3).
 
 **Rationale.** Fact-checks cite redundantly on purpose: two outlets for one fact, a
 register plus a screenshot of it. Treating each citation as a separate evidence item
@@ -596,37 +632,43 @@ redundancy is expressed by the role instead (§3): none of them is key, so
 losing any of them costs the instance nothing unless the ensemble finds that what
 remains no longer carries the verdict.
 
-## 21. A condition without its key evidence needs no ensemble call
+## 21. Every condition is judged by the ensemble
 
-**Decision.** If a key item has no source inside a condition's evidence set, that
-condition is recorded as insufficient (`is_close = False`) without querying the
-ensemble.
+**Decision.** Both conditions go to the ensemble, whatever evidence they lack. A
+condition missing a key item is not recorded as insufficient in advance; the number
+of key items it lacks is stored with the result (`gold_evidence_results.n_key_missing`).
 
-**Rationale.** A key item establishes a central premise of the verdict (§3), so a
-condition that cannot supply one cannot support the verdict the fact-check reached.
-Asking the ensemble anyway would measure how well four models guess a verdict with a
-premise missing — an answer that says nothing about whether the evidence of that
-period sufficed. It also saves the majority of `E_c` calls on precisely the claims
-the analysis is about.
+**Rationale.** An earlier version recorded a condition as insufficient without
+asking the ensemble whenever a key item had no source in it. Once an instance is no
+longer discarded for losing a key item (§3), that shortcut would have decided `E_f`
+by the same prediction the gate no longer applies - and applying it to `E_c` alone
+would judge the two conditions of the paired test (§17) by different rules, which
+makes the comparison uninterpretable. The shortcut had a second flaw: under the
+earlier, rationale-relative definition of the role, a redundant item that appeared
+during the fact-checking period made `E_c` insufficient although a pre-`t_c` item
+proved the same point, landing the claim in the "recoverable only from `E_f`" cell —
+inflating exactly the effect the paper reports. Letting the ensemble judge every
+condition removes both problems. The rationale can be shown to every condition,
+because it contains no evidence (§19), so it cannot hand a condition what it lacks.
 
-**Only key items short-circuit.** An auxiliary item that appeared during the
-fact-checking period does not carry the verdict by definition, so it must not make
-`E_c` insufficient: such an `E_c` goes to the ensemble with whatever evidence
-predates `t_c`. Under the earlier, rationale-relative definition, a redundant item
-did short-circuit, and every such claim landed in the "recoverable only from `E_f`"
-cell — inflating exactly the effect the paper reports.
+**Cost.** One ensemble call per condition and instance, also for `E_c` sets that
+lack a key item - the calls the shortcut used to save.
 
-**Consequence for reporting.** `E_c` failures split into two kinds: a key item that
-only appeared during the fact-checking period (recorded in `error`), and a genuine
-ensemble failure to recover the verdict. Both count as "not recoverable from `E_c`"
-in the headline test; the distinction is available in the stored results.
+**Consequence for reporting.** `n_key_missing` separates `E_c` failures in which a
+key item only appeared during the fact-checking period from those in which the
+evidence was there and the ensemble still failed. Both count as "not recoverable
+from `E_c`" in the headline test.
 
 ## 22. An empty evidence set is a result, not a failure
 
-**Decision.** A claim whose reconstruction yields no evidence is analyzed normally,
-as long as a rationale carries the argument. The instance is rejected only if Stage 1
-produced nothing at all (`nothing_extracted`) or if a key evidence item lost every
-source (`key_evidence_lost`).
+**Decision.** A claim whose reconstruction yields no evidence is analyzed normally -
+also when there is no rationale either, in which case the ensemble judges the claim
+on its own. Stage 1 rejects an instance only if the claim has no readable
+fact-checking article at all (`no_fact_check_article`). An extractor that *failed*
+(an error or an unusable response, as opposed to an empty result) leaves the claim
+`pending` for the next run (`extraction_failed`), since a failure says nothing about
+the claim. The former reasons `nothing_extracted` and `key_evidence_lost` are no
+longer assigned (§3, §21).
 
 **Rationale.** The earlier rule — reject when the admissible set is empty — conflated
 "the fact-checker needed no external source" with "we failed to reconstruct the
@@ -660,9 +702,8 @@ intact half of the dataset.
 
 **Why it also distorts the roles.** `key` is defined relative to the verdict
 (§3). An extraction scoped to the wrong claim yields the wrong key set, and
-that set decides whether an instance is disqualified (§22) and whether a condition
-is sent to the ensemble at all (§21). The error would not stay local to the prompt;
-it would reach the headline numbers.
+that set is what the exports report as the instance's key evidence (§3, §17). The
+error would not stay local to the prompt; it would reach the reported numbers.
 
 **Verdict leakage.** The rectified prompt forbids stating or implying what the
 fact-checker concluded about the claim they checked. That conclusion is the verdict
@@ -686,6 +727,63 @@ scoped to the right claim there is nothing left to disambiguate downstream.
 be reported separately; the analysis rows carry `is_rectified` for exactly that.
 
 ---
+
+## 24. Source media enter the evidence through the citation
+
+**Decision.** Stage 1 stays article-only (§4). Each retrieved source is trimmed once
+to its main content, and the faithfulness judge (§6) names the media of that content
+which show what the proposition states - at most `max_media_per_citation`. They are
+stored on the citation, and once the citation is admissible, their references are
+put in front of the proposition itself.
+
+**Why not give Stage 1 the sources.** Fact-checks often link the media a proposition
+is about instead of embedding them, so the extractor cannot reference them. Reading
+all cited sources during extraction would solve that, at four costs: propositions
+would be written from what the pages say *today* rather than from what the
+fact-checker used, so the faithfulness check would test a text against the page it
+was written from; facts the fact-checker did not use could enter; sources lost to
+link rot would yield poorer propositions than surviving ones - a bias correlated
+with claim age (limitation 2); and cited fact-checks would be in the extractor's
+context before the registry rejects them. It would also multiply the extraction
+context and couple extraction to retrieval and its deferrals.
+
+**Known leak: media cross the cutoff.** A medium comes from one source as
+retrieved today, but once prepended it is part of the proposition and is shown in
+every condition the item is in. If the item is in `E_c` through an early citation
+while the medium comes from a source that only appeared during the fact-checking
+period (or was edited after `t_f`), `E_c` sees material it did not have. This is the
+one place where §8's guarantee - each condition sees only its own citations - does
+not hold, and it favours `E_c`, i.e. the conservative direction for the headline
+test. It can be closed by showing each condition only the media of its own
+citations; the citation records which medium came from where, so that needs no
+re-judging. Until then, report the number of `E_c` items whose media stem only from
+in-window citations.
+
+**Source cleaning.** A raw scrape contains navigation, ads, consent notices,
+related-article lists and comments, which waste the budget of the checks built on
+it and obscure which media belong to the source. Each retrieved source is therefore
+trimmed once, mirroring stage 3's article extraction: its lines are numbered and a
+cheap model (`cleaning_model`, default `gpt_nano`) names the line ranges of the main
+content (title, byline/date, main text, the source's own media and captions). Unlike
+stage 3, several ranges are allowed, because social media posts often separate media
+from text and articles are interrupted by ad blocks; ranges are merged and emitted
+in page order. The text is never rewritten, so the result is a verbatim excerpt and
+media references survive. Cleaning is best effort: short pages (< 1,500 characters)
+are left as they are, and the raw content is kept whenever the answer is unusable,
+the call fails, or the excerpt fails a substance guard (it keeps fewer than 40
+non-media characters, or under 2% of the page's text unless it is at least 1,000
+characters, or it drops every media reference inside the selected region). A noisy
+source is only costly; a gutted one would falsify the faithfulness and later-event
+checks built on it. Cleaning derives from the stored content, so a source stored
+before is cleaned without being fetched again - write-once (§1) is not affected.
+
+**Validation.** A named reference is kept only if it occurs in the content the judge
+was shown - the same device that rules out invented locators (§4).
+
+**Limitation.** The media are chosen by a model and not audited; `n_media` per
+citation is exported so a sample can be checked. The faithfulness judge of a second
+citation sees the proposition with the first citation's media already in front of
+it.
 
 ## Known limitations to state in the paper
 

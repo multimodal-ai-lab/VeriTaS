@@ -5,9 +5,11 @@ scrapeMM call per source settles accessibility, content and dating:
 
 1. retrieve the source through scrapeMM with ``output_format="multimodal"``;
 2. read the publication time off the raw HTML the very same response carries
-   (``response.content.html``), if the used method had access to it;
+   (``response.content.html``), if the used method had access to it - JSON-LD,
+   Open Graph, microdata and other publication meta tags (see `dating`);
 3. only if step 2 found nothing, have a cheap LLM read a publication time off the
-   retrieved content.
+   retrieved content, shown alongside the date-bearing markup of the HTML that step
+   2 could not attribute with certainty (``<time>`` elements and the like).
 
 scrapeMM produces every format preceding the requested one, so the multimodal
 sequence and the page's raw HTML come out of *one* retrieval - there is no second
@@ -33,7 +35,7 @@ verdict for what the outage merely prevented from being checked.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from ezmm import MultimodalSequence
@@ -51,11 +53,13 @@ from veritas.gold_evidence import (
     max_video_size,
     reasoning_effort_dating,
 )
+from veritas.gold_evidence.dating import (
+    extract_publication_time,
+    parse_publication_value,
+    publication_date_hints,
+)
 from veritas.gold_evidence.llm import FATAL_ERRORS, resolve_model
-from veritas.gold_evidence.models import to_naive
 from veritas.models import QuotaExceededError
-from veritas.pipeline.stage_3 import extract_date_meta
-from veritas.util.parsing import determine_date
 from veritas.util.url import is_archive_today_url, preprocess_url
 
 logger = logging.getLogger("VeriTaS")
@@ -83,6 +87,9 @@ class SourceRetrieval:
     #: Archive.today's access check is up; deferred like a rate limit (see
     #: module docstring). Never set for a CAPTCHA on any other domain.
     gated: bool = False
+    #: Date-bearing markup of the HTML for the LLM in step 3 (see
+    #: `dating.publication_date_hints`). Transient - never persisted.
+    date_hints: list[str] = field(default_factory=list)
 
 
 async def retrieve_source(locator: str, determine_time: bool = True) -> SourceRetrieval:
@@ -121,7 +128,8 @@ async def retrieve_source(locator: str, determine_time: bool = True) -> SourceRe
 
     # Step 3: the LLM only sees sources whose meta tags carried no publication time.
     if result.accessible and determine_time and result.available_since is None:
-        result.available_since = await determine_publication_time_llm(url, result.content)
+        result.available_since = await determine_publication_time_llm(
+            url, result.content, hints=result.date_hints)
         if result.available_since is not None:
             result.dating_method = "llm"
 
@@ -143,7 +151,10 @@ async def _retrieve(url: str) -> SourceRetrieval:
 
     # Step 2: free of charge - the same response carries the page's raw HTML
     # whenever the used method had access to it.
-    available_since = _date_from_meta(response.content.html)
+    html = response.content.html
+    available_since = _date_from_meta(html)
+    # Only needed if step 3 will run; cheap, but no reason to parse the page twice.
+    date_hints = _date_hints(html) if available_since is None else []
 
     if not is_sufficient_content(content):
         return SourceRetrieval(accessible=False, method=response.method,
@@ -157,6 +168,7 @@ async def _retrieve(url: str) -> SourceRetrieval:
         available_since=available_since,
         dating_method="meta" if available_since else None,
         method=response.method,
+        date_hints=date_hints,
     )
 
 
@@ -182,22 +194,43 @@ def _failed(response: ScrapingResponse) -> SourceRetrieval:
 
 
 def _date_from_meta(html: str | None) -> datetime | None:
-    """Step 2: publication time from the page's standard meta tags (reuses stage 3).
-    Sources without an HTML page - those scrapeMM serves through an API integration -
-    have no meta tags and are left to the LLM in step 3."""
+    """Step 2: publication time from the page's machine-readable markup - JSON-LD,
+    meta tags, microdata (see `dating.extract_publication_time` for the priority).
+    Recorded as ``dating_method="meta"`` like the meta-tag-only reading it replaces
+    (stage 3's `extract_date_meta`, whose tags are all covered), so the stored data
+    stays comparable. Sources without an HTML page - those scrapeMM serves through
+    an API integration - have no markup and are left to the LLM in step 3."""
     if not html:
         return None
     try:
-        return to_naive(extract_date_meta(html))
-    except Exception:
+        return extract_publication_time(html)
+    except Exception as e:
+        logger.debug(f"Reading the publication time off the HTML failed: {e}")
         return None
 
 
+def _date_hints(html: str | None) -> list[str]:
+    if not html:
+        return []
+    try:
+        return publication_date_hints(html)
+    except Exception as e:
+        logger.debug(f"Collecting date hints from the HTML failed: {e}")
+        return []
+
+
 async def determine_publication_time_llm(url: str,
-                                         content: MultimodalSequence | None) -> datetime | None:
+                                         content: MultimodalSequence | None,
+                                         hints: list[str] | None = None) -> datetime | None:
     """Step 3: reads an explicitly stated publication time off the retrieved content
     (post time, dateline, "published on ..."). Returns None whenever no clear date
-    is stated - in particular for tools."""
+    is stated - in particular for tools.
+
+    `hints` are date-bearing HTML fragments with their context: the dateline is often
+    part of the page chrome that scrapeMM's content extraction strips, so the text
+    alone regularly states no date although the page does. The answer is parsed as
+    strictly as the markup (`dating.parse_publication_value`): an answer lacking the
+    day, or one that is implausible, counts as no date rather than being completed."""
     if not content:
         return None
 
@@ -208,6 +241,7 @@ async def determine_publication_time_llm(url: str,
         DATING_PROMPT_PATH,
         url=url,
         content=str(content)[:max_source_content_length],
+        hints=hints or [],
     )
     try:
         response = await model.generate(prompt, extract="last_code_span",
@@ -224,4 +258,4 @@ async def determine_publication_time_llm(url: str,
     answer = str(response).strip()
     if not answer or answer.lower() in ("none", "null", "unknown", "n/a"):
         return None
-    return to_naive(determine_date(answer))
+    return parse_publication_value(answer)

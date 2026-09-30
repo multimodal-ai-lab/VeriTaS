@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import date, datetime, timedelta
 from enum import Enum
 from urllib.parse import urlsplit, urlunsplit
@@ -94,6 +95,29 @@ def normalize_reason(reason: str | None) -> str | None:
     return LEGACY_REASON_ALIASES.get(reason, reason)
 
 
+#: An ezMM media reference as it occurs in stored text, e.g. `<image:123>`. IDs are
+#: capped at nine digits, like the media index's pattern, so that they fit an INTEGER.
+MEDIA_REFERENCE = re.compile(r"<(?:image|video|audio):\d{1,9}>")
+
+
+def media_references(text: str | None) -> list[str]:
+    """The distinct media references in `text`, in order of first occurrence."""
+    seen, references = set(), []
+    for reference in MEDIA_REFERENCE.findall(text or ""):
+        if reference not in seen:
+            seen.add(reference)
+            references.append(reference)
+    return references
+
+
+def prepend_media(proposition: str, references: list[str]) -> str:
+    """The proposition with the given media references put in front of it - those
+    it does not reference yet, in the given order. Idempotent, so an item judged
+    again does not collect the same medium twice."""
+    missing = [r for r in dict.fromkeys(references) if r not in proposition]
+    return f"{' '.join(missing)} {proposition}" if missing else proposition
+
+
 class Faithfulness(BaseModel):
     """Whether the currently retrieved source still supports the proposition.
 
@@ -109,6 +133,10 @@ class Faithfulness(BaseModel):
     #: The short justification the prompt asked the model to state for its rating.
     justification: str | None = None
     rater: str | None = None
+    #: The source's media that show what the proposition states, as the same judge
+    #: found them (e.g. `<image:123>`). Only references that occur in the content it
+    #: was shown. An admissible citation's media are prepended to the proposition.
+    media: list[str] = Field(default_factory=list)
 
 
 class TemporalValidation(BaseModel):
@@ -196,6 +224,14 @@ class Source(VeritasBaseModel):
 
     locator: str
     raw_content: str | None = None  #: The content as scraped with scrapeMM
+    #: `raw_content` trimmed to the source's own main content - without navigation,
+    #: ads, cookie notices, comments ... (`cleaning.clean_source_content`). Lines
+    #: are cut, never rewritten, so its media references are the page's own. None
+    #: if not cleaned (yet), or if cleaning failed or would have lost substance.
+    cleaned_content: str | None = None
+    #: When cleaning was attempted, successfully or not - so that a page cleaning
+    #: cannot handle is not sent to the model again on every run.
+    cleaned_at: datetime | None = None
 
     #: t_e - when the source became publicly accessible. None if no clear date is
     #: associated with it.
@@ -226,6 +262,12 @@ class Source(VeritasBaseModel):
     def content(self) -> MultimodalSequence | None:
         """The scraped source content as a MultimodalSequence."""
         return MultimodalSequence(self.raw_content) if self.raw_content else None
+
+    @property
+    def main_content(self) -> str | None:
+        """What the judges are shown of the source: the cleaned content where there
+        is one, the raw scrape otherwise."""
+        return self.cleaned_content or self.raw_content
 
     @property
     def domain(self) -> str | None:
@@ -259,6 +301,8 @@ class Source(VeritasBaseModel):
         Stage 2 run retrieves the source again. The registry lookup is kept: it
         does not depend on what the page currently serves."""
         self.raw_content = None
+        self.cleaned_content = None
+        self.cleaned_at = None
         self.available_since = None
         self.dating_method = None
         self.retrieval_method = None
@@ -326,6 +370,11 @@ class Citation(VeritasBaseModel):
     @property
     def locator(self) -> str | None:
         return self.source.locator if self.source else None
+
+    @property
+    def media(self) -> list[str]:
+        """The source's media that show what the proposition states (§3.2)."""
+        return self.faithfulness.media if self.faithfulness else []
 
     @property
     def domain(self) -> str | None:

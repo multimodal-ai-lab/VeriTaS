@@ -195,6 +195,9 @@ def _citation_record(citation, evidence: Evidence, *, claim_id: int,
         "in_window": in_window(citation),
         "accessible": source.accessible if source and not citation.exempt else None,
         "faithfulness": faithfulness.assessment if faithfulness else None,
+        # Source media the faithfulness judge attached, i.e. injected into the
+        # proposition wherever this citation is shown.
+        "n_media": len(citation.media),
         "before_claim": temporal.before_claim if temporal else None,
         "before_fact_check": temporal.before_fact_check if temporal else None,
         # §3.3 (3) is judged for the proposition, so it is the same on every row
@@ -282,10 +285,15 @@ def aggregate(claim_records: list[ClaimRecord],
         "n_key": sum(c.n_key for c in claim_records),
         "n_key_lost": sum(c.n_key_lost for c in claim_records),
         "n_auxiliary_lost": sum(c.n_auxiliary_lost for c in claim_records),
-        # Accepted instances that lost a whole (redundant) evidence item on the way:
-        # what disqualifying only on lost `key` items saves from rejection.
+        # Accepted instances that lost a whole evidence item on the way - which no
+        # longer rejects an instance by itself; the ensemble decides.
         "share_accepted_despite_lost_evidence": _share(
             sum(1 for c in accepted if c.n_auxiliary_lost > 0), len(accepted)),
+        # ... and those that even lost a key item: how often the extractor's "the
+        # verdict likely breaks without it" was wrong in the ensemble's judgement.
+        "share_accepted_despite_lost_key": _share(
+            sum(1 for c in accepted if c.n_key_lost > 0), len(accepted)),
+        "n_claims_with_lost_key": sum(1 for c in claim_records if c.n_key_lost > 0),
         "sources_per_evidence": describe(_sources_per_evidence(evidence_records)),
         # How many distinct URLs the citations point at: the retrievals saved by
         # retrieving each source once rather than once per citation.

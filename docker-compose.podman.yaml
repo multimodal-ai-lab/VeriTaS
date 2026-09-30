@@ -20,5 +20,16 @@ services:
     environment:
       # The host's own loopback, which is where the pipeline's database lives.
       VERITAS_DB_HOST: ${VERITAS_DB_HOST:-127.0.0.1}
-      # Bound by the server itself here, since nothing maps it.
+      # Bound by the server itself here, since nothing maps it - and so is the
+      # interface: `WEBUI_BIND=127.0.0.1` keeps plain HTTP local, as on Docker.
       WEBUI_PORT: ${WEBUI_PORT:-8080}
+      WEBUI_HOST: ${WEBUI_BIND:-0.0.0.0}
+
+  # The TLS front shares the host's network, too: it reaches the UI on the host's
+  # loopback and binds 80/443 itself. Rootless podman may only bind ports below
+  # 1024 once `net.ipv4.ip_unprivileged_port_start` is lowered to 80.
+  webui-tls:
+    network_mode: host
+    ports: !reset []
+    environment:
+      WEBUI_UPSTREAM: ${WEBUI_UPSTREAM:-127.0.0.1:${WEBUI_PORT:-8080}}

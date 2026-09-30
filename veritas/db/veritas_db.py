@@ -514,7 +514,7 @@ class VeritasDB(Database):
                 is_fact_check    BOOLEAN,
                 retrieval_error  TEXT,
                 deferred_until   TIMESTAMP,
-                -- Everything except `raw_content`, which is stored once above.
+                -- Everything except the contents, which are stored once in columns.
                 full_source      JSONB,
                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -524,6 +524,9 @@ class VeritasDB(Database):
                 ON sources (deferred_until);
             CREATE INDEX IF NOT EXISTS sources_available_since_idx
                 ON sources (available_since);
+            -- `raw_content` trimmed to the source's main content. Additive: a source
+            -- stored before gets it when it is next settled, without a refetch.
+            ALTER TABLE sources ADD COLUMN IF NOT EXISTS cleaned_content TEXT;
 
             CREATE TABLE IF NOT EXISTS citations
             (
@@ -532,7 +535,7 @@ class VeritasDB(Database):
                 claim_id                   INT  NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
                 -- NULL for a source the article never located (a tool without a
                 -- page, an interview, an unlinked citation).
-                source_id                  INT REFERENCES sources (id),
+                source_id                  INT REFERENCES sources (id) ON DELETE CASCADE,
                 -- Identifies the citation within its item: the source's locator key,
                 -- or kind and name for a citation without a source.
                 citation_key               TEXT NOT NULL,
@@ -560,6 +563,34 @@ class VeritasDB(Database):
             CREATE INDEX IF NOT EXISTS citations_source_idx ON citations (source_id);
             CREATE INDEX IF NOT EXISTS citations_admissible_idx
                 ON citations (claim_id, admissible);
+
+            -- Tables created before `citations.source_id` cascaded: re-create that
+            -- one constraint with ON DELETE CASCADE, so that removing a source takes
+            -- its citations along instead of being refused. Only when needed, so a
+            -- startup does not re-validate the table every time. Changes no row.
+            DO
+            $$
+                DECLARE
+                    fk_name TEXT;
+                BEGIN
+                    SELECT con.conname INTO fk_name
+                    FROM pg_constraint con
+                             JOIN pg_attribute att
+                                  ON att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey)
+                    WHERE con.conrelid = 'citations'::regclass
+                      AND con.confrelid = 'sources'::regclass
+                      AND con.contype = 'f'
+                      AND att.attname = 'source_id'
+                      AND con.confdeltype <> 'c'
+                    LIMIT 1;
+                    IF fk_name IS NOT NULL THEN
+                        EXECUTE format('ALTER TABLE citations DROP CONSTRAINT %I', fk_name);
+                        ALTER TABLE citations
+                            ADD CONSTRAINT citations_source_id_fkey FOREIGN KEY (source_id)
+                                REFERENCES sources (id) ON DELETE CASCADE;
+                    END IF;
+                END
+            $$;
 
             -- One flat row per citation with the columns `evidence_sources` had, for
             -- read-only consumers (the web UI). Tools and offline citations are
@@ -652,6 +683,10 @@ class VeritasDB(Database):
             -- Migration for tables created by an earlier version
             ALTER TABLE gold_evidence_results
                 ADD COLUMN IF NOT EXISTS with_rationale BOOLEAN DEFAULT FALSE;
+            -- How many key evidence items the condition lacks. Recorded only: a
+            -- missing key item no longer decides the condition without the ensemble.
+            ALTER TABLE gold_evidence_results
+                ADD COLUMN IF NOT EXISTS n_key_missing INT DEFAULT 0;
             """
         )
 
@@ -1343,7 +1378,7 @@ class VeritasDB(Database):
         if not source_ids:
             return {}
         rows = await self._fetch(
-            "SELECT id, raw_content, full_source FROM sources WHERE id = ANY($1);",
+            "SELECT id, raw_content, cleaned_content, full_source FROM sources WHERE id = ANY($1);",
             source_ids)
         return {row["id"]: row_to_source(row) for row in rows}
 
@@ -1351,7 +1386,7 @@ class VeritasDB(Database):
         from veritas.gold_evidence.models import locator_key
 
         row = await self._fetchrow(
-            "SELECT id, raw_content, full_source FROM sources WHERE locator_key = $1;",
+            "SELECT id, raw_content, cleaned_content, full_source FROM sources WHERE locator_key = $1;",
             locator_key(locator))
         return row_to_source(row) if row else None
 
@@ -1360,7 +1395,7 @@ class VeritasDB(Database):
         `get_reviews_with_deferred_archive_today_appearances`."""
         rows = await self._fetch(
             """
-            SELECT id, raw_content, full_source
+            SELECT id, raw_content, cleaned_content, full_source
             FROM sources
             WHERE deferred_until IS NOT NULL
               AND deferred_until > CURRENT_TIMESTAMP
@@ -1369,6 +1404,29 @@ class VeritasDB(Database):
             ARCHIVE_TODAY_URL_SQL_PATTERN,
         )
         return [row_to_source(row) for row in rows]
+
+    async def get_deferred_sources_cited_by(self, claim_ids: list[int]) -> list["Source"]:
+        """The sources the given claims cite that are (or were) deferred, i.e. that
+        still carry a deferral window, expired or not."""
+        if not claim_ids:
+            return []
+        rows = await self._fetch(
+            """
+            SELECT DISTINCT s.id, s.raw_content, s.cleaned_content, s.full_source
+            FROM sources s
+                     JOIN citations c ON c.source_id = s.id
+            WHERE c.claim_id = ANY($1)
+              AND s.deferred_until IS NOT NULL;
+            """,
+            claim_ids)
+        return [row_to_source(row) for row in rows]
+
+    async def get_claim_ids_with_gold_evidence_status(self, status: str) -> list[int]:
+        """IDs of all claims whose reconstruction is on the given status, oldest
+        first - independent of any date range or limit."""
+        rows = await self._fetch(
+            "SELECT id FROM claims WHERE gold_evidence_status = $1 ORDER BY id;", status)
+        return [row["id"] for row in rows]
 
     async def get_claim_ids_citing_sources(self, source_ids: list[int]) -> list[int]:
         """The claims with an evidence item citing any of the given sources."""
@@ -1478,10 +1536,11 @@ class VeritasDB(Database):
                 INSERT INTO gold_evidence_results (claim_id, condition, ensemble_mode, n_evidence,
                                                    with_rationale, predicted_verdict, member_responses,
                                                    property_diffs, max_property_diff, is_close,
-                                                   threshold, model_specifiers, error)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                                   threshold, model_specifiers, error, n_key_missing)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT ON CONSTRAINT unique_gold_evidence_result DO UPDATE
                     SET n_evidence        = EXCLUDED.n_evidence,
+                        n_key_missing     = EXCLUDED.n_key_missing,
                         with_rationale    = EXCLUDED.with_rationale,
                         predicted_verdict = EXCLUDED.predicted_verdict,
                         member_responses  = EXCLUDED.member_responses,
@@ -1509,6 +1568,7 @@ class VeritasDB(Database):
             result.get("threshold"),
             result.get("model_specifiers"),
             result.get("error"),
+            int(result.get("n_key_missing") or 0),
         )
 
     async def get_gold_evidence_results(self, claim_id: int,
@@ -2422,6 +2482,7 @@ def row_to_source(row):
     row = dict(row)
     source = Source.model_validate(row["full_source"])
     source.raw_content = row.get("raw_content")
+    source.cleaned_content = row.get("cleaned_content")
     if row.get("id") is not None:
         source.id = row["id"]
     return source
@@ -2452,6 +2513,7 @@ def _source_columns(source) -> tuple[list[str], list]:
         "locator": source.locator,
         "locator_key": source.key,
         "raw_content": source.raw_content,
+        "cleaned_content": source.cleaned_content,
         "available_since": source.available_since,
         "dating_method": source.dating_method,
         "retrieval_method": source.retrieval_method,
@@ -2460,7 +2522,8 @@ def _source_columns(source) -> tuple[list[str], list]:
         "is_fact_check": source.is_fact_check,
         "retrieval_error": source.retrieval_error,
         "deferred_until": source.deferred_until,
-        "full_source": to_jsonb(source.model_dump(mode="json", exclude={"raw_content"})),
+        "full_source": to_jsonb(source.model_dump(mode="json",
+                                                  exclude={"raw_content", "cleaned_content"})),
     }
     return list(data.keys()), list(data.values())
 

@@ -109,6 +109,9 @@ class SufficiencyResult:
     is_close: bool | None = None
     model_specifiers: list[str] = field(default_factory=list)
     error: str | None = None
+    #: Key evidence items this condition lacks. Recorded for the analysis only: the
+    #: ensemble decides whether the condition suffices without them.
+    n_key_missing: int = 0
 
     def to_db_dict(self) -> dict:
         return {
@@ -125,6 +128,7 @@ class SufficiencyResult:
             "threshold": self.threshold,
             "model_specifiers": self.model_specifiers,
             "error": self.error,
+            "n_key_missing": self.n_key_missing,
         }
 
 
@@ -141,15 +145,18 @@ async def validate_sufficiency(
         mode: str = None,
         threshold: float = None,
         rationales: Iterable[VerdictRationale] = (),
-        missing_key: Iterable[Evidence] = (),
+        n_key_missing: int = 0,
 ) -> SufficiencyResult:
     """Predicts a verdict from the evidence and rationale, and compares it to the
     gold verdict.
 
-    `missing_key` lists the key items this condition cannot supply. It
-    short-circuits the whole prediction: the verdict likely breaks without them,
-    so a condition lacking them cannot support it, and asking the ensemble would
-    only measure how well it guesses."""
+    The ensemble is always asked - also when the condition lacks key evidence, and
+    also when there is neither evidence nor a rationale, in which case it judges
+    the claim on its own. Whether what is there suffices is exactly the question
+    this validator answers; deciding it beforehand from the roles would replace
+    its judgement with the extractor's. The rationale can be shown in every
+    condition because it carries no evidence of its own, only reasoning.
+    `n_key_missing` is recorded for the analysis."""
     if mode is None:
         mode = default_ensemble_mode
     if threshold is None:
@@ -158,7 +165,6 @@ async def validate_sufficiency(
 
     evidence = list(evidence)
     rationales = list(rationales)
-    missing_key = list(missing_key)
     result = SufficiencyResult(
         claim_id=claim.id,
         condition=condition,
@@ -167,20 +173,8 @@ async def validate_sufficiency(
         threshold=threshold,
         with_rationale=bool(rationales),
         model_specifiers=get_ensemble().model_names,
+        n_key_missing=n_key_missing,
     )
-
-    if missing_key:
-        result.error = (f"{len(missing_key)} key evidence item(s) are not "
-                        f"available in this condition.")
-        result.is_close = False
-        return result
-
-    if not evidence and not rationales:
-        # Nothing to reason from at all. With a rationale, an empty evidence set is
-        # a legitimate case (a claim settled by arithmetic or by its own media).
-        result.error = "Neither evidence nor a rationale in this condition."
-        result.is_close = False
-        return result
 
     try:
         if mode == MODE_INTEGRITY:

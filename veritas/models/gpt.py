@@ -12,7 +12,8 @@ from openai.types.upload_create_params import ExpiresAfter
 
 from veritas import api_secrets, selfhosted
 from veritas.common import Prompt
-from veritas.models.base import Generation, Model, RateLimitError, QuotaExceededError
+from veritas.models.base import (Generation, Model, RateLimitError, QuotaExceededError,
+                                 OPENAI_PROVIDERS, configured_model_name)
 
 logger = logging.getLogger("VeriTaS")
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -221,11 +222,13 @@ async def preprocess_prompt(prompt: Prompt) -> list[dict]:
     return content_formatted
 
 
-gpt_strong = GPT("gpt-6.1-sol")
-gpt_cheap = GPT("gpt-5.6-terra")
-gpt_nano = GPT("gpt-6-luna")
-gpt_transcribe = GPT("gpt-4o-mini-transcribe")
-text_embedder = GPT("text-embedding-3-large")
+# Model versions are configurable under `models:` in config.yaml; the names here are
+# the defaults for a config that does not set them.
+gpt_strong = GPT(configured_model_name("gpt_strong", "gpt-6.1-sol", OPENAI_PROVIDERS))
+gpt_cheap = GPT(configured_model_name("gpt_cheap", "gpt-5.6-terra", OPENAI_PROVIDERS))
+gpt_nano = GPT(configured_model_name("gpt_nano", "gpt-6-luna", OPENAI_PROVIDERS))
+gpt_transcribe = GPT(configured_model_name("gpt_transcribe", "gpt-4o-mini-transcribe", OPENAI_PROVIDERS))
+text_embedder = GPT(configured_model_name("text_embedder", "text-embedding-3-large", OPENAI_PROVIDERS))
 
 if __name__ == "__main__":
     llm = GPT(specifier="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",

@@ -19,15 +19,18 @@ INSTANCE_REASON_ORDER = (
     "no_gold_verdict",
     "no_claim_time",
     "no_fact_check_time",
-    "nothing_extracted",
-    "key_evidence_lost",
+    "no_fact_check_article",
     "sufficiency_validation_failed",
     "insufficient_evidence",
+    # No longer assigned, but still stored on claims processed before.
+    "nothing_extracted",
+    "key_evidence_lost",
 )
 
 #: Order used for inadmissibility reasons, mirroring `admissibility.REASON_ORDER`.
 REASON_ORDER = (
     "fact_check_source",
+    "locator_missing",
     "not_filtered",
     "low_extraction_confidence",
     "inaccessible",
@@ -228,6 +231,7 @@ def count_ticks(max_count: int, *, target: int = 4) -> list[int]:
 #: criterion - so subtracting them one after another reconstructs the funnel
 #: exactly, without needing a second pass over the rows.
 FUNNEL_STAGES = (
+    ("Locator given", "locator_missing"),
     ("Stage 2 completed", "not_filtered"),
     ("Confident enough", "low_extraction_confidence"),
     ("Source re-retrieved", "inaccessible"),
@@ -258,10 +262,10 @@ def evidence_funnel(*, n_candidates: int, n_unfiltered: int, reasons: Iterable[d
     }]
     remaining = n_candidates
 
-    for index, (label, reason) in enumerate(FUNNEL_STAGES):
-        # Items whose Stage 2 never completed leave at the first step, whether
-        # they were recorded as `not_filtered` or never got a verdict at all.
-        loss = dropped.get(reason, 0) + (n_unfiltered if index == 0 else 0)
+    for label, reason in FUNNEL_STAGES:
+        # Items whose Stage 2 never completed leave at the `not_filtered` step,
+        # whether they were recorded as such or never got a verdict at all.
+        loss = dropped.get(reason, 0) + (n_unfiltered if reason == "not_filtered" else 0)
         remaining -= loss
         stages.append({
             "label": label,

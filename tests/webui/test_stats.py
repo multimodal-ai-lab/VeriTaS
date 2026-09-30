@@ -216,6 +216,19 @@ def test_funnel_subtracts_each_reason_at_its_own_stage():
     assert stages["not_filtered"]["dropped"] == 5
 
 
+def test_a_missing_locator_is_its_own_first_funnel_stage():
+    """Citations without a locator are not link rot; they leave before Stage 2,
+    and the unfiltered items still leave at the `not_filtered` step."""
+    stages = make_funnel(reasons=[{"label": "locator_missing", "count": 7},
+                                  {"label": "inaccessible", "count": 20}],
+                         n_admissible=68)
+    assert stages[1]["reason"] == "locator_missing"
+    assert stages[1]["dropped"] == 7
+    by_reason = {stage["reason"]: stage for stage in stages}
+    assert by_reason["not_filtered"]["dropped"] == 5
+    assert by_reason["inaccessible"]["dropped"] == 20
+
+
 def test_funnel_reports_a_disagreement_with_the_stored_admissible_count():
     stages = make_funnel(n_admissible=50)
     admissible = stages[-2]

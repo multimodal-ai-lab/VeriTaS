@@ -20,6 +20,7 @@ from veritas.gold_evidence import (
     CONDITION_CLAIM,
     CONDITION_FACT_CHECK,
     STATUS_ACCEPTED,
+    STATUS_PENDING,
     STATUS_REJECTED,
 )
 from veritas.gold_evidence import pipeline as pipeline_module
@@ -27,11 +28,11 @@ from veritas.gold_evidence.admissibility import apply_admissibility_to_item
 from veritas.gold_evidence.extraction import Extraction
 from veritas.gold_evidence.models import EvidenceRole, Faithfulness, TemporalValidation
 from veritas.gold_evidence.pipeline import (
-    REJECT_KEY_EVIDENCE_LOST,
+    PENDING_EXTRACTION_FAILED,
     REJECT_INSUFFICIENT_EVIDENCE,
+    REJECT_NO_ARTICLE,
     REJECT_NO_CLAIM_TIME,
     REJECT_NO_FACT_CHECK_TIME,
-    REJECT_NOTHING_EXTRACTED,
     REJECT_NO_GOLD_VERDICT,
     reconstruct_claim,
     summarize,
@@ -79,7 +80,10 @@ def wired(monkeypatch):
         "close": {CONDITION_CLAIM: True, CONDITION_FACT_CHECK: True},
         "sufficiency_calls": [],
         "rationales_seen": [],
-        "missing_key_seen": [],
+        "key_missing_seen": [],
+        # What the fake extraction reports about the articles it read.
+        "n_articles": 1,
+        "n_failed": 0,
         "t_c": datetime(2024, 5, 1),
         "t_f": datetime(2024, 5, 21),
     }
@@ -96,7 +100,8 @@ def wired(monkeypatch):
         state["db"].evidence = state["extracted"]
         state["db"].rationales = state["rationales"]
         return Extraction(evidence=list(state["extracted"]),
-                          rationales=list(state["rationales"]))
+                          rationales=list(state["rationales"]),
+                          n_articles=state["n_articles"], n_failed=state["n_failed"])
 
     async def fake_filter(claim, evidence, **kwargs):
         """Stands in for Stage 2: marks every source accessible, faithful and
@@ -114,10 +119,10 @@ def wired(monkeypatch):
         return [item for item in evidence if item.admissible]
 
     async def fake_validate(claim, evidence, gold, *, condition, mode, threshold,
-                            rationales=(), missing_key=()):
+                            rationales=(), n_key_missing=0):
         state["sufficiency_calls"].append((condition, len(list(evidence))))
         state["rationales_seen"].append(len(list(rationales)))
-        state["missing_key_seen"].append(len(list(missing_key)))
+        state["key_missing_seen"].append(n_key_missing)
         return SufficiencyResult(
             claim_id=claim.id, condition=condition, ensemble_mode=mode,
             n_evidence=len(list(evidence)), threshold=threshold,
@@ -219,13 +224,54 @@ async def test_rejected_without_a_fact_check_time(wired):
 
 
 @pytest.mark.asyncio
-async def test_rejected_when_nothing_at_all_could_be_extracted(wired):
-    """Neither evidence nor a rationale: there is nothing to analyze."""
+async def test_an_empty_extraction_is_analyzed_rather_than_rejected(wired):
+    """Neither evidence nor a rationale is a result: the ensemble judges the claim
+    on its own, and that decides the instance."""
     wired["extracted"] = []
     wired["rationales"] = []
     outcome = await reconstruct_claim(make_claim())
+
+    assert outcome.status == STATUS_ACCEPTED
+    assert [c for c, _ in wired["sufficiency_calls"]] == [CONDITION_CLAIM, CONDITION_FACT_CHECK]
+    assert wired["rationales_seen"] == [0, 0]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_extraction_the_ensemble_cannot_resolve_is_insufficient(wired):
+    wired["extracted"] = []
+    wired["close"] = {CONDITION_CLAIM: False, CONDITION_FACT_CHECK: False}
+    outcome = await reconstruct_claim(make_claim())
     assert outcome.status == STATUS_REJECTED
-    assert outcome.reason == REJECT_NOTHING_EXTRACTED
+    assert outcome.reason == REJECT_INSUFFICIENT_EVIDENCE
+
+
+@pytest.mark.asyncio
+async def test_rejected_without_any_readable_fact_check_article(wired):
+    """Without an article there is nothing to reconstruct evidence from."""
+    wired["n_articles"] = 0
+    outcome = await reconstruct_claim(make_claim())
+    assert outcome.status == STATUS_REJECTED
+    assert outcome.reason == REJECT_NO_ARTICLE
+    assert wired["sufficiency_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_extraction_leaves_the_claim_pending(wired):
+    """An error is not a finding: the empty result must not be analyzed as if the
+    fact-check cited nothing. The claim is extracted again on the next run."""
+    wired["n_articles"], wired["n_failed"] = 2, 2
+    outcome = await reconstruct_claim(make_claim())
+    assert outcome.status == STATUS_PENDING
+    assert outcome.reason == PENDING_EXTRACTION_FAILED
+    assert wired["sufficiency_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_one_failed_article_of_two_is_not_a_failed_extraction(wired):
+    wired["n_articles"], wired["n_failed"] = 2, 1
+    wired["extracted"] = [make_evidence(decided=False)]
+    outcome = await reconstruct_claim(make_claim())
+    assert outcome.status == STATUS_ACCEPTED
 
 
 @pytest.mark.asyncio
@@ -242,7 +288,9 @@ async def test_an_empty_evidence_set_is_analyzed_when_a_rationale_carries_it(wir
 
 
 @pytest.mark.asyncio
-async def test_rejected_when_an_key_item_loses_every_source(wired, monkeypatch):
+async def test_a_lost_key_item_is_left_to_the_ensemble(wired, monkeypatch):
+    """Losing a key item does not discard the instance: the extractor only predicts
+    that the verdict breaks without it, and Stage 3 tests that directly."""
     wired["extracted"] = [make_evidence(decided=False)]
     wired["rationales"] = [make_rationale()]
 
@@ -255,10 +303,52 @@ async def test_rejected_when_an_key_item_loses_every_source(wired, monkeypatch):
 
     monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
     outcome = await reconstruct_claim(make_claim())
-    assert outcome.status == STATUS_REJECTED
-    assert outcome.reason == REJECT_KEY_EVIDENCE_LOST
+    assert outcome.status == STATUS_ACCEPTED
     assert outcome.n_key_lost == 1
-    assert wired["sufficiency_calls"] == []  # no ensemble calls were wasted
+    # Both conditions were judged, with the rationale, and knew the key item was gone.
+    assert [n for _, n in wired["sufficiency_calls"]] == [0, 0]
+    assert wired["rationales_seen"] == [1, 1]
+    assert wired["key_missing_seen"] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_key_item_the_ensemble_cannot_do_without_is_insufficient(wired, monkeypatch):
+    wired["extracted"] = [make_evidence(decided=False)]
+    wired["close"] = {CONDITION_CLAIM: False, CONDITION_FACT_CHECK: False}
+
+    async def fake_filter(claim, evidence, **kwargs):
+        for item in evidence:
+            for citation in item.citations:
+                citation.source.accessible = False
+            apply_admissibility_to_item(item)
+        return []
+
+    monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
+    outcome = await reconstruct_claim(make_claim())
+    assert outcome.status == STATUS_REJECTED
+    assert outcome.reason == REJECT_INSUFFICIENT_EVIDENCE
+
+
+@pytest.mark.asyncio
+async def test_a_key_item_that_appeared_after_the_claim_does_not_decide_e_claim(wired, monkeypatch):
+    """E_c lacking a key item is recorded, but the ensemble judges E_c like E_f:
+    the two conditions of the paired test must be decided by the same rule."""
+    wired["extracted"] = [make_evidence(decided=False)]
+
+    async def fake_filter(claim, evidence, **kwargs):
+        for item in evidence:
+            for citation in item.citations:
+                citation.source.accessible = True
+                citation.faithfulness = Faithfulness(assessment=1.0)
+                citation.temporal_validation = TemporalValidation(
+                    before_fact_check=True, before_claim=False)
+            apply_admissibility_to_item(item, undated_policy="permissive")
+        return evidence
+
+    monkeypatch.setattr(pipeline_module, "filter_evidence", fake_filter)
+    await reconstruct_claim(make_claim())
+    assert [c for c, _ in wired["sufficiency_calls"]] == [CONDITION_CLAIM, CONDITION_FACT_CHECK]
+    assert wired["key_missing_seen"] == [1, 0]
 
 
 @pytest.mark.asyncio
@@ -336,7 +426,7 @@ async def test_losing_one_of_two_redundant_items_keeps_the_instance(wired, monke
     assert outcome.n_key == 0
     assert outcome.n_admissible == 1
     assert dict(wired["sufficiency_calls"])[CONDITION_FACT_CHECK] == 1
-    assert wired["missing_key_seen"] == [0, 0]
+    assert wired["key_missing_seen"] == [0, 0]
 
 
 @pytest.mark.asyncio
@@ -382,7 +472,7 @@ async def test_a_redundant_window_item_does_not_short_circuit_e_claim(wired, mon
     sizes = dict(wired["sufficiency_calls"])
     assert sizes[CONDITION_CLAIM] == 1
     assert sizes[CONDITION_FACT_CHECK] == 2
-    assert wired["missing_key_seen"] == [0, 0]
+    assert wired["key_missing_seen"] == [0, 0]
 
 
 @pytest.mark.asyncio

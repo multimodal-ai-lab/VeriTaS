@@ -32,4 +32,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Shell form, so `WEBUI_PORT` is expanded at start-up; `exec` keeps uvicorn as
 # PID 1 so that it still receives SIGTERM and shuts down gracefully.
-CMD exec uvicorn webui.main:app --host 0.0.0.0 --port "${WEBUI_PORT:-8080}" --proxy-headers
+# `WEBUI_HOST` only matters where the container shares the host's network (see
+# docker-compose.podman.yaml); behind Docker's port mapping it stays 0.0.0.0.
+CMD exec uvicorn webui.main:app --host "${WEBUI_HOST:-0.0.0.0}" --port "${WEBUI_PORT:-8080}" --proxy-headers

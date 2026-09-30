@@ -191,4 +191,4 @@ async def test_an_unlocated_source_is_discarded_without_a_retrieval(stage_2):
     assert stage_2["retrievals"] == []
     assert citation.source is None
     assert citation.admissible is False
-    assert citation.inadmissibility_reason == "inaccessible"
+    assert citation.inadmissibility_reason == "locator_missing"

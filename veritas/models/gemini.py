@@ -12,7 +12,8 @@ from pydantic import BaseModel
 
 from veritas import api_secrets
 from veritas.common.prompt import Prompt
-from veritas.models.base import Generation, Model, RateLimitError, QuotaExceededError, THINKING_BUDGETS
+from veritas.models.base import (Generation, Model, RateLimitError, QuotaExceededError, THINKING_BUDGETS,
+                                 GEMINI_PROVIDERS, configured_model_name)
 
 logger = logging.getLogger("VeriTaS")
 
@@ -201,8 +202,10 @@ def to_gemini_user_content(user_prompt: Prompt, extra_instructions: str | None =
     return parts
 
 
-gemini_strong = Gemini("gemini-3.1-pro-preview")
-gemini_cheap = Gemini("gemini-3.8-flash")
+# Model versions are configurable under `models:` in config.yaml; the names here are
+# the defaults for a config that does not set them.
+gemini_strong = Gemini(configured_model_name("gemini_strong", "gemini-3.1-pro-preview", GEMINI_PROVIDERS))
+gemini_cheap = Gemini(configured_model_name("gemini_cheap", "gemini-3.8-flash", GEMINI_PROVIDERS))
 
 if __name__ == "__main__":
     prompt = Prompt(text="<video:11> Describe what you see.")

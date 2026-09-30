@@ -5,12 +5,12 @@ reconstructed, the instance is *rejected*, which is recorded in the additive
 `claims.gold_evidence_*` columns only - `claims.dismissed` stays untouched, so a
 rejected instance remains a valid VeriTaS claim.
 
-An *empty* evidence set is not a rejection: a verdict can rest on arithmetic, on a
-contradiction inside the claim, or on what the claim's own media shows, and the
-verdict rationale carries those cases. What disqualifies an instance is a broken
-argument - a key evidence item, i.e. one without which the verdict likely breaks,
-that Stage 2 left without a single admissible source. Auxiliary items may be lost
-without that: whether what remains still suffices is for Stage 3 to decide.
+Neither an *empty* evidence set nor the loss of evidence in Stage 2 is a rejection
+in itself. A verdict can rest on arithmetic, on a contradiction inside the claim, or
+on what the claim's own media shows, and a key item that lost every source may have
+been key only to the extractor. Whether what remains suffices to recover the gold
+verdict is decided by one judge only - the Stage 3 ensemble. The roles are recorded
+for the analysis, not used as a gate.
 """
 
 from __future__ import annotations
@@ -53,12 +53,22 @@ logger = logging.getLogger("VeriTaS")
 REJECT_NO_GOLD_VERDICT = "no_gold_verdict"
 REJECT_NO_CLAIM_TIME = "no_claim_time"
 REJECT_NO_FACT_CHECK_TIME = "no_fact_check_time"
-#: Stage 1 produced neither evidence nor a rationale - nothing to analyze at all.
-REJECT_NOTHING_EXTRACTED = "nothing_extracted"
-#: A key evidence item lost every one of its sources in Stage 2.
-REJECT_KEY_EVIDENCE_LOST = "key_evidence_lost"
+#: None of the claim's reviews has a readable fact-checking article, so there is
+#: nothing to reconstruct evidence from. (An article that yields neither evidence
+#: nor a rationale is *not* a rejection: the ensemble then judges the claim alone.)
+REJECT_NO_ARTICLE = "no_fact_check_article"
 REJECT_ENSEMBLE_FAILED = "sufficiency_validation_failed"
 REJECT_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+#: No longer assigned, but still stored on claims processed by earlier versions:
+#: an empty extraction and a lost key item used to reject the instance outright.
+LEGACY_REJECT_NOTHING_EXTRACTED = "nothing_extracted"
+LEGACY_REJECT_KEY_EVIDENCE_LOST = "key_evidence_lost"
+REJECT_KEY_EVIDENCE_LOST = LEGACY_REJECT_KEY_EVIDENCE_LOST  # kept for the legacy alias map
+
+#: Not a rejection: the extractor failed on every article (an error or an unusable
+#: response). The claim stays `pending` and is extracted again on the next run.
+PENDING_EXTRACTION_FAILED = "extraction_failed"
 
 
 @dataclass
@@ -73,7 +83,7 @@ class ClaimOutcome:
     n_deferred: int = 0
     n_rationales: int = 0
     #: Key evidence items (those the verdict likely breaks without), and how many
-    #: of them lost every source in Stage 2. The latter is what rejects an instance.
+    #: of them lost every source in Stage 2. Reported only; neither rejects.
     n_key: int = 0
     n_key_lost: int = 0
     results: dict[str, SufficiencyResult] = field(default_factory=dict)
@@ -145,14 +155,20 @@ async def reconstruct_claim(
         re_extract = True
     if re_extract or not (evidence or rationales):
         extraction = await extract_evidence(claim, replace=re_extract)
+        if extraction.n_articles == 0:
+            return await _finish(claim, outcome, STATUS_REJECTED, REJECT_NO_ARTICLE)
+        if extraction.failed:
+            # An error is not a finding: analyzing the empty result would judge the
+            # claim as if its fact-check cited nothing. Try again next run.
+            logger.warning(f"Claim {claim.id}: evidence extraction failed for all "
+                           f"{extraction.n_articles} article(s); left pending.")
+            return await _finish(claim, outcome, STATUS_PENDING, PENDING_EXTRACTION_FAILED)
         evidence, rationales = extraction.evidence, extraction.rationales
     outcome.n_candidates = len(evidence)
     outcome.n_rationales = len(rationales)
 
-    # An empty evidence set is legitimate as long as a rationale carries the
-    # argument; only the total absence of both leaves nothing to analyze.
-    if not evidence and not rationales:
-        return await _finish(claim, outcome, STATUS_REJECTED, REJECT_NOTHING_EXTRACTED)
+    # Neither an empty evidence set nor a missing rationale ends the analysis: the
+    # ensemble then judges from whatever there is, down to the claim alone.
     await db.set_gold_evidence_status(claim.id, STATUS_EXTRACTED)
 
     # --- Stage 2 -----------------------------------------------------------
@@ -181,17 +197,13 @@ async def reconstruct_claim(
 
     outcome.n_admissible = sum(1 for item in evidence if item.admissible)
 
-    # The argument is broken when a key proposition has no admissible source
-    # left. Redundancy saves it at two levels: an item survives as long as one of
-    # its sources does, and an auxiliary item may be lost altogether, since the
-    # verdict does not break without it - Stage 3 judges whether the rest suffices.
+    # Lost key items are counted, not acted on: the extractor's "key" is a
+    # prediction of what the verdict needs, and Stage 3 tests that directly.
     outcome.n_key = len(key_evidence(evidence))
-    lost = lost_key(evidence)
-    outcome.n_key_lost = len(lost)
-    if lost:
-        logger.debug(f"Claim {claim.id} rejected: {len(lost)} key item(s) lost "
-                     f"every source, e.g. {lost[0].proposition[:120]!r}")
-        return await _finish(claim, outcome, STATUS_REJECTED, REJECT_KEY_EVIDENCE_LOST)
+    outcome.n_key_lost = len(lost_key(evidence))
+    if outcome.n_key_lost:
+        logger.debug(f"Claim {claim.id}: {outcome.n_key_lost} key item(s) lost every "
+                     f"source; the ensemble decides whether the rest suffices.")
     await db.set_gold_evidence_status(claim.id, STATUS_FILTERED)
 
     # --- Stage 3 -----------------------------------------------------------
@@ -200,9 +212,7 @@ async def reconstruct_claim(
         result = await validate_sufficiency(
             claim, subset, gold, condition=condition, mode=mode, threshold=threshold,
             rationales=rationales,
-            # A condition that cannot supply a key proposition cannot carry the
-            # verdict, so there is nothing for the ensemble to decide.
-            missing_key=missing_key(evidence, condition),
+            n_key_missing=len(missing_key(evidence, condition)),
         )
         outcome.results[condition] = result
         await db.save_gold_evidence_result(result.to_db_dict())
@@ -271,6 +281,32 @@ async def retry_deferred_archive_today_sources(**kwargs) -> list[ClaimOutcome]:
     claim_ids = await db.get_claim_ids_citing_sources([source.id for source in sources])
     if not claim_ids:
         return []
+    claims = await db.get_claims_by_ids(claim_ids)
+    return await reconstruct_claims(claims, **kwargs)
+
+
+async def retry_deferred_claims(**kwargs) -> list[ClaimOutcome]:
+    """Reconstructs every claim on status `deferred` again, now.
+
+    Called at the start of every reconstruction run, independent of the run's
+    date range and limit, so that no claim stays parked just because later runs
+    were configured for other claims (or for none at all). The deferral windows of
+    the sources those claims wait for are cleared first: otherwise the retry would
+    find every one of them still waiting and change nothing. A source that is still
+    rate-limited or gated simply defers again, and its claims with it.
+
+    `kwargs` are forwarded to `reconstruct_claims` (e.g. `mode`, `threshold`)."""
+    claim_ids = await db.get_claim_ids_with_gold_evidence_status(STATUS_DEFERRED)
+    if not claim_ids:
+        return []
+
+    sources = await db.get_deferred_sources_cited_by(claim_ids)
+    for source in sources:
+        source.deferred_until = None
+        await db.update_source(source)
+
+    logger.info(f"Retrying {len(claim_ids)} deferred claim(s), clearing the deferral "
+                f"of {len(sources)} source(s).")
     claims = await db.get_claims_by_ids(claim_ids)
     return await reconstruct_claims(claims, **kwargs)
 

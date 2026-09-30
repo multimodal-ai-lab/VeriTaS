@@ -14,7 +14,9 @@ import openai
 from ezmm import MultimodalSequence
 
 from veritas.common.prompt import Prompt
+from veritas import models_config
 from veritas.models import Model, QuotaExceededError, RateLimitError, gpt_strong, gemini_strong, init_model
+from veritas.models.base import GEMINI_PROVIDERS, OPENAI_PROVIDERS, matching_singleton
 
 T = TypeVar('T')
 
@@ -234,11 +236,33 @@ class Ensemble:
         return responses
 
 
+#: Members of the global ensemble when `models.ensemble` is not configured. Tracks
+#: the strong singletons, so that changing `models.gpt_strong` alone changes the
+#: ensemble member too, as it did when the ensemble registered the singletons directly.
+DEFAULT_ENSEMBLE: list[str] = [
+    f"openai:{gpt_strong.specifier}",
+    "anthropic:claude-opus-5-5",
+    # "selfhosted:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",  # TODO: Replace with Qwen
+    f"gemini:{gemini_strong.specifier}",
+]
+
+
+def ensemble_members(specifiers: Iterable[str] | str | None,
+                     singletons: list[tuple[Model, tuple[str, ...]]]) -> list[str | Model]:
+    """The members to register for the given specifiers (null or empty -> the
+    defaults). A specifier denoting one of the `singletons` becomes that instance,
+    so the ensemble shares its client instead of constructing a second one; all
+    others stay specifiers for `init_model`."""
+    if isinstance(specifiers, str):
+        specifiers = [specifiers]
+    specifiers = list(specifiers or DEFAULT_ENSEMBLE)
+    return [matching_singleton(s, singletons) or s for s in specifiers]
+
+
 ensemble = Ensemble()  # global singleton instance
-ensemble.register(gpt_strong)
-ensemble.register("anthropic:claude-opus-5-5")
-# ensemble.register("selfhosted:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")  # TODO: Replace with Qwen
-ensemble.register(gemini_strong)
+for _member in ensemble_members(models_config.get("ensemble"),
+                                [(gpt_strong, OPENAI_PROVIDERS), (gemini_strong, GEMINI_PROVIDERS)]):
+    ensemble.register(_member)
 
 if __name__ == "__main__":
     prompt = Prompt(text="<image:126394> Describe what you see.")

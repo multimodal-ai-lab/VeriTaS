@@ -3,8 +3,8 @@
 Everything goes through scrapeMM, in exactly one call per source: the response
 carries the multimodal sequence *and* the raw HTML the method saw along the way.
 The order is: one `retrieve(output_format="multimodal")` -> publication time from
-the meta tags of that response's HTML -> LLM dating only if the meta tags carried
-nothing.
+the markup (JSON-LD, meta tags, microdata) of that response's HTML -> LLM dating only
+if the markup carried nothing, shown the HTML's remaining date hints.
 """
 
 from datetime import datetime
@@ -32,6 +32,7 @@ def scrapemm(monkeypatch):
         "meta_input": [],
         "llm_date": None,
         "llm_calls": [],
+        "llm_hints": [],
         "content": MultimodalSequence(PAGE),
     }
 
@@ -45,16 +46,17 @@ def scrapemm(monkeypatch):
         return ScrapingResponse(url=url, content=content, method="firecrawl",
                                 output_format=output_format)
 
-    def fake_meta(html):
+    def fake_meta(html, now=None):
         state["meta_input"].append(html)
         return state["meta_date"]
 
-    async def fake_llm(url, content):
+    async def fake_llm(url, content, hints=None):
         state["llm_calls"].append(url)
+        state["llm_hints"].append(hints)
         return state["llm_date"]
 
     monkeypatch.setattr(retrieval_module, "retrieve", fake_retrieve)
-    monkeypatch.setattr(retrieval_module, "extract_date_meta", fake_meta)
+    monkeypatch.setattr(retrieval_module, "extract_publication_time", fake_meta)
     monkeypatch.setattr(retrieval_module, "determine_publication_time_llm", fake_llm)
     return state
 
@@ -135,6 +137,63 @@ async def test_dating_can_be_switched_off(scrapemm):
     assert scrapemm["llm_calls"] == []
 
 
+# --- The HTML's date hints reach the LLM -------------------------------------
+
+@pytest.mark.asyncio
+async def test_the_llm_is_shown_the_date_hints_of_the_html(scrapemm):
+    """The dateline is often stripped from the extracted text but survives in the
+    markup; it reaches the LLM as hints taken from the same response's HTML."""
+    scrapemm["html"] = ('<html><body><p>By Jane Doe</p>'
+                        '<time datetime="2024-05-10">May 10, 2024</time>'
+                        '<p>Body</p></body></html>')
+    scrapemm["llm_date"] = datetime(2024, 5, 10)
+    result = await retrieve_source("https://example.org/a")
+
+    [hints] = scrapemm["llm_hints"]
+    assert len(hints) == 1
+    assert 'datetime="2024-05-10"' in hints[0]
+    assert "By Jane Doe" in hints[0]
+    assert result.dating_method == "llm"
+
+
+@pytest.mark.asyncio
+async def test_no_hints_are_collected_when_the_markup_dated_the_page(scrapemm, monkeypatch):
+    def failing(html):
+        raise AssertionError("hints must not be collected")
+
+    monkeypatch.setattr(retrieval_module, "publication_date_hints", failing)
+    scrapemm["meta_date"] = datetime(2024, 5, 10)
+    result = await retrieve_source("https://example.org/a")
+
+    assert result.date_hints == []
+    assert scrapemm["llm_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_failing_hint_collection_does_not_fail_the_retrieval(scrapemm, monkeypatch):
+    def failing(html):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(retrieval_module, "publication_date_hints", failing)
+    result = await retrieve_source("https://example.org/a")
+
+    assert result.accessible
+    assert scrapemm["llm_hints"] == [[]]
+
+
+@pytest.mark.asyncio
+async def test_failing_markup_extraction_falls_back_to_the_llm(scrapemm, monkeypatch):
+    def failing(html, now=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(retrieval_module, "extract_publication_time", failing)
+    scrapemm["llm_date"] = datetime(2024, 5, 12)
+    result = await retrieve_source("https://example.org/a")
+
+    assert result.available_since == datetime(2024, 5, 12)
+    assert result.dating_method == "llm"
+
+
 # --- Sources without an HTML page ------------------------------------------
 
 @pytest.mark.asyncio
@@ -151,6 +210,7 @@ async def test_a_source_without_html_is_still_retrieved(scrapemm):
     assert result.accessible
     assert result.method == "x"
     assert scrapemm["meta_input"] == []  # nothing to read meta tags off
+    assert scrapemm["llm_hints"] == [[]]
     assert result.dating_method == "llm"
 
 
@@ -346,3 +406,60 @@ async def test_server_error_in_response_errors_also_aborts_the_run(scrapemm):
     scrapemm["response"] = failed_response(ServerError("The server did not return a result for this URL."))
     with pytest.raises(QuotaExceededError):
         await retrieve_source("https://example.org/a")
+
+
+# --- The LLM's answer -----------------------------------------------------------
+
+class FakeDatingModel:
+    def __init__(self, answer):
+        self.answer = answer
+        self.prompts = []
+
+    async def generate(self, prompt, **kwargs):
+        self.prompts.append(str(prompt))
+        return self.answer
+
+
+@pytest.fixture
+def dating_model(monkeypatch):
+    def install(answer):
+        model = FakeDatingModel(answer)
+        monkeypatch.setattr(retrieval_module, "resolve_model", lambda specifier, default: model)
+        return model
+    return install
+
+
+@pytest.mark.asyncio
+async def test_the_llm_prompt_carries_the_hints(dating_model):
+    model = dating_model("2024-05-10")
+    hint = '<time datetime="2024-05-10">May 10</time> - preceded by: "By Jane Doe"'
+    result = await retrieval_module.determine_publication_time_llm(
+        "https://example.org/a", MultimodalSequence(PAGE), hints=[hint])
+
+    assert result == datetime(2024, 5, 10)
+    assert hint in model.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_the_llm_prompt_omits_the_hint_section_without_hints(dating_model):
+    model = dating_model("none")
+    await retrieval_module.determine_publication_time_llm(
+        "https://example.org/a", MultimodalSequence(PAGE))
+    assert "Date Markup Found" not in model.prompts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer,expected", [
+    ("2024-05-10T09:30:00+02:00", datetime(2024, 5, 10, 7, 30)),
+    ("2024-05-10", datetime(2024, 5, 10)),
+    ("none", None),
+    ("", None),
+    (None, None),
+    ("2024-05", None),       # a missing day is not completed (no guessing)
+    ("2999-01-01", None),    # implausible
+])
+async def test_the_llm_answer_is_parsed_strictly(dating_model, answer, expected):
+    dating_model(answer)
+    result = await retrieval_module.determine_publication_time_llm(
+        "https://example.org/a", MultimodalSequence(PAGE))
+    assert result == expected

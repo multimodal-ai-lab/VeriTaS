@@ -107,6 +107,7 @@ def test_extraction_auto_still_picks_by_modality(constructions, monkeypatch):
     from veritas.models import gemini_strong, gpt_strong
 
     monkeypatch.setattr(extraction_module, "extraction_model", "auto")
+    monkeypatch.setattr(extraction_module, "extraction_video_model", "auto")
 
     class Prompt:
         def __init__(self, videos):
@@ -118,6 +119,27 @@ def test_extraction_auto_still_picks_by_modality(constructions, monkeypatch):
     assert extraction_module._resolve_model(Prompt(True)) is gemini_strong
     assert extraction_module._resolve_model(Prompt(False)) is gpt_strong
     assert constructions == []
+
+
+def test_extraction_video_model_applies_to_videos_only(constructions, monkeypatch):
+    from veritas.models import gpt_strong
+
+    monkeypatch.setattr(extraction_module, "extraction_model", "auto")
+    monkeypatch.setattr(extraction_module, "extraction_video_model", "gemini:gemini-video")
+
+    class Prompt:
+        def __init__(self, videos):
+            self._videos = videos
+
+        def has_videos(self):
+            return self._videos
+
+    video_models = [extraction_module._resolve_model(Prompt(True)) for _ in range(5)]
+
+    assert len(set(id(m) for m in video_models)) == 1
+    assert video_models[0].specifier == "gemini:gemini-video"
+    assert extraction_module._resolve_model(Prompt(False)) is gpt_strong
+    assert constructions == ["gemini:gemini-video"]
 
 
 def test_dating_model_is_constructed_once(constructions, monkeypatch):

@@ -10,7 +10,7 @@ from typing import Type
 
 from ezmm import MultimodalSequence
 
-from veritas import selfhosted
+from veritas import models_config, selfhosted
 from veritas.common.prompt import Prompt
 from veritas.util.parsing import extract_last
 
@@ -186,6 +186,77 @@ def _split_provider(model_name: str) -> tuple[str | None, str]:
         provider, model = model_name.split(":", 1)
         return provider.lower(), model
     return None, model_name
+
+
+#: Provider prefixes `init_model` understands. A prefix outside this set is part of
+#: the model name itself (e.g. OpenAI fine-tunes like "ft:gpt-4o:org:id").
+KNOWN_PROVIDERS = frozenset({
+    "openai", "anthropic", "gemini", "google", "vertex", "vertexai", "gcp",
+    "selfhosted", "openai_compat", "llama",
+})
+
+#: Prefixes that `init_model` routes to the respective class. Used to check that a
+#: configured singleton names the provider its class implements.
+OPENAI_PROVIDERS = ("openai",)
+GEMINI_PROVIDERS = ("gemini", "google", "vertex", "vertexai", "gcp")
+
+
+def split_known_provider(specifier: str) -> tuple[str | None, str]:
+    """Like `_split_provider`, but only splits off a prefix naming a known provider,
+    so that colons inside a model name survive."""
+    provider, model = _split_provider(specifier)
+    if provider in KNOWN_PROVIDERS:
+        return provider, model
+    return None, specifier
+
+
+def configured_model_name(key: str,
+                          default: str,
+                          providers: tuple[str, ...],
+                          config: dict | None = None) -> str:
+    """The model name configured under `models.<key>` in config.yaml, or `default`.
+
+    The singletons in `veritas.models` are provider-specific (transcription and
+    embeddings exist only for OpenAI, video input only for Gemini), so the value may
+    carry a provider prefix only if it is one of `providers`; the prefix is stripped,
+    since the singleton's class already fixes the provider. A value naming another
+    provider (e.g. `gpt_strong: "anthropic:..."`) raises a `ValueError` rather than
+    silently constructing a model of the wrong class.
+
+    :param key: The key below `models:`, e.g. "gpt_strong".
+    :param default: The name used when the key is missing or null.
+    :param providers: The prefixes accepted for this singleton, e.g. `OPENAI_PROVIDERS`.
+    :param config: The `models:` section. Defaults to the one from config.yaml.
+    """
+    config = models_config if config is None else config
+    value = config.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"config.yaml: `models.{key}` must be a non-empty model name, "
+                         f"got {value!r}.")
+    provider, name = split_known_provider(value.strip())
+    if provider is not None and provider not in providers:
+        raise ValueError(
+            f"config.yaml: `models.{key}` is '{value}', but this model must be served by "
+            f"{' / '.join(providers)} (it is used through that provider's API). Name a "
+            f"model of that provider, or configure the other model where arbitrary "
+            f"providers are accepted (e.g. `models.ensemble` or the `gold_evidence.*_model` keys).")
+    return name
+
+
+def matching_singleton(specifier: str,
+                       singletons: "list[tuple[Model, tuple[str, ...]]]") -> "Model | None":
+    """Returns the singleton that `specifier` denotes, if any, so that it can be
+    reused instead of constructing a second instance of the same model.
+
+    Each singleton comes with the provider prefixes of its class. A specifier matches
+    if its model name equals the singleton's and it carries no prefix or one of those."""
+    provider, name = split_known_provider(specifier.strip())
+    for model, providers in singletons:
+        if name == model.specifier and (provider is None or provider in providers):
+            return model
+    return None
 
 
 def _infer_model_type(name: str) -> Type[Model]:

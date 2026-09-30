@@ -26,6 +26,7 @@ from veritas.common import Article, Claim, Prompt, Review
 from veritas.db import db
 from veritas.gold_evidence import (
     extraction_model,
+    extraction_video_model,
     max_article_length,
     max_evidence_per_claim,
     max_reviews_per_claim,
@@ -57,13 +58,28 @@ class Extraction:
     evidence: list[Evidence] = field(default_factory=list)
     #: One rationale per article that produced one.
     rationales: list[VerdictRationale] = field(default_factory=list)
+    #: Articles the extractor was run on, and how many of those runs failed (an
+    #: error or an unusable response) rather than returned a result.
+    n_articles: int = 0
+    n_failed: int = 0
 
     @property
     def is_empty(self) -> bool:
-        """True if the articles yielded neither evidence nor a rationale, i.e. the
-        instance cannot be analyzed at all. An empty *evidence set* alone is a
-        legitimate outcome: some verdicts rest on the rationale only."""
+        """True if the articles yielded neither evidence nor a rationale. That is a
+        legitimate result - the ensemble then judges the claim on its own - as long
+        as the extractor actually ran; see `failed`."""
         return not self.evidence and not self.rationales
+
+    @property
+    def failed(self) -> bool:
+        """True if the extractor ran on no article successfully, i.e. an empty
+        result says nothing about the claim and must not be analyzed as one."""
+        return self.n_articles > 0 and self.n_failed == self.n_articles
+
+
+class ExtractionFailed(Exception):
+    """The extractor produced no usable response for an article. Distinguished
+    from an empty result, which is a finding; this is not."""
 
 
 async def extract_evidence(claim: Claim, replace: bool = False) -> Extraction:
@@ -90,7 +106,14 @@ async def extract_evidence(claim: Claim, replace: bool = False) -> Extraction:
         article = await review.article
         if not article or article.dismissed or not str(article.content).strip():
             continue
-        evidence, rationale = await extract_from_article(claim, review, article)
+        extraction.n_articles += 1
+        try:
+            evidence, rationale = await extract_from_article(claim, review, article)
+        except ExtractionFailed as e:
+            extraction.n_failed += 1
+            logger.warning(f"Evidence extraction failed for claim {claim.id}, "
+                           f"review {review.id}: {e}")
+            continue
         extraction.evidence.extend(evidence)
         if rationale:
             extraction.rationales.append(rationale)
@@ -115,7 +138,8 @@ async def _select_reviews(claim: Claim) -> list[Review]:
 
 async def extract_from_article(claim: Claim, review: Review,
                                article: Article) -> tuple[list[Evidence], VerdictRationale | None]:
-    """Runs the extractor MLLM on a single fact-checking article.
+    """Runs the extractor MLLM on a single fact-checking article. Raises
+    `ExtractionFailed` if it returned no usable response.
 
     A *rectified* claim is not the claim the article checked: it is a corrected
     version of it, produced to balance the dataset, and the fact-checker never
@@ -155,12 +179,13 @@ async def extract_from_article(claim: Claim, review: Review,
     except FATAL_ERRORS:
         raise
     except Exception as e:
-        logger.warning(f"Evidence extraction failed for claim {claim.id}, review {review.id}: {e}")
-        return [], None
+        raise ExtractionFailed(f"{type(e).__name__}: {e}") from e
 
     if response is None:
-        return [], None
+        raise ExtractionFailed("The model returned no response.")
 
+    if not is_structured_response(str(response)):
+        raise ExtractionFailed(f"Unparseable response: {str(response)[:300]!r}")
     rationale_text, records = parse_extraction_response(str(response))
     if not records:
         logger.debug(f"Extractor returned no evidence records for claim {claim.id}, "
@@ -195,14 +220,17 @@ async def extract_from_article(claim: Claim, review: Review,
 
 
 def _resolve_model(prompt: Prompt):
-    """Videos need a model that can natively read them (as in stage 5).
+    """Videos need a model that can natively read them (as in stage 5), so prompts
+    with videos use `extraction_video_model` ("auto" -> `gemini_strong`) and all
+    others `extraction_model` ("auto" -> `gpt_strong`).
 
     Resolved through `llm.resolve_model`, so a configured model is constructed
     once and reused across all claims."""
     from veritas.models import gemini_strong, gpt_strong
 
-    default = gemini_strong if prompt.has_videos() else gpt_strong
-    return resolve_model(extraction_model, default)
+    if prompt.has_videos():
+        return resolve_model(extraction_video_model, gemini_strong)
+    return resolve_model(extraction_model, gpt_strong)
 
 
 def _excluded_domains(review: Review, publisher) -> set[str]:
@@ -231,6 +259,18 @@ def _host_keys(url: str) -> set[str]:
     if hostname:
         keys.add(hostname.lower().removeprefix("www."))
     return keys
+
+
+def is_structured_response(response: str) -> bool:
+    """Whether the response contains a JSON object or list at all. An empty one
+    (`{"evidence": [], "verdict_rationale": ""}`) is a result; prose, a refusal or
+    garbage is not, and must not be mistaken for "the article cites nothing"."""
+    payload = extract_last_code_block(response) or response
+    try:
+        parsed = json_repair.loads(payload)
+    except Exception:
+        return False
+    return isinstance(parsed, (dict, list))
 
 
 def parse_extraction_response(response: str) -> tuple[str | None, list[dict]]:

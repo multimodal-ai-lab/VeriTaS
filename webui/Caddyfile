@@ -1,0 +1,21 @@
+# TLS front for the web UI: serves it publicly over HTTPS under WEBUI_DOMAIN.
+# Caddy obtains and renews the certificate from Let's Encrypt on its own; that
+# requires WEBUI_DOMAIN to resolve to this host and ports 80 and 443 to be
+# reachable from the internet. Enabled by `COMPOSE_PROFILES=tls` in `.env`, see
+# webui/README.md ("Public access over TLS").
+
+{$WEBUI_DOMAIN} {
+	encode zstd gzip
+
+	# The web UI itself; `webui:<port>` on Docker's bridge network, the host's
+	# loopback on a podman host (see docker-compose.podman.yaml).
+	reverse_proxy {$WEBUI_UPSTREAM}
+
+	header {
+		# Once served over HTTPS, browsers should not fall back to plain HTTP.
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+}
