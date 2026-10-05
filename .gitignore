@@ -3,6 +3,7 @@ dumps/
 data/
 dev/
 eval/baselines/results/
+config.yaml
 
 
 # Byte-compiled / optimized / DLL files
