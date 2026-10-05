@@ -1,10 +1,12 @@
-"""Anthropic fact-checker provider."""
+"""Anthropic fact-checker provider.
+
+The model verifies the claim with the web_search and fetch_url tools via Anthropic's
+tool use API.
+"""
 
 import os
-import re
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
 
 import anthropic as anthropic_sdk
 
@@ -15,22 +17,14 @@ try:
 except ImportError:
     VERITAS_ANTHROPIC_KEY = None
 
-from ..common.types import FactCheckResult, LabelScheme
-from ..common.media import encode_image_base64, get_mime_type, extract_video_frames
-from .base import BaseFactChecker
-
-
-def _parse_data_uri(data_uri: str) -> tuple[str, str]:
-    """Parse a data URI into (media_type, base64_data)."""
-    # Format: data:<media_type>;base64,<data>
-    match = re.match(r"data:([^;]+);base64,(.+)", data_uri, re.DOTALL)
-    if match:
-        return match.group(1), match.group(2)
-    return "image/jpeg", data_uri
+from ..common.types import FactCheckResult
+from ..common.media import encode_image_base64, extract_video_frames, parse_data_uri
+from ..common.tools import anthropic_tools, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
+from .base import BaseFactChecker, MAX_TURNS
 
 
 class AnthropicFactChecker(BaseFactChecker):
-    """Fact-checker using Anthropic's Claude models with optional web search."""
+    """Fact-checker using Anthropic Claude with the web_search and fetch_url tools."""
 
     provider_name = "anthropic"
 
@@ -38,32 +32,27 @@ class AnthropicFactChecker(BaseFactChecker):
         self,
         api_key: str | None = None,
         model: str = "claude-sonnet-4-6",
-        use_search: bool = True,
-        label_scheme: LabelScheme | None = None,
-        seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
+        scrape_methods: list[str] | str | None = "auto",
+        max_searches: int = DEFAULT_MAX_SEARCHES,
+        max_fetches: int = DEFAULT_MAX_FETCHES,
     ):
         """
         Initialize the Anthropic fact-checker.
 
         Args:
-            api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
-            model: Model to use. Options include:
-                - "claude-sonnet-4-6": Claude Sonnet 4.6 (default)
-                - "claude-opus-4-6": Claude Opus 4.6 (most capable)
-                - "claude-haiku-4-5-20251001": Claude Haiku 4.5 (fastest)
-            use_search: If True (default), use built-in web search tool.
-                       If False, use only parametric knowledge.
-            label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
-            seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
-                                      combined label; "two_step" asks for
-                                      direction + certainty.
+            api_key: Anthropic API key. If None, uses config/env var.
+            model: Model to use (must support tool use).
+            scrape_methods: Which scrapeMM backends fetch_url uses (subset of
+                            integrations/browser/firecrawl/decodo, or "auto").
+            max_searches: Maximum number of web_search calls per claim.
+            max_fetches: Maximum number of fetch_url calls per claim.
         """
         super().__init__(
             api_key=api_key,
             model=model,
-            use_search=use_search,
-            label_scheme=label_scheme,
-            seven_bin_prediction_mode=seven_bin_prediction_mode,
+            scrape_methods=scrape_methods,
+            max_searches=max_searches,
+            max_fetches=max_fetches,
         )
         self.client = self._create_client(api_key)
 
@@ -72,13 +61,12 @@ class AnthropicFactChecker(BaseFactChecker):
         if api_key:
             return anthropic_sdk.Anthropic(api_key=api_key)
 
-        # Try Veritas config first, then environment variable
         key_to_use = VERITAS_ANTHROPIC_KEY or os.environ.get("ANTHROPIC_API_KEY")
 
         if not key_to_use:
             raise ValueError(
                 "Anthropic API key required. Either:\n"
-                "  1. Add it to config/globals.yaml (anthropic: <key>)\n"
+                "  1. Add it to config.yaml (api_secrets.anthropic)\n"
                 "  2. Set ANTHROPIC_API_KEY environment variable\n"
                 "  3. Pass api_key parameter"
             )
@@ -92,22 +80,22 @@ class AnthropicFactChecker(BaseFactChecker):
         claim_date: str | datetime | None = None,
     ) -> FactCheckResult:
         """
-        Fact-check a claim using Claude with optional web search and images.
+        Fact-check a claim using Anthropic with the web_search and fetch_url tools.
 
         Args:
             claim: The claim text to verify.
-            image_paths: Optional list of image file paths to include.
-            video_paths: Optional list of video file paths (frames will be extracted).
-            claim_date: Date of the claim (ISO format string or datetime).
+            image_paths: Optional list of image file paths.
+            video_paths: Optional list of video file paths (frames extracted).
+            claim_date: Date of the claim for temporal filtering.
 
         Returns:
-            FactCheckResult with verdict, reasoning, citations, etc.
+            FactCheckResult with verdict, reasoning, citations.
         """
-        # Collect all images (including extracted video frames)
+        session = self._new_tool_session(claim_date)
+
         all_image_paths = list(image_paths) if image_paths else []
         temp_frame_paths = []
 
-        # Extract frames from videos (Anthropic doesn't support native video)
         if video_paths:
             for video_path in video_paths:
                 frames = extract_video_frames(video_path, max_frames=5)
@@ -115,68 +103,65 @@ class AnthropicFactChecker(BaseFactChecker):
                 temp_frame_paths.extend(frames)
 
         try:
-            # Build user message content
-            content = []
+            messages = [{"role": "user", "content": self._build_user_content(claim, all_image_paths, claim_date)}]
+            system_prompt = self._system_prompt()
+            tools = anthropic_tools()
+            total_usage = {"input_tokens": 0, "output_tokens": 0}
 
-            # Add images
-            for img_path in all_image_paths:
-                img_data = encode_image_base64(img_path)
-                if img_data:
-                    media_type, b64_data = _parse_data_uri(img_data)
-                    content.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64_data,
-                        },
-                    })
+            for turn in range(MAX_TURNS):
+                # The last turn disables tool use to force a verdict
+                tool_choice = {"type": "none"} if turn == MAX_TURNS - 1 else {"type": "auto"}
+                response = self._call_with_retry(
+                    self.client.messages.create,
+                    model=self.model,
+                    max_tokens=8096,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
 
-            # Add text prompt
-            prompt_text = self._get_user_prompt(claim, claim_date)
-            content.append({"type": "text", "text": prompt_text})
+                # Accumulate usage
+                if hasattr(response, "usage") and response.usage:
+                    total_usage["input_tokens"] += getattr(response.usage, "input_tokens", 0)
+                    total_usage["output_tokens"] += getattr(response.usage, "output_tokens", 0)
 
-            system_prompt = self._get_system_prompt()
+                # Append assistant turn to history
+                messages.append({"role": "assistant", "content": response.content})
 
-            # Build API request
-            api_kwargs = {
-                "model": self.model,
-                "max_tokens": 8096,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": content}],
-            }
-            if self.use_search:
-                api_kwargs["tools"] = [
-                    {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
-                ]
+                # The model is done once it stops calling tools
+                tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+                if not tool_use_blocks:
+                    break
 
-            response = self._call_with_retry(
-                self.client.messages.create,
-                **api_kwargs,
-            )
+                # Append tool results as next user turn
+                messages.append({"role": "user", "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": session.call(block.name, block.input),
+                    }
+                    for block in tool_use_blocks
+                ]})
 
-            assert response is not None, "Anthropic API call failed after retries."
+            # Extract final text response
+            final_text = self._extract_text(response.content)
+            verdict = self._extract_verdict(final_text)
 
-            response_text = self._extract_response_text(response)
-            citations = self._extract_citations(response, response_text)
-            verdict = self._extract_verdict(response_text)
-
-            # Extract usage info
-            usage_info = {}
-            if hasattr(response, "usage") and response.usage:
-                usage_info = {
-                    "input_tokens": getattr(response.usage, "input_tokens", 0),
-                    "output_tokens": getattr(response.usage, "output_tokens", 0),
-                }
+            citations = list(session.citations)
+            for url in self._extract_urls_from_text(final_text):
+                if url not in citations:
+                    citations.append(url)
 
             return FactCheckResult(
                 verdict=verdict,
-                reasoning=response_text,
+                reasoning=final_text,
                 citations=citations,
                 model=self.model,
                 provider=self.provider_name,
-                usage=usage_info,
+                usage=total_usage,
             )
+
         finally:
             for temp_path in temp_frame_paths:
                 try:
@@ -184,32 +169,31 @@ class AnthropicFactChecker(BaseFactChecker):
                 except Exception:
                     pass
 
-    def _extract_response_text(self, response) -> str:
-        """Extract text content from Anthropic response."""
-        text_parts = []
-        for block in response.content:
-            block_type = getattr(block, "type", None)
-            if block_type == "text":
-                text_parts.append(block.text)
-        return "\n".join(text_parts)
+    def _build_user_content(
+        self,
+        claim: str,
+        image_paths: list[str],
+        claim_date: str | datetime | None,
+    ) -> list[dict]:
+        """Build user message content with optional images."""
+        content = []
+        for img_path in image_paths:
+            img_data = encode_image_base64(img_path)
+            if img_data:
+                media_type, b64_data = parse_data_uri(img_data)
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64_data,
+                    },
+                })
+        content.append({"type": "text", "text": self._user_prompt(claim, claim_date)})
+        return content
 
-    def _extract_citations(self, response, response_text: str) -> list[str]:
-        """Extract citations/URLs from Anthropic response."""
-        citations = []
-
-        # Extract URLs from web_search_tool_result blocks
-        for block in response.content:
-            block_type = getattr(block, "type", None)
-            if block_type == "web_search_tool_result":
-                content_items = getattr(block, "content", [])
-                for item in content_items:
-                    url = getattr(item, "url", None)
-                    if url and url not in citations:
-                        citations.append(url)
-
-        # Also extract URLs from response text
-        for url in self._extract_urls_from_text(response_text):
-            if url not in citations:
-                citations.append(url)
-
-        return citations
+    def _extract_text(self, content_blocks) -> str:
+        """Extract text from a list of Anthropic content blocks."""
+        return "\n".join(
+            b.text for b in content_blocks if getattr(b, "type", None) == "text"
+        )

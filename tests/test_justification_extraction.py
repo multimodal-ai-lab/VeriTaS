@@ -2,7 +2,6 @@
 
 import pytest
 
-from eval.baselines.common.types import get_label_scheme
 from eval.baselines.providers.base import BaseFactChecker, extract_justification
 
 
@@ -17,11 +16,7 @@ class DummyFactChecker(BaseFactChecker):
 
 @pytest.fixture
 def two_step_checker():
-    return DummyFactChecker(
-        model="dummy",
-        label_scheme=get_label_scheme(7),
-        seven_bin_prediction_mode="two_step",
-    )
+    return DummyFactChecker(model="dummy")
 
 
 def test_extracts_from_exact_output_block():

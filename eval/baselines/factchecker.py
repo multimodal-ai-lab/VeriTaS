@@ -1,82 +1,57 @@
 """Unified fact-checker that supports multiple providers."""
 
-import inspect
 from datetime import datetime
 from typing import Literal
 
-from .common.search import ScrapeMode
-from .common.types import FactCheckResult, LabelScheme
+from .common.tools import DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
+from .common.types import FactCheckResult
 from .providers import (
     BaseFactChecker,
     OpenAIFactChecker,
     GeminiFactChecker,
-    PerplexityFactChecker,
-    OpenAICustomSearchFactChecker,
-    GeminiCustomSearchFactChecker,
-    SelfhostedFactChecker,
     AnthropicFactChecker,
-    AnthropicCustomSearchFactChecker,
+    SelfhostedFactChecker,
 )
 from .providers.base import extract_justification
 
 
-Provider = Literal["openai", "gemini", "perplexity", "selfhosted", "anthropic"]
-SevenBinPredictionMode = Literal["direct", "two_step"]
+Provider = Literal["openai", "gemini", "anthropic", "selfhosted"]
 
 # Default models for each provider
 DEFAULT_MODELS = {
     "openai": "gpt-5.2",
     "gemini": "gemini-2.5-flash",
-    "perplexity": "sonar-pro",
-    "selfhosted": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
     "anthropic": "claude-sonnet-4-6",
+    "selfhosted": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
 }
 
-# Provider class mapping - standard (built-in search)
+# Provider class mapping
 PROVIDER_CLASSES = {
     "openai": OpenAIFactChecker,
     "gemini": GeminiFactChecker,
-    "perplexity": PerplexityFactChecker,
-    # Self-hosted models have no native search, always use custom
-    "selfhosted": SelfhostedFactChecker,
     "anthropic": AnthropicFactChecker,
+    "selfhosted": SelfhostedFactChecker,
 }
 
-# Provider class mapping - custom search (with date filtering)
-PROVIDER_CLASSES_CUSTOM_SEARCH = {
-    "openai": OpenAICustomSearchFactChecker,
-    "gemini": GeminiCustomSearchFactChecker,
-    # Perplexity already has good date filtering, no custom version needed
-    "perplexity": PerplexityFactChecker,
-    # Self-hosted models only support custom search
-    "selfhosted": SelfhostedFactChecker,
-    "anthropic": AnthropicCustomSearchFactChecker,
-}
+DEFAULT_PROVIDERS: list[Provider] = ["openai", "gemini", "anthropic"]
 
 
 class UnifiedFactChecker:
     """
     Unified fact-checker that can use any supported provider.
 
-    This class provides a single interface for fact-checking using
-    OpenAI, Gemini, Perplexity, or self-hosted Llama as the backend.
+    Every provider runs the same baseline: the model verifies the claim with the
+    web_search tool (results restricted to before the claim date) and the fetch_url
+    tool, and answers on the 7-class label scheme in two steps (DIRECTION + CERTAINTY).
 
     Example usage:
-        # Single provider with built-in search
-        fc = UnifiedFactChecker(provider="openai")
-        result = fc.check_claim("The Earth is flat")
-
-        # Single provider with custom search (date filtering + content retrieval)
-        fc = UnifiedFactChecker(provider="gemini", custom_search=True)
+        # Single provider
+        fc = UnifiedFactChecker(provider="gemini")
         result = fc.check_claim("The Earth is flat", claim_date="2024-01-15")
 
         # Multiple providers
-        fc = UnifiedFactChecker(providers=["openai", "gemini", "perplexity"])
+        fc = UnifiedFactChecker(providers=["openai", "gemini", "anthropic"])
         results = fc.check_claim_all_providers("The Earth is flat")
-
-        # Use 7-class label scheme (with uncertainty)
-        from baselines.common.types import get_label_scheme
-        fc = UnifiedFactChecker(provider="openai", label_scheme=get_label_scheme(7))
     """
 
     def __init__(
@@ -86,49 +61,32 @@ class UnifiedFactChecker:
         model: str | None = None,
         models: dict[Provider, str] | None = None,
         api_keys: dict[str, str] | None = None,
-        custom_search: bool = False,
-        use_search: bool = True,
-        label_scheme: LabelScheme | None = None,
-        seven_bin_prediction_mode: SevenBinPredictionMode = "direct",
-        scrape_mode: ScrapeMode = "lite",
-        scrape_methods: list[str] | str | None = "firecrawl",
+        scrape_methods: list[str] | str | None = "auto",
+        max_searches: int = DEFAULT_MAX_SEARCHES,
+        max_fetches: int = DEFAULT_MAX_FETCHES,
     ):
         """
         Initialize the unified fact-checker.
 
         Args:
-            provider: Single provider to use (openai, gemini, perplexity, or selfhosted).
+            provider: Single provider to use (openai, gemini, anthropic, or selfhosted).
             providers: List of providers to initialize (for multi-provider mode).
             model: Model to use for single provider mode.
             models: Dict mapping provider names to model identifiers.
             api_keys: Dict mapping provider/service names to API keys.
-                      Keys: "openai", "google", "perplexity"
-            custom_search: If True, use custom search instead of built-in
-                          provider search. Enables:
-                          - Date filtering (only results before claim date)
-                          - Full page content retrieval
-            use_search: If True (default), use web search. If False, use only
-                       parametric knowledge (no search tools will be used).
-            label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
-            seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
-                                      combined label; "two_step" asks for
-                                      direction + certainty in one response.
-            scrape_mode: For custom_search providers, how to fetch page content -
-                        "lite" (fast), "scrapemm" (full), or "none".
-            scrape_methods: For scrape_mode="scrapemm", which scrapeMM backends to use
-                        (subset of integrations/firecrawl/decodo, or "auto"). Default
-                        ["firecrawl"]. Custom-search providers only.
+                      Keys: "openai", "google", "anthropic", "selfhosted"
+            scrape_methods: Which scrapeMM backends fetch_url uses, in order (subset of
+                        integrations/browser/firecrawl/decodo, or "auto"). Default "auto".
+            max_searches: Maximum number of web_search calls per claim.
+            max_fetches: Maximum number of fetch_url calls per claim.
 
         Note: Specify either `provider` or `providers`, not both.
         """
         self.api_keys = api_keys or {}
         self.models = models or {}
-        self.custom_search = custom_search
-        self.use_search = use_search
-        self.scrape_mode = scrape_mode
-        self.label_scheme = label_scheme
-        self.seven_bin_prediction_mode = seven_bin_prediction_mode
         self.scrape_methods = scrape_methods
+        self.max_searches = max_searches
+        self.max_fetches = max_fetches
         self._checkers: dict[Provider, BaseFactChecker] = {}
 
         # Determine which providers to initialize
@@ -142,8 +100,7 @@ class UnifiedFactChecker:
         elif providers:
             providers_to_init = providers
         else:
-            # Default to standard providers (not custom)
-            providers_to_init = ["openai", "gemini", "perplexity"]
+            providers_to_init = list(DEFAULT_PROVIDERS)
 
         # Initialize requested providers
         for p in providers_to_init:
@@ -153,38 +110,23 @@ class UnifiedFactChecker:
 
     def _init_provider(self, provider: Provider) -> None:
         """Initialize a single provider."""
-        # Select the appropriate class based on custom_search flag
-        if self.custom_search:
-            provider_classes = PROVIDER_CLASSES_CUSTOM_SEARCH
-        else:
-            provider_classes = PROVIDER_CLASSES
+        if provider not in PROVIDER_CLASSES:
+            raise ValueError(f"Unknown provider: {provider}. Valid options: {list(PROVIDER_CLASSES.keys())}")
 
-        if provider not in provider_classes:
-            raise ValueError(f"Unknown provider: {provider}. Valid options: {list(provider_classes.keys())}")
-
-        provider_class = provider_classes[provider]
+        provider_class = PROVIDER_CLASSES[provider]
         model = self.models.get(provider, DEFAULT_MODELS[provider])
         api_key = self.api_keys.get(provider) or self.api_keys.get(
-            {"openai": "openai", "gemini": "google", "perplexity": "perplexity", "anthropic": "anthropic"}.get(provider)
+            {"openai": "openai", "gemini": "google", "anthropic": "anthropic"}.get(provider)
         )
 
-        # Build kwargs based on provider type
         kwargs = {
             "model": model,
-            "use_search": self.use_search,
-            "label_scheme": self.label_scheme,
-            "seven_bin_prediction_mode": self.seven_bin_prediction_mode,
+            "scrape_methods": self.scrape_methods,
+            "max_searches": self.max_searches,
+            "max_fetches": self.max_fetches,
         }
         if api_key:
             kwargs["api_key"] = api_key
-
-        # Only custom-search providers accept scrape_mode / scrape_methods;
-        # pass them when supported.
-        provider_params = inspect.signature(provider_class.__init__).parameters
-        if "scrape_mode" in provider_params:
-            kwargs["scrape_mode"] = self.scrape_mode
-        if "scrape_methods" in provider_params:
-            kwargs["scrape_methods"] = self.scrape_methods
 
         self._checkers[provider] = provider_class(**kwargs)
 
@@ -229,8 +171,7 @@ class UnifiedFactChecker:
                          Note: Only Gemini supports native video processing.
                          Other providers will extract frames.
             claim_date: Date of the claim (ISO format string or datetime).
-                        If custom_search=True, search results will be filtered
-                        to only include content from before this date.
+                        web_search only returns content published before this day.
             provider: Provider to use. If None, uses the default provider.
 
         Returns:

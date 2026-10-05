@@ -44,6 +44,15 @@ def encode_image_base64(image_path: str | Path) -> str | None:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def parse_data_uri(data_uri: str) -> tuple[str, str]:
+    """Parse a data URI into (media_type, base64_data)."""
+    # Format: data:<media_type>;base64,<data>
+    match = re.match(r"data:([^;]+);base64,(.+)", data_uri, re.DOTALL)
+    if match:
+        return match.group(1), match.group(2)
+    return "image/jpeg", data_uri
+
+
 def parse_media_references(claim_text: str) -> tuple[str, list[dict]]:
     """
     Parse media references from claim text.
