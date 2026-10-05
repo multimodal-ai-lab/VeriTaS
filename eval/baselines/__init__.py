@@ -1,17 +1,19 @@
-"""Unified baselines package for fact-checking with multiple providers."""
+"""Fact-checking baseline for the VeriTaS benchmark, with support for multiple providers."""
 
-from .common.types import Verdict, FactCheckResult, LABELS, LabelScheme, get_label_scheme
+from .common.types import Verdict, Verdict7, FactCheckResult, LABELS, LabelScheme, get_label_scheme
 from .providers import (
     BaseFactChecker,
     OpenAIFactChecker,
     GeminiFactChecker,
-    PerplexityFactChecker,
+    AnthropicFactChecker,
+    SelfhostedFactChecker,
 )
 from .factchecker import UnifiedFactChecker
 
 __all__ = [
     # Types
     "Verdict",
+    "Verdict7",
     "FactCheckResult",
     "LABELS",
     "LabelScheme",
@@ -20,7 +22,8 @@ __all__ = [
     "BaseFactChecker",
     "OpenAIFactChecker",
     "GeminiFactChecker",
-    "PerplexityFactChecker",
+    "AnthropicFactChecker",
+    "SelfhostedFactChecker",
     # Unified interface (recommended)
     "UnifiedFactChecker",
 ]

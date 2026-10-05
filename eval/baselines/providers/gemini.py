@@ -1,10 +1,13 @@
-"""Gemini fact-checker provider."""
+"""Gemini fact-checker provider.
+
+The model verifies the claim with the web_search and fetch_url tools via Gemini's
+function calling. Videos are passed natively.
+"""
 
 import os
-import re
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
 
 from google import genai
 from google.genai import types
@@ -16,9 +19,10 @@ try:
 except ImportError:
     VERITAS_GOOGLE_KEY = None
 
-from ..common.types import FactCheckResult, LabelScheme
+from ..common.types import FactCheckResult
 from ..common.media import get_mime_type
-from .base import BaseFactChecker
+from ..common.tools import TOOL_DEFINITIONS, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
+from .base import BaseFactChecker, MAX_TURNS
 
 
 # Video MIME types supported by Gemini
@@ -37,8 +41,20 @@ VIDEO_MIME_TYPES = {
 }
 
 
+def gemini_tool() -> types.Tool:
+    """The tools in Gemini format."""
+    return types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name=tool["name"],
+            description=tool["description"],
+            parameters_json_schema=tool["parameters"],
+        )
+        for tool in TOOL_DEFINITIONS
+    ])
+
+
 class GeminiFactChecker(BaseFactChecker):
-    """Fact-checker using Google Gemini with Google Search grounding and native video support."""
+    """Fact-checker using Gemini with the web_search and fetch_url tools."""
 
     provider_name = "gemini"
 
@@ -46,32 +62,27 @@ class GeminiFactChecker(BaseFactChecker):
         self,
         api_key: str | None = None,
         model: str = "gemini-2.5-flash",
-        use_search: bool = True,
-        label_scheme: LabelScheme | None = None,
-        seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
+        scrape_methods: list[str] | str | None = "auto",
+        max_searches: int = DEFAULT_MAX_SEARCHES,
+        max_fetches: int = DEFAULT_MAX_FETCHES,
     ):
         """
         Initialize the Gemini fact-checker.
 
         Args:
-            api_key: Google API key. If None, uses GOOGLE_API_KEY env var.
-            model: Model to use. Options include:
-                - "gemini-2.5-flash": Latest, with native video support
-                - "gemini-2.0-flash": Fast and capable
-                - "gemini-1.5-pro": More capable for complex tasks
-            use_search: If True (default), use Google Search grounding. If False,
-                       use only parametric knowledge.
-            label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
-            seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
-                                      combined label; "two_step" asks for
-                                      direction + certainty.
+            api_key: Google API key. If None, uses config/env var.
+            model: Model to use (must support function calling).
+            scrape_methods: Which scrapeMM backends fetch_url uses (subset of
+                            integrations/browser/firecrawl/decodo, or "auto").
+            max_searches: Maximum number of web_search calls per claim.
+            max_fetches: Maximum number of fetch_url calls per claim.
         """
         super().__init__(
             api_key=api_key,
             model=model,
-            use_search=use_search,
-            label_scheme=label_scheme,
-            seven_bin_prediction_mode=seven_bin_prediction_mode,
+            scrape_methods=scrape_methods,
+            max_searches=max_searches,
+            max_fetches=max_fetches,
         )
         self.client = self._create_client(api_key)
 
@@ -80,13 +91,12 @@ class GeminiFactChecker(BaseFactChecker):
         if api_key:
             return genai.Client(api_key=api_key)
 
-        # Try Veritas config first, then environment variable
         key_to_use = VERITAS_GOOGLE_KEY or os.environ.get("GOOGLE_API_KEY")
 
         if not key_to_use:
             raise ValueError(
                 "Google API key required. Either:\n"
-                "  1. Add it to config/globals.yaml (google: <key>)\n"
+                "  1. Add it to config.yaml (api_secrets.google)\n"
                 "  2. Set GOOGLE_API_KEY environment variable\n"
                 "  3. Pass api_key parameter"
             )
@@ -100,85 +110,106 @@ class GeminiFactChecker(BaseFactChecker):
         claim_date: str | datetime | None = None,
     ) -> FactCheckResult:
         """
-        Fact-check a claim using Gemini with Google Search grounding and native video support.
+        Fact-check a claim using Gemini with the web_search and fetch_url tools.
 
         Args:
             claim: The claim text to verify.
-            image_paths: Optional list of image file paths to include.
-            video_paths: Optional list of video file paths to include (native support).
-            claim_date: Date of the claim (ISO format string or datetime).
+            image_paths: Optional list of image file paths.
+            video_paths: Optional list of video file paths (native support).
+            claim_date: Date of the claim for temporal filtering.
 
         Returns:
-            FactCheckResult with verdict, reasoning, citations, etc.
+            FactCheckResult with verdict, reasoning, citations.
         """
-        # Build message content parts
-        contents = []
+        session = self._new_tool_session(claim_date)
 
-        # Add images first if provided
-        if image_paths:
-            for img_path in image_paths:
-                img_part = self._load_image(img_path)
-                if img_part:
-                    contents.append(img_part)
+        # Build the user turn: media first, then the prompt
+        user_parts = []
+        for img_path in image_paths or []:
+            img_part = self._load_image(img_path)
+            if img_part:
+                user_parts.append(img_part)
+        for video_path in video_paths or []:
+            video_part = self._load_video(video_path)
+            if video_part:
+                user_parts.append(video_part)
+        user_parts.append(types.Part.from_text(text=self._user_prompt(claim, claim_date)))
 
-        # Add videos natively (Gemini 2.5+ supports native video)
-        if video_paths:
-            for video_path in video_paths:
-                video_part = self._load_video(video_path)
-                if video_part:
-                    contents.append(video_part)
+        history = [types.Content(role="user", parts=user_parts)]
 
-        # Format the prompt using label-scheme-aware helpers
-        prompt_text = self._get_user_prompt(claim, claim_date)
-        system_prompt = self._get_system_prompt()
-
-        # Add the text prompt
-        contents.append(prompt_text)
-
-        # Configure generation with Google Search grounding (if search enabled)
-        # WARNING: Google Search grounding does NOT support API-level date filtering.
-        # Temporal constraints are enforced via prompt instruction only (soft constraint).
-        # For hard temporal filtering, use Perplexity provider instead.
-        config_kwargs = {
-            "system_instruction": system_prompt,
-        }
-        if self.use_search:
-            config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-
-        config = types.GenerateContentConfig(**config_kwargs)
-
-        # Call API with retry logic
-        response = self._call_with_retry(
-            self.client.models.generate_content,
-            model=self.model,
-            contents=contents,
-            config=config,
+        tools = [gemini_tool()]
+        config = types.GenerateContentConfig(
+            system_instruction=self._system_prompt(),
+            tools=tools,
+        )
+        # The last turn disables tool use to force a verdict
+        final_config = types.GenerateContentConfig(
+            system_instruction=self._system_prompt(),
+            tools=tools,
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.NONE)
+            ),
         )
 
-        assert response is not None, "Gemini API call failed after retries."
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        # Extract response content and citations
-        response_content = self._extract_response_content(response)
-        citations = self._extract_citations(response)
-        verdict = self._extract_verdict(response_content)
+        for turn in range(MAX_TURNS):
+            response = self._call_with_retry(
+                self.client.models.generate_content,
+                model=self.model,
+                contents=history,
+                config=final_config if turn == MAX_TURNS - 1 else config,
+            )
 
-        # Extract usage info
-        usage_info = {}
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage_info = {
-                "prompt_tokens": getattr(response.usage_metadata, "prompt_token_count", 0) or 0,
-                "completion_tokens": getattr(response.usage_metadata, "candidates_token_count", 0) or 0,
-                "total_tokens": getattr(response.usage_metadata, "total_token_count", 0) or 0,
-            }
+            # Accumulate usage
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                total_usage["prompt_tokens"] += getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+                total_usage["completion_tokens"] += getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+                total_usage["total_tokens"] += getattr(response.usage_metadata, "total_token_count", 0) or 0
+
+            # The model is done once it stops calling functions
+            function_calls = self._get_function_calls(response)
+            if not function_calls:
+                break
+
+            # Keep the whole conversation: the model's turn (incl. thought signatures)
+            # followed by the function responses
+            history.append(response.candidates[0].content)
+            history.append(types.Content(role="user", parts=[
+                types.Part.from_function_response(
+                    name=func_call.name,
+                    response={"result": session.call(func_call.name, dict(func_call.args or {}))},
+                )
+                for func_call in function_calls
+            ]))
+
+        # Extract final response
+        final_content = self._extract_response_content(response) or ""
+        verdict = self._extract_verdict(final_content)
+
+        # Add any URLs from response text
+        citations = list(session.citations)
+        for url in self._extract_urls_from_text(final_content):
+            if url not in citations:
+                citations.append(url)
 
         return FactCheckResult(
             verdict=verdict,
-            reasoning=response_content,
+            reasoning=final_content,
             citations=citations,
             model=self.model,
             provider=self.provider_name,
-            usage=usage_info,
+            usage=total_usage,
         )
+
+    def _get_function_calls(self, response) -> list[types.FunctionCall]:
+        """Return the function calls of the response's first candidate."""
+        if not getattr(response, "candidates", None):
+            return []
+        content = response.candidates[0].content
+        if not content or not content.parts:
+            return []
+        return [part.function_call for part in content.parts if part.function_call]
 
     def _load_image(self, image_path: str) -> types.Part | None:
         """Load an image file and return as Gemini Part."""
@@ -194,12 +225,7 @@ class GeminiFactChecker(BaseFactChecker):
         return types.Part.from_bytes(data=image_data, mime_type=mime_type)
 
     def _load_video(self, video_path: str) -> types.Part | None:
-        """
-        Load a video file and return as Gemini Part for native video processing.
-
-        For videos > 20MB, uses the File API for upload.
-        For smaller videos, uses inline data.
-        """
+        """Load a video file and return as Gemini Part."""
         path = Path(video_path)
         if not path.exists():
             return None
@@ -214,12 +240,28 @@ class GeminiFactChecker(BaseFactChecker):
             # Use File API for large videos
             try:
                 uploaded_file = self.client.files.upload(file=str(path))
-                return uploaded_file
+                # Wait for file to become ACTIVE (required before use)
+                max_wait = 60  # seconds
+                wait_interval = 2
+                waited = 0
+                while waited < max_wait:
+                    file_info = self.client.files.get(name=uploaded_file.name)
+                    if file_info.state.name == "ACTIVE":
+                        return types.Part.from_uri(
+                            file_uri=file_info.uri,
+                            mime_type=file_info.mime_type or mime_type,
+                        )
+                    elif file_info.state.name == "FAILED":
+                        print(f"    Warning: Video file processing failed")
+                        return None
+                    time.sleep(wait_interval)
+                    waited += wait_interval
+                print(f"    Warning: Video file not ready after {max_wait}s, skipping")
+                return None
             except Exception as e:
                 print(f"    Warning: Failed to upload video via File API: {e}")
                 return None
         else:
-            # Use inline data for smaller videos
             with open(path, "rb") as f:
                 video_data = f.read()
 
@@ -238,44 +280,10 @@ class GeminiFactChecker(BaseFactChecker):
                 if parts:
                     text_parts = []
                     for part in parts:
-                        # Only extract text parts, skip other part types
+                        # Only extract text parts, skip function_call and other parts
                         if hasattr(part, "text") and part.text:
                             text_parts.append(part.text)
                     if text_parts:
                         return "\n".join(text_parts)
 
         return ""
-
-    def _extract_citations(self, response) -> list[str]:
-        """Extract citations/URLs from Gemini response with grounding."""
-        citations = []
-
-        if hasattr(response, "candidates") and response.candidates:
-            candidate = response.candidates[0]
-            if hasattr(candidate, "grounding_metadata") and candidate.grounding_metadata:
-                grounding = candidate.grounding_metadata
-
-                # Get grounding chunks (sources)
-                if hasattr(grounding, "grounding_chunks") and grounding.grounding_chunks:
-                    for chunk in grounding.grounding_chunks:
-                        if hasattr(chunk, "web") and chunk.web:
-                            if hasattr(chunk.web, "uri"):
-                                citations.append(chunk.web.uri)
-
-                # Try search_entry_point for web search results
-                if hasattr(grounding, "search_entry_point") and grounding.search_entry_point:
-                    if hasattr(grounding.search_entry_point, "rendered_content"):
-                        html_content = grounding.search_entry_point.rendered_content
-                        url_pattern = r'href=["\']([^"\']+)["\']'
-                        found_urls = re.findall(url_pattern, html_content)
-                        for url in found_urls:
-                            if url.startswith("http") and url not in citations:
-                                citations.append(url)
-
-        # Also extract URLs from response text
-        text = self._extract_response_content(response)
-        for url in self._extract_urls_from_text(text):
-            if url not in citations:
-                citations.append(url)
-
-        return citations

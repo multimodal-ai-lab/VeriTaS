@@ -5,10 +5,14 @@ import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Literal
 
-from ..common.types import LabelScheme, DEFAULT_LABEL_SCHEME, MAX_RETRIES, BASE_DELAY, MAX_DELAY
-from ..common.prompts import build_prompts
+from ..common.types import LABEL_SCHEME_7, MAX_RETRIES, BASE_DELAY, MAX_DELAY
+from ..common.prompts import SYSTEM_PROMPT, build_user_prompt
+from ..common.tools import ToolSession, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
+
+# Maximum model calls in a tool-calling loop. The last call is made with tool use
+# disabled, forcing the model to give its verdict.
+MAX_TURNS = 20
 
 
 def extract_justification(response: str) -> str:
@@ -23,7 +27,12 @@ def extract_justification(response: str) -> str:
 
 
 class BaseFactChecker(ABC):
-    """Abstract base class for fact-checking providers."""
+    """Abstract base class for fact-checking providers.
+
+    Every provider runs the same baseline: the model verifies the claim with the
+    web_search and fetch_url tools and answers on the 7-class label scheme in two
+    steps (DIRECTION + CERTAINTY).
+    """
 
     provider_name: str = "base"
 
@@ -31,9 +40,9 @@ class BaseFactChecker(ABC):
         self,
         api_key: str | None = None,
         model: str = "",
-        use_search: bool = True,
-        label_scheme: LabelScheme | None = None,
-        seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
+        scrape_methods: list[str] | str | None = "auto",
+        max_searches: int = DEFAULT_MAX_SEARCHES,
+        max_fetches: int = DEFAULT_MAX_FETCHES,
     ):
         """
         Initialize the fact-checker.
@@ -41,21 +50,17 @@ class BaseFactChecker(ABC):
         Args:
             api_key: API key for the provider.
             model: Model identifier to use.
-            use_search: If True (default), use web search. If False, use only
-                       parametric knowledge (no search tools).
-            label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
-            seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
-                                      single combined label, while "two_step"
-                                      asks for direction + certainty.
+            scrape_methods: Which scrapeMM backends fetch_url uses (subset of
+                            integrations/browser/firecrawl/decodo, or "auto").
+            max_searches: Maximum number of web_search calls per claim.
+            max_fetches: Maximum number of fetch_url calls per claim.
         """
         self.api_key = api_key
         self.model = model
-        self.use_search = use_search
-        self.label_scheme = label_scheme or DEFAULT_LABEL_SCHEME
-        if seven_bin_prediction_mode not in {"direct", "two_step"}:
-            raise ValueError("seven_bin_prediction_mode must be 'direct' or 'two_step'")
-        self.seven_bin_prediction_mode = seven_bin_prediction_mode
-        self._prompts = build_prompts(self.label_scheme)
+        self.label_scheme = LABEL_SCHEME_7
+        self.scrape_methods = scrape_methods
+        self.max_searches = max_searches
+        self.max_fetches = max_fetches
 
     @abstractmethod
     def check_claim(
@@ -81,53 +86,23 @@ class BaseFactChecker(ABC):
         """
         pass
 
-    def _get_system_prompt(self) -> str:
-        """Get the appropriate system prompt based on search mode."""
-        if self.use_search:
-            return self._prompts["system_prompt"] + self._get_two_step_prompt_suffix()
-        if self._is_two_step_7bin_mode():
-            return self._prompts["system_prompt_no_search_two_step"]
-        return self._prompts["system_prompt_no_search"]
+    def _system_prompt(self) -> str:
+        """The system prompt of the baseline."""
+        return SYSTEM_PROMPT
 
-    def _get_user_prompt(self, claim: str, claim_date: str | datetime | None = None) -> str:
-        """Get the formatted user prompt based on search mode and claim date."""
-        if self.use_search:
-            if claim_date:
-                formatted_date = self._format_date_for_prompt(claim_date)
-                return self._prompts["user_prompt_with_date"].format(
-                    claim=claim, claim_date=formatted_date
-                )
-            return self._prompts["user_prompt"].format(claim=claim)
+    def _user_prompt(self, claim: str, claim_date: str | datetime | None = None) -> str:
+        """The user prompt for a claim."""
+        formatted_date = self._format_date_for_prompt(claim_date) if claim_date else None
+        return build_user_prompt(claim, formatted_date)
 
-        two_step = self._is_two_step_7bin_mode()
-        if claim_date:
-            key = "user_prompt_with_date_no_search_two_step" if two_step else "user_prompt_with_date_no_search"
-            formatted_date = self._format_date_for_prompt(claim_date)
-            return self._prompts[key].format(claim=claim, claim_date=formatted_date)
-        key = "user_prompt_no_search_two_step" if two_step else "user_prompt_no_search"
-        return self._prompts[key].format(claim=claim)
-
-    def _get_custom_search_system_prompt(self) -> str:
-        """Get the custom search system prompt."""
-        if self._is_two_step_7bin_mode():
-            return self._prompts["system_prompt_custom_search_two_step"]
-        return self._prompts["system_prompt_custom_search"]
-
-    def _get_custom_search_user_prompt(self, claim: str, claim_date: str | datetime | None = None) -> str:
-        """Get the formatted custom search user prompt."""
-        if self._is_two_step_7bin_mode():
-            if claim_date:
-                formatted_date = self._format_date_for_prompt(claim_date)
-                return self._prompts["user_prompt_custom_search_with_date_two_step"].format(
-                    claim=claim, claim_date=formatted_date
-                )
-            return self._prompts["user_prompt_custom_search_two_step"].format(claim=claim)
-        if claim_date:
-            formatted_date = self._format_date_for_prompt(claim_date)
-            return self._prompts["user_prompt_custom_search_with_date"].format(
-                claim=claim, claim_date=formatted_date
-            )
-        return self._prompts["user_prompt_custom_search"].format(claim=claim)
+    def _new_tool_session(self, claim_date: str | datetime | None) -> ToolSession:
+        """Create the tool session for a single claim."""
+        return ToolSession(
+            claim_date=claim_date,
+            scrape_methods=self.scrape_methods,
+            max_searches=self.max_searches,
+            max_fetches=self.max_fetches,
+        )
 
     def _call_with_retry(self, api_call_fn, *args, **kwargs):
         """
@@ -238,64 +213,15 @@ class BaseFactChecker(ABC):
         # If no clear verdict found, default to Unknown
         return "Unknown"
 
-    def _is_two_step_7bin_mode(self) -> bool:
-        """Whether two-step extraction/prompting should be active."""
-        return self.seven_bin_prediction_mode == "two_step" and len(self.label_scheme.labels) == 7
-
-    def _get_direction_triplet(self) -> tuple[str, str, str] | None:
-        """
-        Return (positive_direction, unknown_label, negative_direction) for 7-bin schemes.
-
-        For integrity this is typically ("Intact", "Unknown", "Compromised").
-        """
-        if len(self.label_scheme.labels) != 7:
-            return None
-
-        unknown = None
-        for label in self.label_scheme.labels:
-            if label.strip().lower() == "unknown":
-                unknown = label
-                break
-        if unknown is None:
-            return None
-
+    def _get_direction_triplet(self) -> tuple[str, str, str]:
+        """Return (positive_direction, unknown_label, negative_direction), i.e. ("Intact", "Unknown", "Compromised")."""
         positive = self.label_scheme.labels[0].split(" (", 1)[0].strip()
         negative = self.label_scheme.labels[-1].split(" (", 1)[0].strip()
-        return positive, unknown, negative
-
-    def _get_two_step_prompt_suffix(self) -> str:
-        """Additional prompt instructions for 7-bin two-step mode."""
-        if not self._is_two_step_7bin_mode():
-            return ""
-
-        triplet = self._get_direction_triplet()
-        if not triplet:
-            return ""
-        positive, unknown, negative = triplet
-
-        return (
-            "\n\nFor this run, produce the final 7-bin decision in two steps:\n"
-            f"1. DIRECTION: exactly one of [{positive}/{unknown}/{negative}]\n"
-            f"   - Use {unknown} only as a last resort when evidence is genuinely insufficient\n"
-            "     or strongly contradictory after reasonable analysis.\n"
-            f"   - If evidence weakly leans {positive} or {negative}, choose that direction\n"
-            "     and express uncertainty in CERTAINTY (do not choose UNKNOWN).\n"
-            "2. CERTAINTY: exactly one of [certain/rather certain/rather uncertain]\n"
-            f"   - If DIRECTION is {unknown}, use CERTAINTY: [N/A]\n\n"
-            "Always end your response with these exact final lines:\n"
-            "DIRECTION: <chosen direction>\n"
-            "CERTAINTY: <chosen certainty or N/A>"
-        )
+        return positive, "Unknown", negative
 
     def _extract_two_step_verdict(self, response: str) -> str | None:
-        """Extract 7-bin verdict from DIRECTION/CERTAINTY fields when enabled."""
-        if not self._is_two_step_7bin_mode():
-            return None
-
-        triplet = self._get_direction_triplet()
-        if not triplet:
-            return None
-        positive, unknown, negative = triplet
+        """Extract the 7-bin verdict from the DIRECTION/CERTAINTY fields."""
+        positive, unknown, negative = self._get_direction_triplet()
 
         direction_match = re.search(r"DIRECTION\s*:\s*([^\n\r]+)", response, re.IGNORECASE)
         if not direction_match:
