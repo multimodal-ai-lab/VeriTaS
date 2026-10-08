@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from ezmm import Item, MultimodalSequence
 from veritas.common import Claim, Prompt, Verdict
@@ -43,7 +43,12 @@ from veritas.gold_evidence.closeness import (
     property_diffs,
 )
 from veritas.gold_evidence.models import Evidence, VerdictRationale
-from veritas.pipeline.stage_6 import extract_label_from_response
+from veritas.pipeline.stage_6 import (
+    PriorAssessment,
+    extract_label_from_response,
+    medium_subject,
+    merge_justifications,
+)
 
 logger = logging.getLogger("VeriTaS")
 
@@ -220,37 +225,52 @@ async def _predict_full(claim: Claim, evidence: list[Evidence],
     """The full stage-6 property cascade, driven by evidence instead of reviews."""
     media = MultimodalSequence(claim.data).unique_items()
     media_verdicts: list[MediumVerdict] = []
+    media_priors: list[PriorAssessment] = []  # Context for the claim-level properties
     incorrect_contextualization = False
 
-    for medium in media:
+    for index, medium in enumerate(media):
         authenticity, responses = await assess_property_from_evidence(
             "authenticity", claim, evidence, medium=medium, rationales=rationales)
         result.member_responses[f"authenticity[{medium.reference}]"] = [
             r.to_dict() for r in responses]
-
-        contextualization, responses = await assess_property_from_evidence(
-            "contextualization", claim, evidence, medium=medium, rationales=rationales)
-        result.member_responses[f"contextualization[{medium.reference}]"] = [
-            r.to_dict() for r in responses]
-
-        if authenticity is None or contextualization is None:
+        if authenticity is None:
             result.error = f"Could not assess medium {medium.reference}."
             return None
+        await merge_justifications(authenticity, "authenticity", claim, medium)
+
+        # Contextualize also fabricated media
+        authenticity_prior = PriorAssessment(PROPERTIES["authenticity"], medium.kind.capitalize(), authenticity)
+        contextualization, responses = await assess_property_from_evidence(
+            "contextualization", claim, evidence, medium=medium, rationales=rationales,
+            prior_assessments=[authenticity_prior])
+        result.member_responses[f"contextualization[{medium.reference}]"] = [
+            r.to_dict() for r in responses]
+        if contextualization is None:
+            result.error = f"Could not assess medium {medium.reference}."
+            return None
+        await merge_justifications(contextualization, "contextualization", claim, medium)
 
         media_verdicts.append(MediumVerdict(reference=medium.reference,
                                             authenticity=authenticity,
                                             contextualization=contextualization))
+        subject = medium_subject(medium, index, len(media))
+        media_priors += [PriorAssessment(PROPERTIES["authenticity"], subject, authenticity),
+                         PriorAssessment(PROPERTIES["contextualization"], subject, contextualization)]
         if contextualization.as_3_bin() == Category3Bin.NEGATIVE:
             incorrect_contextualization = True
 
     veracity = context_coverage = None
     if not incorrect_contextualization:
         veracity, responses = await assess_property_from_evidence(
-            "veracity", claim, evidence, rationales=rationales)
+            "veracity", claim, evidence, rationales=rationales,
+            prior_assessments=media_priors)
         result.member_responses["veracity"] = [r.to_dict() for r in responses]
-        if veracity is not None and veracity.score > 0:
+        if veracity is not None and veracity.as_3_bin() != Category3Bin.NEGATIVE:
+            await merge_justifications(veracity, "veracity", claim)
+            veracity_prior = PriorAssessment(PROPERTIES["veracity"], "Claim", veracity)
             context_coverage, responses = await assess_property_from_evidence(
-                "context_coverage", claim, evidence, rationales=rationales)
+                "context_coverage", claim, evidence, rationales=rationales,
+                prior_assessments=media_priors + [veracity_prior])
             result.member_responses["context_coverage"] = [r.to_dict() for r in responses]
 
     predicted = PredictedVerdict(
@@ -272,8 +292,10 @@ async def assess_property_from_evidence(
         evidence: list[Evidence],
         medium: Item | None = None,
         rationales: Iterable[VerdictRationale] = (),
+        prior_assessments: Sequence[PriorAssessment] = (),
 ) -> tuple[RatingAggregated | None, list[MemberResponse]]:
     """Queries the ensemble for one property, given only claim + evidence + rationale.
+    The prior assessments of other properties are shown as context, as in stage 6.
 
     Returns the aggregated rating and every member's full response, so the
     individual reasonings can be persisted alongside the result."""
@@ -281,7 +303,8 @@ async def assess_property_from_evidence(
     subject = "Claim" if medium is None else medium.kind.capitalize()
 
     prompt = build_prompt(claim, evidence, prop, subject=subject, medium=medium,
-                          rationales=list(rationales))
+                          rationales=list(rationales),
+                          prior_assessments=list(prior_assessments))
 
     def extract(response: ModelResponse) -> MemberResponse:
         rating = extract_label_from_response(response, prop)
@@ -307,7 +330,8 @@ async def assess_property_from_evidence(
 
 def build_prompt(claim: Claim, evidence: list[Evidence], prop: Property, *,
                  subject: str, medium: Item | None = None,
-                 rationales: list[VerdictRationale] = ()) -> Prompt:
+                 rationales: list[VerdictRationale] = (),
+                 prior_assessments: list[PriorAssessment] = ()) -> Prompt:
     """Composes the evidence-only prompt. The claim is included for every property
     except authenticity, mirroring `stage_6.assess_property`."""
     return Prompt(
@@ -319,4 +343,6 @@ def build_prompt(claim: Claim, evidence: list[Evidence], prop: Property, *,
         medium=medium,
         subject=subject,
         property=prop,
+        has_media=bool(MultimodalSequence(claim.data).unique_items()),
+        prior_assessments=list(prior_assessments),
     )

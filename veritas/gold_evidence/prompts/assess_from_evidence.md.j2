@@ -39,6 +39,7 @@ The claim was released on {{ claim_date }}.
 {{ medium.reference }}
 {% endif %}
 
+{% include "veritas/prompts/partials/prior_assessments.md.j2" %}
 # Instructions
 Your goal is to **assess the {{ property.name }} of the {{ subject }} shown above using only the material above**{% if rationales %}, i.e. the Evidence and the Reasoning Aid{% endif %}. Follow the steps in order:
 
@@ -48,27 +49,27 @@ Summarize the evidence items that bear specifically on the {{ subject }}'s {{ pr
 ## 2. Evaluation
 Reason step-by-step from the summarized evidence to what it implies about the {{ subject }}'s {{ property.name }}. Weigh sources by their proximity: first-hand (primary) material outweighs reporting about it. If no evidence provided, analyze the {{ subject }} directly and try to assess what follows for the {{ property.name }}. {% if rationales %} Follow the Reasoning Aid only as far as you can verify it against the Evidence and the {{ subject }} itself.{% endif %}
 
-## 3. Category Decision
-Choose whether the {{ property.name }} is rather `{{ property.negative_category }}` or `{{ property.positive_category }}`. If the material is missing or fully inconclusive, answer `Unknown` and then skip directly to step 5. Enclose your choice in backticks like `this`.
-{% if property.negative_tags or property.positive_tags %}
-## 3a. Tag Selection
-If your chosen category includes tags, list all applicable tags for the {{ subject }}, each enclosed in colons.
+## 3. Decision
+Decide whether the {{ property.name }} is rather "{{ property.negative_category }}" or "{{ property.positive_category }}". If the material is missing or fully inconclusive, decide "Unknown".
+{% if property.tags %}
+If your chosen category has tags, determine all tags that apply to the {{ subject }}.
 {% endif %}
+Unless "Unknown", determine the certainty level. Certainty refers to the strength and clarity of the material, not to your own confidence.
+    - Certain: The evidence is unequivocal and leaves no room for doubt.
+    - Rather certain: The evidence is strong and mostly consistent, but not fully definitive.
+    - Rather uncertain: The evidence only weakly supports one side, and misclassification is likely.
 
-## 4. Certainty
-Choose one certainty level and enclose it in underscores. Certainty refers to the strength and clarity of the material, not to your own confidence.
-    - _Certain_: The evidence is unequivocal and leaves no room for doubt.
-    - _Rather certain_: The evidence is strong and mostly consistent, but not fully definitive.
-    - _Rather uncertain_: The evidence only weakly supports one side, and misclassification is likely.
-
-## 5. Explanation
-Provide a short explanation (1-4 sentences) justifying your category and certainty. Use only the material above. Do not restate the {{ subject }} or the decision itself. Enclose your explanation in a fenced code block like ```this```.
+{% with step = 4 %}{% include "veritas/prompts/partials/assessment_answer.md.j2" %}{% endwith %}
+The explanation must use only the material above.
 
 # Rules
 * Follow the definitions of {{ property.name }} strictly.
 * Base your reasoning **only** on the material above. Do not invent facts, do not speculate, and do not rely on your own recollection of this case or of any fact-check about it.
-* If the material contains nothing about the {{ property.name }}, choose `Unknown`.
-* If the Evidence is contradictory, weigh it and say so in the explanation rather than defaulting to `Unknown`.
+* If the material contains nothing about the {{ property.name }}, choose "Unknown".
+* If the Evidence is contradictory, weigh it and say so in the explanation rather than defaulting to "Unknown".
+{% if prior_assessments %}
+* Concentrate exclusively on the {{ property.name }}. Do not re-assess the Prior Assessments.
+{% endif %}
 
 # {{ property.name }}
 Definition: {{ property.definition }}
@@ -79,7 +80,7 @@ Definition: {{ property.negative_definition }}
 {% if property.negative_tags %}
 Tags:
 {% for tag in property.negative_tags %}
-- :{{ tag.name }}: {{ tag.definition }}
+- {{ tag.name }}: {{ tag.definition }}
 {% endfor %}
 {% endif %}
 
@@ -88,14 +89,11 @@ Definition: {{ property.positive_definition }}
 {% if property.positive_tags %}
 Tags:
 {% for tag in property.positive_tags %}
-- :{{ tag.name }}: {{ tag.definition }}
+- {{ tag.name }}: {{ tag.definition }}
 {% endfor %}
 {% endif %}
 
-{% if property.hints %}
-## Hints
-{{ property.hints }}
-{% endif %}
+{% include "veritas/prompts/partials/property_hints.md.j2" %}
 
 # Your Response
 (Answer in English.)

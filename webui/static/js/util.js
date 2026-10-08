@@ -56,19 +56,49 @@ export function days(value, digits = 1) {
     return `${rounded > 0 ? '+' : ''}${rounded} d`;
 }
 
+/** A timestamp from the API as a `Date`.
+ *
+ *  The database stores timestamps without a time zone, in UTC, and the API passes
+ *  them on as they are (`2026-09-30T12:22:13`). `new Date()` would read such a
+ *  string as *local* time and show the server's clock unconverted, so a value
+ *  without a zone designator is read as UTC here - and then shown in the
+ *  viewer's own time zone. Date-only strings are UTC in JavaScript anyway. */
+export function parseTimestamp(value) {
+    if (value === null || value === undefined || value === '') return null;
+    if (value instanceof Date) return value;
+    let text = String(value).trim();
+    if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(text)) {
+        text = `${text.replace(' ', 'T')}Z`;
+    }
+    const parsed = new Date(text);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/** Whether a timestamp is exactly midnight UTC, i.e. most likely a calendar date
+ *  that was stored as a timestamp (claim dates often are). Such a value is shown
+ *  as that date, not shifted into the viewer's time zone - where it could land on
+ *  the previous day - and without a meaningless "00:00". */
+const isUtcMidnight = (parsed) =>
+    parsed.getUTCHours() === 0 && parsed.getUTCMinutes() === 0
+    && parsed.getUTCSeconds() === 0 && parsed.getUTCMilliseconds() === 0;
+
 export function date(value, { time = false } = {}) {
     if (!value) return '—';
-    const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) return String(value);
-    const options = time
-        ? { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }
-        : { year: 'numeric', month: 'short', day: '2-digit' };
-    return parsed.toLocaleDateString('en-GB', options);
+    const parsed = parseTimestamp(value);
+    if (!parsed) return String(value);
+    const day = { year: 'numeric', month: 'short', day: '2-digit' };
+    if (isUtcMidnight(parsed)) {
+        return parsed.toLocaleDateString('en-GB', { ...day, timeZone: 'UTC' });
+    }
+    // The viewer's local time zone (the browser's default).
+    return time
+        ? parsed.toLocaleString('en-GB', { ...day, hour: '2-digit', minute: '2-digit' })
+        : parsed.toLocaleDateString('en-GB', day);
 }
 
 export function relative(value) {
     if (!value) return '—';
-    const then = new Date(value).getTime();
+    const then = parseTimestamp(value)?.getTime() ?? NaN;
     if (Number.isNaN(then)) return '—';
     const seconds = (then - Date.now()) / 1000;
     const steps = [[60, 'second'], [60, 'minute'], [24, 'hour'], [7, 'day'], [4.348, 'week'], [12, 'month'], [Infinity, 'year']];
@@ -98,10 +128,29 @@ export const humanize = (value) => {
     if (value === null || value === undefined || value === '') return '—';
     const text = String(value);
     if (!/^[a-z][a-z0-9_]*$/.test(text)) return text;
-    if (!text.includes('_') && text.length <= 3) return text;  // language codes
     const spaced = text.replace(/_+/g, ' ');
     return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 };
+
+const LANGUAGE_NAMES = (() => {
+    try {
+        return new Intl.DisplayNames(['en'], { type: 'language' });
+    } catch {
+        return null;  // A browser without Intl.DisplayNames shows the codes.
+    }
+})();
+
+/** An ISO language code as its English name: `en` -> `English`, `pt-BR` ->
+ *  `Brazilian Portuguese`. Anything the browser does not know stays as it is. */
+export function languageName(code) {
+    if (!code) return '—';
+    try {
+        const name = LANGUAGE_NAMES?.of(String(code));
+        return name && name.toLowerCase() !== String(code).toLowerCase() ? name : String(code);
+    } catch {
+        return String(code);  // Not a well-formed language tag.
+    }
+}
 
 export const truncate = (value, length = 160) => {
     const text = String(value ?? '');

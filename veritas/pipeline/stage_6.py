@@ -1,6 +1,8 @@
 import traceback
-from typing import Collection
+from dataclasses import dataclass
+from typing import Collection, Sequence
 
+import json_repair
 from ezmm import Item, MultimodalSequence
 
 from veritas import logger
@@ -12,14 +14,38 @@ from veritas.ensemble import ensemble, ModelResponse
 from veritas.models import QuotaExceededError, RateLimitError, gemini_cheap
 from veritas.pipeline.util.stage import Stage
 from veritas.util import run_with_semaphore
-from veritas.util.parsing import extract_last, extract_all, extract_last_code_block
+from veritas.util.parsing import extract_last_code_block
 
 CERTAINTY_OPTIONS = {
     "certain": 1,
     "rather certain": 2 / 3,
     "rather uncertain": 1 / 3,
 }
-LABEL_REGEX = r"[a-zA-Z\- ]+"
+LABEL_REGEX = r"[a-zA-Z\- ]+"  # Used by the faithfulness parsing in gold evidence filtering
+
+
+@dataclass
+class PriorAssessment:
+    """The outcome of an earlier property assessment, shown as context to the
+    assessments of subsequent properties."""
+    property: Property
+    subject: str  # The assessed subject, e.g., "Claim" or "Image"
+    rating: RatingAggregated
+
+    @property
+    def category(self) -> str:
+        return self.rating.category_str_7_bin(self.property)
+
+    @property
+    def explanation(self) -> str | None:
+        return self.rating.explanation
+
+
+def medium_subject(medium: Item, index: int, n_media: int) -> str:
+    """Names the medium for prior assessments. If the claim contains multiple
+    media, numbers it by its position in the claim."""
+    kind = medium.kind.capitalize()
+    return kind if n_media == 1 else f"{kind} {index + 1} (by order of appearance in the Claim)"
 
 
 class Stage6(Stage):
@@ -110,8 +136,10 @@ async def predict_verdict_single(claim: Claim) -> Verdict | None:
         logger.debug(f"Completing verdict for claim {claim.id}...")
     else:
         logger.debug(f"Predicting verdict for claim {claim.id}...")
-    veracity = context_coverage = incorrect_contextualization = None
+    veracity = context_coverage = None
+    incorrect_contextualization = False
     media_verdicts = []
+    media_priors: list[PriorAssessment] = []  # Context for assessing the claim-level properties
 
     original_claim = await claim.variant if claim.is_rectified else None
     original_verdict = await original_claim.current_verdict if original_claim else None
@@ -119,12 +147,14 @@ async def predict_verdict_single(claim: Claim) -> Verdict | None:
     try:
         # Assess the media
         media = MultimodalSequence(claim.data).unique_items()
-        for medium in media:
+        for index, medium in enumerate(media):
             current_medium_verdict = current_verdict.get_medium_verdict(medium.reference) if current_verdict else None
 
             # Asses the authenticity (only if this is not a rectified claim)
             if claim.is_original:
-                authenticity = await assess_property("authenticity", claim, medium)
+                current_authenticity = current_medium_verdict.authenticity if current_medium_verdict else None
+                authenticity = await assess_property("authenticity", claim, medium,
+                                                     incomplete_rating=current_authenticity)
             else:
                 # Recycle the original verdict for the rectified claim
                 assert original_verdict, "Rectified claim without original verdict!"
@@ -132,15 +162,20 @@ async def predict_verdict_single(claim: Claim) -> Verdict | None:
                 assert original_medium_verdict, "Rectified claim without original medium verdict!"
                 authenticity = original_medium_verdict.authenticity
 
-            # Assess the contextualization
+            # Assess the contextualization (also for fabricated media)
             current_contextualization = current_medium_verdict.contextualization if current_medium_verdict else None
+            authenticity_prior = PriorAssessment(PROPERTIES["authenticity"], medium.kind.capitalize(), authenticity)
             contextualization = await assess_property("contextualization", claim, medium,
-                                                      incomplete_rating=current_contextualization)
+                                                      incomplete_rating=current_contextualization,
+                                                      prior_assessments=[authenticity_prior])
 
             medium_verdict = MediumVerdict(reference=medium.reference,
                                            authenticity=authenticity,
                                            contextualization=contextualization)
             media_verdicts.append(medium_verdict)
+            subject = medium_subject(medium, index, len(media))
+            media_priors += [PriorAssessment(PROPERTIES["authenticity"], subject, authenticity),
+                             PriorAssessment(PROPERTIES["contextualization"], subject, contextualization)]
             if contextualization.as_3_bin() == Category3Bin.NEGATIVE:
                 incorrect_contextualization = True
 
@@ -149,16 +184,23 @@ async def predict_verdict_single(claim: Claim) -> Verdict | None:
             # Assess the veracity
             current_veracity = current_verdict.veracity if current_verdict else None
             veracity = await assess_property("veracity", claim,
-                                             incomplete_rating=current_veracity)
+                                             incomplete_rating=current_veracity,
+                                             prior_assessments=media_priors)
 
-            if veracity.score > 0:
-                # Assess the context coverage
+            # Assess the context coverage only if the claim is not false
+            if veracity.as_3_bin() != Category3Bin.NEGATIVE:
                 current_context_coverage = current_verdict.context_coverage if current_verdict else None
+                veracity_prior = PriorAssessment(PROPERTIES["veracity"], "Claim", veracity)
                 context_coverage = await assess_property("context_coverage", claim,
-                                                         incomplete_rating=current_context_coverage)
+                                                         incomplete_rating=current_context_coverage,
+                                                         prior_assessments=media_priors + [veracity_prior])
 
         # Construct verdict object
         if current_verdict:
+            # Overwrite all properties: Completed ratings may have altered the assessment trace
+            current_verdict.media_verdicts = media_verdicts
+            current_verdict.veracity = veracity
+            current_verdict.context_coverage = context_coverage
             await current_verdict.save_to_db()
             verdict = current_verdict
         else:
@@ -200,10 +242,12 @@ async def assess_property(
         claim: Claim,
         medium: Item | None = None,
         incomplete_rating: RatingAggregated | None = None,
+        prior_assessments: Sequence[PriorAssessment] = (),
 ) -> RatingAggregated:
     """Prompts the LLMs to assess the specified property, subject to the
     claim or, if specified, the given Medium. If an incomplete rating is provided,
-    fills in the ratings for the missing LLMs."""
+    fills in the ratings for the missing LLMs. The prior assessments of other
+    properties are shown as context, helping the LLMs to focus on this property."""
     logger.debug(f"Assessing property {property_name} for claim {claim.id}...")
     prop = PROPERTIES[property_name]
 
@@ -218,7 +262,9 @@ async def assess_property(
                     claim=None if prop.name == "Authenticity" else claim,
                     medium=medium,
                     subject=subject,
-                    property=prop)
+                    property=prop,
+                    has_media=bool(MultimodalSequence(claim.data).unique_items()),
+                    prior_assessments=list(prior_assessments))
 
     def extract_label(response: ModelResponse) -> Rating:
         return extract_label_from_response(response, prop)
@@ -275,40 +321,37 @@ def extract_label_from_response(response: ModelResponse, prop: Property) -> Rati
         if pattern in output_lower and len(output) < 200:  # Short refusal messages
             raise ValueError(f"Model {response.model} refused to respond (content policy)")
 
+    # The final answer is a JSON object, concluding the model's reasoning
+    answer = json_repair.loads(extract_last_code_block(output) or "")
+    if not isinstance(answer, dict):
+        raise ValueError(f"No final JSON answer provided by model {response.model}.")
+
+    explanation = str(answer.get("explanation") or "").strip()
+    if not explanation:
+        raise ValueError(f"No explanation provided by model {response.model}.")
+
+    category = str(answer.get("category") or "").strip().lower()
     candidate_categories = [cat.lower() for cat in prop.categories] + ["unknown"]
+    if category not in candidate_categories:
+        raise ValueError(f"Invalid category '{category}' provided by model {response.model}. "
+                         f"Must be one of {candidate_categories}.")
+    if category == "unknown":
+        return Rating(score=0, explanation=explanation, rater=response.model.specifier)
 
-    category = extract_last(output, "`", allowed_symbols=LABEL_REGEX)
-    certainty = extract_last(output, "_", allowed_symbols=LABEL_REGEX)
-    tags = extract_all(output, ":", allowed_symbols=LABEL_REGEX) if prop.tags else []
-    explanation = extract_last_code_block(output)
+    certainty = str(answer.get("certainty") or "").strip().lower()
+    if certainty not in CERTAINTY_OPTIONS:
+        raise ValueError(f"Invalid certainty '{certainty}' provided by model {response.model}. "
+                         f"Must be one of {list(CERTAINTY_OPTIONS)}.")
 
-    # Validate the response
-    # Category
-    assert category, f"No category provided by model {response.model}!\nResponse was:\n{output}"
-    category = category.lower().strip()
-    assert category in candidate_categories, (f"Invalid category '{category}' for property {prop.name}. "
-                                              f"Must be one of {candidate_categories}.")
+    # Keep only the tags of the chosen category, in their defined spelling
     is_positive = category == prop.positive_category.lower()
-
-    # Certainty
-    if not category == "unknown":
-        assert certainty, f"No certainty provided.\nResponse was:\n{output}"
-        assert certainty.lower() in CERTAINTY_OPTIONS, f"Invalid certainty '{certainty}' for property {prop.name}."
-
-    # Tags
     candidate_tags = prop.positive_tags if is_positive else prop.negative_tags
-    candidate_tags = [tag.name.lower() for tag in candidate_tags]
-    for tag in tags:
-        assert tag.lower() in candidate_tags, (f"Invalid tag '{tag}' for property {prop.name}. Must be one "
-                                               f"of {candidate_tags}.")
+    answered_tags = answer.get("tags") or []
+    answered_tags = {str(tag).strip().lower() for tag in answered_tags} if isinstance(answered_tags, list) else set()
+    tags = [tag.name for tag in candidate_tags if tag.name.lower() in answered_tags]
 
-    # Explanation
-    assert explanation, f"No explanation provided."
-
-    # Turn into Label object
-    tendency = 0 if category == "unknown" else CERTAINTY_OPTIONS[certainty.lower()] * (1 if is_positive else -1)
     return Rating(
-        score=tendency,
+        score=CERTAINTY_OPTIONS[certainty] * (1 if is_positive else -1),
         explanation=explanation,
         tags=tags,
         rater=response.model.specifier

@@ -11,7 +11,7 @@ import { api } from '../api.js';
 import { renderMultimodal } from '../media.js';
 import { math } from '../math.js';
 import {
-    ADMISSIBILITY_STYLE, badge, date, decimal, el, humanize, mediaSelect, num,
+    ADMISSIBILITY_STYLE, badge, date, decimal, el, humanize, languageName, mediaSelect, num,
     PROXIMITY_STYLE, REASON_HELP, ROLE_STYLE, SOURCE_KIND_ICON, truncate, ZONE_HELP,
     ZONE_STYLE,
 } from '../util.js';
@@ -241,7 +241,8 @@ function facet(state, key, placeholder, entries, apply) {
         select.append(el('option', {
             value: entry.label,
             selected: selected.length === 1 && selected[0] === entry.label,
-            text: `${humanize(entry.label)} (${num(entry.count)})`,
+            text: `${key === 'language' ? languageName(entry.label) : humanize(entry.label)} `
+                + `(${num(entry.count)})`,
         }));
     }
     return select;
@@ -351,9 +352,6 @@ function evidenceCard(item, index) {
             : null,
         badge(item.source?.proximity ?? 'secondary', proximityStyle),
         item.zone ? badge(item.zone, { ...zoneStyle, title: ZONE_HELP[item.zone] ?? '' }) : null,
-        item.proposition?.is_multimodal
-            ? badge(`${item.proposition.n_media} media`, { tone: 'violet', icon: 'fa-photo-film' })
-            : null,
         item.dismissed ? badge('dismissed', { tone: 'bad', icon: 'fa-ban', title: item.dismissed_reason ?? '' }) : null,
         el('span', { class: 'spacer' }),
         el('span', { class: 'eid', title: 'Source ID', text: `#${item.id}` }),
@@ -409,7 +407,10 @@ function evidenceCard(item, index) {
         el('span', { class: 'label' }, [
             el('i', { class: 'fa-solid fa-quote-left' }),
             `Claim #${item.claim_id}`,
-            item.claim?.language ? el('span', { class: 'badge plain', text: item.claim.language }) : null,
+            item.claim?.language
+                ? el('span', { class: 'badge plain', title: item.claim.language,
+                    text: languageName(item.claim.language) })
+                : null,
             el('span', { class: 'when', text: date(item.claim?.t_c) }),
         ]),
         el('span', { class: 'text', text: truncate(stripRefs(item.claim?.data), 200) }),

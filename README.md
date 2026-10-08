@@ -28,20 +28,13 @@ The code is actively used to gather the data for the VeriTaS benchmark, includin
    ```bash
    conda install -c conda-forge ffmpeg
    ```
-4. Install Playwright for powerful scraping:
-   ```bash
-    conda config --add channels conda-forge
-    conda config --add channels microsoft
-    conda install playwright
-    playwright install
-   ```
-5. Configure the environment variables in `config.yaml`. Required variables:
+4. Configure the environment variables in `config.yaml`. Required variables:
     - `openai`: The OpenAI API key.
     - `google`: The Google API key.
     - `anthropic`: The Anthropic API key.
     - `database`: The credentials of the DB where to store all pipeline data.
     - `selfhosted.url`: The URL for self-hosted LLMs.
-6. Configure the secrets needed by `scrapeMM` for scraping social media services:
+5. Configure the secrets needed by `scrapeMM` for scraping social media services:
    ```bash
    python -m scrapemm
    ```

@@ -20,8 +20,9 @@ Carefully read the Review(s) below. Then follow the Instructions section.
 {{ medium.reference }}
 {% endif %}
 
+{% include "veritas/prompts/partials/prior_assessments.md.j2" %}
 # Instructions
-Your goal is to **assess the {{ property.name }} of the {{ subject }} shown above using only the information from the Review(s). Follow the steps in order:
+Your goal is to **assess the {{ property.name }} of the {{ subject }}** shown above using only the information from the Review(s). Follow the steps in order:
 
 {% if claim and claim.is_rectified %}
 ## 0. Claim Differences
@@ -35,27 +36,27 @@ If no relevant evidence exists, output "No evidence provided."
 ## 2. Evaluation
 Analyze the summarized evidence step-by-step and determine what it implies about the {{ subject }}’s {{ property.name }}.
 
-## 3. Category Decision
-Choose whether the {{ property.name }} is rather `{{ property.negative_category }}` or `{{ property.positive_category }}`. If the evidence is missing or fully inconclusive, answer `Unknown` and then skip directly to step 5. Enclose your choice in backticks like `this`.
-{% if property.negative_tags or property.positive_tags %}
-## 3a. Tag Selection
-If your chosen category includes tags, list all applicable tags for the {{ subject }}, each enclosed in colons.
+## 3. Decision
+Decide whether the {{ property.name }} is rather "{{ property.negative_category }}" or "{{ property.positive_category }}". If the evidence is missing or fully inconclusive, decide "Unknown".
+{% if property.tags %}
+If your chosen category has tags, determine all tags that apply to the {{ subject }}.
 {% endif %}
+Unless "Unknown", determine the certainty level. Certainty refers to the strength and clarity of the evidence in the Review(s), not to your own confidence.
+    - Certain: The evidence is unequivocal and leaves no room for doubt. The Review(s) present clear, authoritative statements.
+    - Rather certain: The evidence is strong and mostly consistent, but not fully definitive. The Review(s) express minor reservations or partial relativization.
+    - Rather uncertain: The evidence only weakly supports one side, and misclassification is likely. The Review(s) explicitly highlight substantial uncertainty, conflicting indications, or lack of clarity.
 
-## 4. Certainty
-Choose one certainty level and enclose it in underscores. Certainty refers to the strength and clarity of the evidence in the Review(s), not to your own confidence.
-    - _Certain_: The evidence is unequivocal and leaves no room for doubt. The Review(s) present clear, authoritative statements.
-    - _Rather certain_: The evidence is strong and mostly consistent, but not fully definitive. The Review(s) express minor reservations or partial relativization.
-    - _Rather uncertain_: The evidence only weakly supports one side, and misclassification is likely. The Review(s) explicitly highlight substantial uncertainty, conflicting indications, or lack of clarity.
-
-## 5. Explanation
-Provide a short explanation (1–4 sentences) justifying your category and certainty. Use only evidence from the Review(s). Do not restate the {{ subject }} or the decision itself. Enclose your explanation in a fenced code block like ```this```.
+{% with step = 4 %}{% include "veritas/prompts/partials/assessment_answer.md.j2" %}{% endwith %}
+The explanation must use only evidence from the Review(s).
 
 # Rules
 * Follow the definitions of {{ property.name }} strictly.
 * Base your reasoning only on information from the Review(s). Do not invent facts or speculate.
-* If the Review(s) contain no evidence about the {{ property.name }}, choose `Unknown`.
+* If the Review(s) contain no evidence about the {{ property.name }}, choose "Unknown".
 * Ignore any rating or verdict stated by the Review(s). Use the evidence only.
+{% if prior_assessments %}
+* Concentrate exclusively on the {{ property.name }}. Do not re-assess the Prior Assessments.
+{% endif %}
 {% if claim and claim.is_rectified %}
 * Do NOT inspect the claim in the Review(s) but concentrate on the claim presented under "Subject of Analysis".
 {% endif %}
@@ -69,7 +70,7 @@ Definition: {{ property.negative_definition }}
 {% if property.negative_tags %}
 Tags:
 {% for tag in property.negative_tags %}
-- :{{ tag.name }}: {{ tag.definition }}
+- {{ tag.name }}: {{ tag.definition }}
 {% endfor %}
 {% endif %}
 
@@ -78,14 +79,11 @@ Definition: {{ property.positive_definition }}
 {% if property.positive_tags %}
 Tags:
 {% for tag in property.positive_tags %}
-- :{{ tag.name }}: {{ tag.definition }}
+- {{ tag.name }}: {{ tag.definition }}
 {% endfor %}
 {% endif %}
 
-{% if property.hints %}
-## Hints
-{{ property.hints }}
-{% endif %}
+{% include "veritas/prompts/partials/property_hints.md.j2" %}
 
 # Your Response
 (Answer in English.)

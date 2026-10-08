@@ -120,6 +120,7 @@ class Ensemble:
         elif len(models) == 0:
             return None
         assert isinstance(models, list)
+        models = list(models)  # Omitting a failed model below must not alter the caller's list
 
         gathered_responses: dict[str, ModelResponse] = {}
 

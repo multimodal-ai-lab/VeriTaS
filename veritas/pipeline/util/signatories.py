@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from typing import Collection, Optional
 
@@ -9,11 +10,16 @@ from veritas import logger
 from veritas.common import Publisher, SignatoryStatus
 from veritas.db import db
 from veritas.util import get_domain
-from veritas.util.scraping import get_all_links, get_dynamic_htmls, get_static_htmls
+from veritas.util.scraping import get_all_links, get_rendered_htmls, get_static_htmls, request_static
 from veritas.util.util import get_lang_iso_code
 
 IFCN_CODE_OF_PRINCIPLES_DOMAIN = "https://ifcncodeofprinciples.poynter.org"
 IFCN_SIGNATORIES_URL = "https://ifcncodeofprinciples.poynter.org/signatories"
+#: The JSON API behind the (JavaScript-rendered) IFCN signatories page, listing all
+#: signatories with their status.
+IFCN_SIGNATORIES_API_URL = "https://ifcn-cop-prod-server-8q9x7.ondigitalocean.app/api/organization/signatories"
+#: The IFCN signatory statuses to consider. Expired signatories were officially removed.
+IFCN_RELEVANT_STATUSES = {"Verified Signatory", "In Renewal"}
 
 EFCSN_BASE_URL = "https://members.efcsn.com"
 EFCSN_SIGNATORIES_URL = "https://members.efcsn.com/signatories"
@@ -51,23 +57,39 @@ async def update_efcsn_members():
 
 
 async def get_ifcn_signatories_profile_urls() -> list[str]:
-    """Applies BeautifulSoup to retrieve the URLs of all IFCN signatories' profiles,
-    including in renewal and expired signatories."""
-    links = [
-        *await get_all_links(IFCN_SIGNATORIES_URL),
-        *await get_all_links(IFCN_SIGNATORIES_URL, buttons_to_click=['[data-rr-ui-event-key="In Renewal"]']),
-        # Officially removed:
-        # *await get_all_links(IFCN_SIGNATORIES_URL, buttons_to_click=['[data-rr-ui-event-key="Expired"]']),
-    ]
-    # Normalize and filter links by the desired scheme
-    matching_links = [IFCN_CODE_OF_PRINCIPLES_DOMAIN + link for link in links if link.startswith("/profile/")]
+    """Retrieves the URLs of the profiles of all verified and in-renewal IFCN
+    signatories from the JSON API behind the signatories page."""
+    async with aiohttp.ClientSession() as session:
+        response = await request_static(IFCN_SIGNATORIES_API_URL, session)
+    if not response:
+        return []
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError as e:
+        logger.error(f"IFCN signatories API returned invalid JSON: {e}")
+        return []
+    return ifcn_profile_urls_from_api_response(data)
 
-    return list(set(matching_links))
+
+def ifcn_profile_urls_from_api_response(data: dict) -> list[str]:
+    """Returns the profile URLs of the signatories with a relevant status
+    (see `IFCN_RELEVANT_STATUSES`) listed in the IFCN signatories API response."""
+    urls = []
+    for organization in data.get("organizations") or []:
+        if not isinstance(organization, dict):
+            continue
+        slug = organization.get("slug")
+        if organization.get("signatory_status") in IFCN_RELEVANT_STATUSES and isinstance(slug, str) and slug:
+            url = f"{IFCN_CODE_OF_PRINCIPLES_DOMAIN}/profile/{slug}"
+            if url not in urls:
+                urls.append(url)
+    return urls
 
 
 async def read_and_save_ifcn_profiles(urls: list[str]):
-    """Scrapes the signatory's profile and extracts their name, URL, status, etc."""
-    htmls = await get_dynamic_htmls(urls)
+    """Scrapes the signatory's profile and extracts their name, URL, status, etc.
+    The profile pages are rendered with JavaScript, so they are retrieved via scrapeMM."""
+    htmls = await get_rendered_htmls(urls)
     for html in htmls:
         if html:
             publisher = await _read_ifcn_profile(BeautifulSoup(html, "html.parser"))
@@ -178,9 +200,9 @@ async def _read_ifcn_profile(soup: BeautifulSoup) -> Optional[Publisher]:
 
 
 async def get_efcsn_member_profile_urls() -> list[str]:
-    """Applies BeautifulSoup to retrieve the URLs of all IFCN signatories' profiles,
-    including in renewal and expired signatories."""
-    links = await get_all_links(EFCSN_SIGNATORIES_URL)
+    """Applies BeautifulSoup to retrieve the URLs of all EFCSN members' profiles
+    from the (static) members page."""
+    links = await get_all_links(EFCSN_SIGNATORIES_URL) or []
     # Normalize and filter links by the desired scheme
     matching_links = [EFCSN_BASE_URL + link for link in links if link.startswith("/organization/")]
 

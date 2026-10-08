@@ -1,0 +1,8 @@
+{% if prior_assessments %}
+# Prior Assessments
+The following properties were already assessed in earlier steps. They are settled: do NOT re-assess them. They serve only as context to delimit the scope of your task.
+{% for prior in prior_assessments %}
+- **{{ prior.property.name }} of the {{ prior.subject }}**: {{ prior.category }}{% if prior.explanation %}. {{ prior.explanation }}{% endif %}
+
+{% endfor %}
+{% endif %}

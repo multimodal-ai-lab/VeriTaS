@@ -1,6 +1,7 @@
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from ezmm import Item
+from ezmm.util import is_item_ref
 from pydantic import BaseModel, Field
 
 from veritas.common.base_model import VeritasBaseModel
@@ -17,8 +18,10 @@ class MediumVerdict(BaseModel):
     authenticity: RatingAggregated
     contextualization: RatingAggregated
 
-    def model_post_init__(self):
-        assert self.medium
+    def model_post_init(self, context: Any, /) -> None:
+        # Validate the reference's format only: Resolving the medium requires the media store
+        if not is_item_ref(self.reference):
+            raise ValueError(f"Invalid medium reference: {self.reference!r}")
 
     @property
     def medium(self) -> Optional[Item]:

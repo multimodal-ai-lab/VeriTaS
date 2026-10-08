@@ -20,6 +20,7 @@ class Property:
     positive_tags: list[Tag]
 
     hints: Optional[str] = None
+    media_hints: Optional[str] = None  # Hints that apply only if the claim contains media
 
     @property
     def categories(self) -> list[str]:
@@ -36,7 +37,7 @@ def load_properties() -> dict[str, Property]:
     properties = dict()
 
     # Load the labeling scheme YAML
-    labeling_scheme = yaml.safe_load(open("veritas/labels.yaml"))
+    labeling_scheme = yaml.safe_load(open("veritas/labels.yaml", encoding="utf-8"))
     for property_id, property_dict in labeling_scheme["properties"].items():
         # Read in tags
         negative_tags = [
@@ -58,7 +59,8 @@ def load_properties() -> dict[str, Property]:
             positive_category=property_dict["positive"]["name"],
             positive_definition=property_dict["positive"]["definition"],
             positive_tags=positive_tags,
-            hints=property_dict.get("hints")
+            hints=property_dict.get("hints"),
+            media_hints=property_dict.get("media_hints"),
         )
         properties[property_id] = prop
 

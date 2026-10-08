@@ -12,6 +12,7 @@ from veritas.common.verdict import Verdict
 from veritas.db.base import Database
 from veritas.util import get_domain
 from veritas.util.url import ARCHIVE_TODAY_URL_SQL_PATTERN
+from veritas.util.review_key import review_match_key
 from veritas.util.util import hash_int32
 
 #: Matches an ezMM item reference such as `<image:42>` inside stored text. The ID
@@ -29,6 +30,51 @@ def _usage_agg(source: str) -> str:
     """SQL collecting the distinct IDs of one source kind into an `INTEGER[]`."""
     return (f"COALESCE(ARRAY_AGG(DISTINCT source_id) FILTER (WHERE source = '{source}'), "
             f"'{{}}'::INTEGER[])")
+
+
+#: The review columns that Stage 1 extracts from the ClaimReviews.
+REVIEW_EXTRACTED_COLUMNS = (
+    "published", "modified", "raw_rating", "raw_claimant_name", "raw_claimant_url", "raw_claim_date",
+    "raw_publisher_name", "raw_publisher_url", "publisher_id", "author_name", "author_url", "appearance_ids",
+)
+
+
+def _naive_utc(dt):
+    """Converts a timezone-aware datetime to naive UTC; leaves anything else as is."""
+    if isinstance(dt, datetime) and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def dedupe_by_match_key(
+        claim_reviews: dict[tuple[str, str], dict]
+) -> dict[tuple[str, int], tuple[str, str, dict]]:
+    """Collapses ClaimReviews (identified by their URL-claim-pair) that are mere
+    spelling variants of each other, keeping the first one of each match key.
+    Returns the `(url, claim, claim_review)` triples by match key."""
+    entries = dict()
+    for (url, claim), cr in claim_reviews.items():
+        entries.setdefault(review_match_key(url, claim), (url, claim, cr))
+    return entries
+
+
+def plan_claim_review_writes(
+        entries: list[tuple[str, str, dict]],
+        matches: list[tuple[int | None, dict | None]],
+) -> tuple[list[tuple[str, str, dict]], list[tuple[int, dict]]]:
+    """Given the `(url, claim, claim_review)` entries and, for each, the matching
+    existing review's `(id, claim_review)`, decides what to write: entries
+    without a matching review are to be inserted, entries whose ClaimReview
+    differs from the matching review's one are to be updated (by review ID).
+    Returns the entries to insert and the `(review_id, claim_review)` updates."""
+    assert len(entries) == len(matches)
+    to_insert, to_update = [], []
+    for (url, claim, cr), (review_id, existing_cr) in zip(entries, matches):
+        if review_id is None:
+            to_insert.append((url, claim, cr))
+        elif cr != existing_cr:
+            to_update.append((review_id, cr))
+    return to_insert, to_update
 
 
 class VeritasDB(Database):
@@ -81,6 +127,46 @@ class VeritasDB(Database):
             -- Optional helper index for checking deferral windows on reviews
             CREATE INDEX IF NOT EXISTS reviews_deferred_until_idx
                 ON reviews (deferred_until);
+            """
+        )
+
+        # Normalized match keys of the reviews (see `veritas.util.review_key`).
+        # Additive only: set on insert and backfilled by `sync_review_keys()` for
+        # reviews lacking them; `url` and `raw_claim` themselves stay untouched.
+        await self._execute(
+            """
+            ALTER TABLE reviews ADD COLUMN IF NOT EXISTS norm_url        TEXT;
+            ALTER TABLE reviews ADD COLUMN IF NOT EXISTS norm_claim_hash BIGINT;
+            CREATE INDEX IF NOT EXISTS reviews_match_key_idx
+                ON reviews (norm_url, norm_claim_hash);
+            -- Shrinks to (almost) nothing once all reviews are keyed
+            CREATE INDEX IF NOT EXISTS reviews_unkeyed_idx
+                ON reviews (id) WHERE norm_url IS NULL;
+            """
+        )
+
+        # Backup of the Google ClaimReviews as converted before the converter fix
+        # (wrong field mapping, see `google_factcheck_explorer`). Copied once, when
+        # the column gets created, and never written afterwards; `google_claim_review`
+        # then receives the corrected ClaimReviews on the next retrievals. The lock
+        # serializes the stage processes, which all initialize the DB at startup.
+        await self._execute(
+            """
+            DO $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(hashtext('veritas:google_claim_review_legacy'));
+                IF NOT EXISTS (SELECT 1
+                               FROM information_schema.columns
+                               WHERE table_schema = current_schema()
+                                 AND table_name = 'reviews'
+                                 AND column_name = 'google_claim_review_legacy') THEN
+                    ALTER TABLE reviews ADD COLUMN google_claim_review_legacy JSONB;
+                    UPDATE reviews
+                    SET google_claim_review_legacy = google_claim_review
+                    WHERE google_claim_review IS NOT NULL;
+                END IF;
+            END
+            $$;
             """
         )
 
@@ -797,59 +883,228 @@ class VeritasDB(Database):
             review.id,
         )
 
-    async def save_claim_review(self, claim_reviews: dict[tuple[str, str], dict], source: str):
-        """Inserts the raw ClaimReview dicts, identified by their URL-claim-pair,
-        to the database. Updates the 'updated_at' field of the corresponding
-        review *only when* the insert made a change. `source` is either 'google'
-        or 'datacommons'."""
-        url_claim_pairs = list(claim_reviews.keys())
-        input_crs = claim_reviews.values()
-        existing_crs = await self.get_claim_reviews(url_claim_pairs, source)
-        assert len(input_crs) == len(existing_crs)
+    async def save_claim_review(self, claim_reviews: dict[tuple[str, str], dict], source: str) -> tuple[int, int]:
+        """Saves the raw ClaimReview dicts, identified by their URL-claim-pair,
+        to the database. A ClaimReview belongs to an existing review if their
+        normalized match keys agree (see `veritas.util.review_key`), so that
+        mere spelling variants of a known review do not become new reviews.
+        Such existing reviews get their `{source}_claim_review` (and 'updated_at')
+        updated *only when* the ClaimReview changed. All other ClaimReviews are
+        inserted as new reviews. `source` is either 'google' or 'datacommons'.
+        Returns the number of inserted and of updated reviews."""
+        await self.sync_review_keys()
 
-        # Compare input and existing CRs to identify new ones (those that differ from the existing)
-        is_new = [cr_in != cr_existing for cr_in, cr_existing in zip(input_crs, existing_crs)]
+        entries = dedupe_by_match_key(claim_reviews)
+        matches = await self.get_claim_reviews_by_match_keys(list(entries.keys()), source)
+        to_insert, to_update = plan_claim_review_writes(list(entries.values()), matches)
 
-        if any(is_new):
-            # Filter for ClaimReviews that are actually new (or differ from existing ones)
-            to_insert = [
-                (url, claim, hash_int32(claim), cr)
-                for (url, claim), cr, new in zip(url_claim_pairs, input_crs, is_new)
-                if new
-            ]
+        if to_insert or to_update:
+            async with self._transaction() as conn:
+                if to_update:
+                    await conn.execute(
+                        """
+                        CREATE TEMP TABLE temp_claim_review_updates (
+                            review_id INT,
+                            claim_review JSONB
+                        ) ON COMMIT DROP;
+                        """
+                    )
+                    await conn.copy_records_to_table(
+                        table_name="temp_claim_review_updates",
+                        records=to_update,
+                        columns=["review_id", "claim_review"],
+                    )
+                    await conn.execute(
+                        f"""
+                        UPDATE reviews r
+                        SET {source}_claim_review = t.claim_review,
+                            updated_at = CURRENT_TIMESTAMP
+                        FROM temp_claim_review_updates t
+                        WHERE r.id = t.review_id;
+                        """
+                    )
 
-            # Bulk-insert the ClaimReviews
-            async with self.pool.acquire() as conn:
-                async with conn.transaction():
-                    # 1. Create a temp table for staging
+                if to_insert:
                     await conn.execute(
                         f"""
                         CREATE TEMP TABLE temp_claim_reviews (
                             url TEXT,
                             raw_claim TEXT,
                             raw_claim_hash INTEGER,
+                            norm_url TEXT,
+                            norm_claim_hash BIGINT,
                             {source}_claim_review JSONB
                         ) ON COMMIT DROP;
-                    """
+                        """
                     )
-
-                    # 2. Copy data into the temp table
                     await conn.copy_records_to_table(
                         table_name="temp_claim_reviews",
-                        records=to_insert,
-                        columns=["url", "raw_claim", "raw_claim_hash", f"{source}_claim_review"],
+                        records=[(url, claim, hash_int32(claim), *review_match_key(url, claim), cr)
+                                 for url, claim, cr in to_insert],
+                        columns=["url", "raw_claim", "raw_claim_hash", "norm_url", "norm_claim_hash",
+                                 f"{source}_claim_review"],
                     )
-
-                    # 3. Insert, but update existing reviews
+                    # The conflict clause is a mere safeguard: an exact duplicate
+                    # would have been matched via its match key already
                     await conn.execute(
                         f"""
-                        INSERT INTO reviews (url, raw_claim, raw_claim_hash, {source}_claim_review)
-                        SELECT url, raw_claim, raw_claim_hash, {source}_claim_review FROM temp_claim_reviews
+                        INSERT INTO reviews (url, raw_claim, raw_claim_hash, norm_url, norm_claim_hash,
+                                             {source}_claim_review)
+                        SELECT url, raw_claim, raw_claim_hash, norm_url, norm_claim_hash, {source}_claim_review
+                        FROM temp_claim_reviews
                         ON CONFLICT (url, raw_claim_hash) DO UPDATE
                         SET {source}_claim_review = EXCLUDED.{source}_claim_review,
                             updated_at = CURRENT_TIMESTAMP;
-                    """
+                        """
                     )
+
+        return len(to_insert), len(to_update)
+
+    async def sync_review_keys(self, batch_size: int = 20_000) -> int:
+        """Computes and stores the match keys (`norm_url`, `norm_claim_hash`) of
+        all reviews that have none yet. Reviews saved by `save_claim_review()` get
+        their keys right away, so this mainly backfills the keys of all existing
+        reviews on its very first call. Only fills the (empty) key columns; leaves
+        everything else, incl. 'updated_at', untouched. Returns the number of
+        reviews keyed."""
+        n_keyed = 0
+        while True:
+            rows = await self._fetch(
+                "SELECT id, url, raw_claim FROM reviews WHERE norm_url IS NULL ORDER BY id LIMIT $1",
+                batch_size,
+            )
+            if not rows:
+                break
+
+            records = [(row["id"], *review_match_key(row["url"], row["raw_claim"])) for row in rows]
+            async with self._transaction() as conn:
+                await conn.execute(
+                    """
+                    CREATE TEMP TABLE temp_review_keys (
+                        review_id INT,
+                        norm_url TEXT,
+                        norm_claim_hash BIGINT
+                    ) ON COMMIT DROP;
+                    """
+                )
+                await conn.copy_records_to_table(
+                    table_name="temp_review_keys",
+                    records=records,
+                    columns=["review_id", "norm_url", "norm_claim_hash"],
+                )
+                await conn.execute(
+                    """
+                    UPDATE reviews r
+                    SET norm_url        = t.norm_url,
+                        norm_claim_hash = t.norm_claim_hash
+                    FROM temp_review_keys t
+                    WHERE r.id = t.review_id AND r.norm_url IS NULL;
+                    """
+                )
+            n_keyed += len(records)
+            if n_keyed > len(records):  # Only log for backfills spanning several batches
+                logger.info(f"Computed match keys for {n_keyed} reviews so far...")
+        return n_keyed
+
+    async def get_claim_reviews_by_match_keys(
+            self, keys: list[tuple[str, int]], source: str
+    ) -> list[tuple[int | None, dict | None]]:
+        """For each match key, returns the ID and the `{source}_claim_review` of
+        the oldest review with that key, or `(None, None)` if there is none.
+        `source` is either 'google' or 'datacommons'."""
+        if not keys:
+            return []
+        async with self._transaction() as conn:
+            await conn.execute(
+                """
+                CREATE TEMP TABLE temp_match_keys (
+                    id SERIAL,
+                    norm_url TEXT,
+                    norm_claim_hash BIGINT
+                ) ON COMMIT DROP;
+                """
+            )
+            await conn.copy_records_to_table(
+                "temp_match_keys", records=keys, columns=["norm_url", "norm_claim_hash"]
+            )
+            rows = await conn.fetch(
+                f"""
+                SELECT m.review_id, r.{source}_claim_review AS claim_review
+                FROM temp_match_keys t
+                LEFT JOIN LATERAL (
+                    SELECT MIN(k.id) AS review_id
+                    FROM reviews k
+                    WHERE k.norm_url = t.norm_url AND k.norm_claim_hash = t.norm_claim_hash
+                ) m ON TRUE
+                LEFT JOIN reviews r ON r.id = m.review_id
+                ORDER BY t.id;
+                """
+            )
+        return [(row["review_id"], row["claim_review"]) for row in rows]
+
+    async def get_reviews_for_reextraction(
+            self, start: date, end: date, after_id: int = 0, limit: int = 1000
+    ) -> list[Review]:
+        """Returns the next batch (by ID, after `after_id`) of non-dismissed reviews
+        that went through Stage 1 already and were published within the given
+        date range (both inclusive)."""
+        query = """
+                SELECT *
+                FROM reviews
+                WHERE stage >= 1
+                  AND dismissed = FALSE
+                  AND published >= $1
+                  AND published <= $2
+                  AND id > $3
+                ORDER BY id
+                LIMIT $4;
+                """
+        rows = await self._fetch(
+            query,
+            datetime.combine(start, datetime.min.time()),
+            datetime.combine(end, datetime.max.time()),
+            after_id,
+            limit,
+        )
+        return [Review.model_validate(dict(row)) for row in rows]
+
+    async def update_review_extracted_data(self, review: Review):
+        """Writes only the review's data extracted from its ClaimReviews (see
+        `REVIEW_EXTRACTED_COLUMNS`) to the DB, leaving all other columns (stage,
+        dismissal, claim, language, ...) untouched."""
+        query = """
+                UPDATE reviews
+                SET published          = $1,
+                    modified           = $2,
+                    raw_rating         = $3,
+                    raw_claimant_name  = $4,
+                    raw_claimant_url   = $5,
+                    raw_claim_date     = $6,
+                    raw_publisher_name = $7,
+                    raw_publisher_url  = $8,
+                    publisher_id       = $9,
+                    author_name        = $10,
+                    author_url         = $11,
+                    appearance_ids     = $12,
+                    updated_at         = CURRENT_TIMESTAMP
+                WHERE id = $13;
+                """
+        await self._execute(
+            query,
+            _naive_utc(review.published),
+            _naive_utc(review.modified),
+            review.raw_rating,
+            review.raw_claimant_name,
+            str(review.raw_claimant_url) if review.raw_claimant_url else None,
+            _naive_utc(review.raw_claim_date),
+            review.raw_publisher_name,
+            str(review.raw_publisher_url) if review.raw_publisher_url else None,
+            review.publisher_id,
+            review.author_name,
+            str(review.author_url) if review.author_url else None,
+            review.appearance_ids,
+            review.id,
+        )
 
     async def insert_publisher(self, publisher: Publisher) -> int:
         """Adds the publisher to the database and returns the assigned ID.

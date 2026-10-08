@@ -856,6 +856,15 @@ mjx-container[jax="CHTML"][display="true"] { margin: 0; }
 }
 .claim-card:hover .media-thumb, .evidence-card:hover .media-thumb { border-color: var(--border-strong); }
 .media-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.media-thumb.video { position: relative; }
+.media-thumb video {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    pointer-events: none;  /* the card is the link; the preview is not a player */
+}
+.media-thumb.video i {
+    position: absolute; font-size: .7rem; color: #fff;
+    filter: drop-shadow(0 0 3px rgba(0, 0, 0, .75));
+}
 .media-thumb.missing { color: var(--bad-ink); background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 28%, transparent); }
 .media-thumb.more {
     font-family: var(--mono); font-size: .74rem; font-weight: 600;

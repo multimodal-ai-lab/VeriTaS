@@ -1,0 +1,9 @@
+{% if property.hints or (has_media and property.media_hints) %}
+## Hints
+{% if property.hints %}
+{{ property.hints }}
+{% endif %}
+{% if has_media and property.media_hints %}
+{{ property.media_hints }}
+{% endif %}
+{% endif %}

@@ -85,7 +85,7 @@ def extract_last_code_block(text: str) -> Optional[str]:
     code_block = extract_last(text, "```")
     if code_block:
         lines = code_block.split("\n")
-        if len(lines[0]) <= 8:
+        if len(lines) > 1 and len(lines[0]) <= 8:
             # First line seems to be a language tag, so remove it
             return "\n".join(lines[1:]).strip()
         return code_block

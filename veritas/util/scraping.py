@@ -4,8 +4,8 @@ from typing import Iterable, Optional
 import aiohttp
 from aiohttp.http_exceptions import ContentLengthError
 from bs4 import BeautifulSoup
-from playwright.async_api import TimeoutError, async_playwright, BrowserContext, Error
 from pydantic import HttpUrl
+from scrapemm import retrieve
 
 from veritas.util.util import run_with_semaphore
 
@@ -78,60 +78,22 @@ async def stream(response: aiohttp.ClientResponse, chunk_size: int = 1024) -> by
     return bytes(data)  # Convert to immutable bytes if needed
 
 
-async def get_dynamic_htmls(urls: list[str], **kwargs):
-    """Reads multiple URLs dynamically and concurrently."""
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(accept_downloads=False)
-            tasks = [get_dynamic_html(url, context, **kwargs) for url in urls]
-            results = await run_with_semaphore(tasks, limit=100)
-            await browser.close()
-            return results
-
-    except Exception as e:
-        logger.warning(f"Unable to dynamically read pages: {e}")
+async def get_rendered_htmls(urls: list[str]) -> list[str | None]:
+    """Retrieves the HTML of pages that need JavaScript to show their content.
+    Anything beyond a static request goes through the scrapeMM server, which
+    renders the pages in a real browser. Returns None for pages that failed.
+    Raises scrapeMM's `ServerError` if the server is unreachable."""
+    if not urls:
+        return []
+    responses = await retrieve(list(urls), output_format="html", show_progress=False)
+    return [response.content.html if response.success else None for response in responses]
 
 
-async def get_dynamic_html(url: str, context: BrowserContext, buttons_to_click: list[str] = None) -> str | None:
-    """Retrieves the HTML of a URL using Playwright. Loads JavaScript contents
-    dynamically and can perform button clicks. Specify the buttons using CSS selectors."""
-    page = await context.new_page()
-
-    try:
-        await page.goto(url, timeout=60000)
-        await page.wait_for_load_state(
-            "networkidle"
-        )  # 'domcontentloaded'
-    except (TimeoutError, Error) as e:
-        logger.warning(f"\rUnable to load page at URL '{url}'.\n\tReason: {type(e).__name__} {e}")
-        return
-
-    if buttons_to_click:
-        for button in buttons_to_click:
-            # Click buttons
-            try:
-                # 1. Wait for the button to appear
-                await page.wait_for_selector(f"{button}", timeout=5000)
-
-                # 2. Click the button
-                await page.click(f"{button}")
-
-                # 3. Optionally wait for new content to load
-                await page.wait_for_load_state("networkidle")
-
-            except Exception as e:
-                logger.warning(f"Button {button} not found or clickable: {e}")
-
-    # Get the full page HTML after JS execution
-    content = await page.content()
-    await page.close()
-    return content
-
-
-async def get_all_links(url: str, **kwargs) -> Optional[list[str]]:
-    """Returns a list of all links on the page specified by the given URL."""
-    if html := (await get_dynamic_htmls([url], **kwargs))[0]:
+async def get_all_links(url: str) -> Optional[list[str]]:
+    """Returns a list of all links on the (static) page specified by the given URL."""
+    async with aiohttp.ClientSession() as session:
+        html = await request_static(url, session)
+    if html:
         soup = BeautifulSoup(html, features="lxml")
         links = soup.find_all('a', href=True)
         return [a['href'] for a in links]

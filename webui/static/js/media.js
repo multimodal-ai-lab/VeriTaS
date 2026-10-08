@@ -88,9 +88,17 @@ export function renderMediaStrip(payload, { limit = 4 } = {}) {
         if (!item.exists) {
             thumb.append(el('i', { class: 'fa-solid fa-image-slash' }));
         } else if (item.kind === 'video') {
-            // A poster frame would need decoding the video; the icon says enough
-            // at this size, and the detail view plays it.
-            thumb.append(el('i', { class: 'fa-solid fa-film' }));
+            // The browser decodes a frame from the start of the file (a range
+            // request, not the whole video); the icon marks it as a video.
+            thumb.classList.add('video');
+            thumb.append(
+                el('video', {
+                    src: `${api.mediaUrl(item.kind, item.id)}#t=0.1`,
+                    preload: 'metadata', muted: true, playsinline: true,
+                    disablepictureinpicture: true, tabindex: '-1', 'aria-hidden': 'true',
+                }),
+                el('i', { class: 'fa-solid fa-play' }),
+            );
         } else if (item.kind === 'audio') {
             thumb.append(el('i', { class: 'fa-solid fa-volume-high' }));
         } else {
@@ -154,7 +162,9 @@ function mediaFigure(item, { wide = false, index = 0 } = {}) {
         }));
     } else if (item.kind === 'video') {
         frame.append(el('video', {
-            src: api.mediaUrl(item.kind, item.id),
+            // `#t=0.1` makes browsers that otherwise show a blank box before the
+            // first play (Firefox, Safari) decode and show an opening frame.
+            src: `${api.mediaUrl(item.kind, item.id)}#t=0.1`,
             controls: true,
             preload: 'metadata',
             playsinline: true,

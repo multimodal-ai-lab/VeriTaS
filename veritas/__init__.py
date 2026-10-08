@@ -7,7 +7,7 @@ import yaml
 from ezmm import set_ezmm_path
 
 # Load global configuration variables
-globals = yaml.safe_load(open("config.yaml"))
+globals = yaml.safe_load(open("config.yaml", encoding="utf-8"))
 
 api_secrets = globals.get("api_secrets")
 

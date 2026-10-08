@@ -1,0 +1,14 @@
+## {{ step }}. Final Answer
+Only after (!) completing all reasoning above, conclude your response with your final answer as a JSON object in a ```json code block. Nothing may follow it. Use this format:
+```json
+{
+  "category": "{{ property.negative_category }}" | "{{ property.positive_category }}" | "Unknown",
+  "certainty": "Certain" | "Rather certain" | "Rather uncertain" | null,{% if property.tags %}
+  "tags": [<tag>, ...],{% endif %}
+  "explanation": "<explanation>"
+}
+```
+* `category`: Your category decision.
+* `certainty`: Your certainty level, `null` if the category is "Unknown".{% if property.tags %}
+* `tags`: The names of all tags of the chosen category that apply to the {{ subject }}. Empty if none applies.{% endif %}
+* `explanation`: A short explanation (1–4 sentences) justifying your category and certainty. Do not restate the {{ subject }} or the decision itself.

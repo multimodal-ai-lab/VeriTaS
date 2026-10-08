@@ -4,8 +4,8 @@ import { api } from '../api.js';
 import { renderMediaStrip } from '../media.js';
 import { math } from '../math.js';
 import {
-    badge, date, el, humanize, mediaSelect, num, REASON_HELP, relative, STATUS_STYLE,
-    truncate,
+    badge, date, el, humanize, languageName, mediaSelect, num, REASON_HELP, relative,
+    STATUS_STYLE, truncate,
 } from '../util.js';
 
 const SORT_LABELS = {
@@ -148,7 +148,7 @@ function buildToolbar(state, filters, apply) {
         languageSelect.append(el('option', {
             value: entry.label,
             selected: state.language.length === 1 && state.language[0] === entry.label,
-            text: `${entry.label} (${num(entry.count)})`,
+            text: `${languageName(entry.label)} (${num(entry.count)})`,
         }));
     }
 
@@ -224,6 +224,7 @@ function buildResults(page, apply) {
 
 function claimCard(claim, index) {
     const style = STATUS_STYLE[claim.status] ?? { tone: 'plain', icon: 'fa-circle' };
+    const rejected = claim.status === 'rejected' && Boolean(claim.reason);
     const total = Math.max(claim.n_evidence, 1);
 
     return el('a', {
@@ -232,11 +233,14 @@ function claimCard(claim, index) {
         href: `#/claims/${claim.id}`,
     }, [
         el('div', { class: 'row' }, [
-            badge(claim.status ?? 'unprocessed', style),
-            claim.reason
+            // A rejected claim shows *why* - "Rejected" alone says little.
+            rejected
+                ? badge(claim.reason, { tone: 'bad', icon: STATUS_STYLE.rejected.icon,
+                    title: `Rejected: ${REASON_HELP[claim.reason] ?? humanize(claim.reason)}` })
+                : badge(claim.status ?? 'unprocessed', style),
+            !rejected && claim.reason
                 ? badge(claim.reason, { tone: 'plain', icon: 'fa-circle-info', title: REASON_HELP[claim.reason] ?? '' })
                 : null,
-            ...mediaBadges(claim),
             claim.released ? badge('released', { tone: 'info', icon: 'fa-box-open' }) : null,
             claim.is_rectified ? badge('rectified', { tone: 'plain', icon: 'fa-pen-nib' }) : null,
             el('span', { class: 'id', style: { marginLeft: 'auto' }, text: `#${claim.id}` }),
@@ -261,7 +265,10 @@ function claimCard(claim, index) {
                 }, [el('i', { class: 'fa-solid fa-photo-film' }),
                     `${num(claim.n_multimodal)} multimodal evidence`])
                 : null,
-            claim.language ? el('span', {}, [el('i', { class: 'fa-solid fa-language' }), claim.language]) : null,
+            claim.language
+                ? el('span', { title: claim.language },
+                    [el('i', { class: 'fa-solid fa-language' }), languageName(claim.language)])
+                : null,
             el('span', { style: { marginLeft: 'auto' }, title: claim.updated_at ?? '' },
                 [el('i', { class: 'fa-solid fa-clock-rotate-left' }), relative(claim.updated_at)]),
         ]),
@@ -274,30 +281,6 @@ function claimCard(claim, index) {
             ])
             : null,
     ]);
-}
-
-/** Badges for the media the *claim itself* carries, one per kind. The evidence's
- *  own modality is reported in the meta row, so the two are never confused. */
-function mediaBadges(claim) {
-    if (!claim.content?.n_media) return [];
-
-    // Counted from the segments, which list every reference: the `media` array
-    // is capped for the preview and would undercount.
-    const counts = new Map();
-    const seen = new Set();
-    for (const part of claim.content.segments ?? []) {
-        if (part.type !== 'media' || seen.has(part.reference)) continue;
-        seen.add(part.reference);
-        counts.set(part.kind, (counts.get(part.kind) ?? 0) + 1);
-    }
-
-    const icons = { image: 'fa-image', video: 'fa-film', audio: 'fa-volume-high' };
-    return [...counts].map(([kind, count]) =>
-        badge(`${count} ${kind}${count === 1 ? '' : 's'}`, {
-            tone: 'violet',
-            icon: icons[kind] ?? 'fa-paperclip',
-            title: `The claim references ${count} ${kind}(s)`,
-        }));
 }
 
 /** Media references would clutter the one-line preview; the detail view keeps them. */

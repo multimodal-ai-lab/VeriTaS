@@ -1,7 +1,7 @@
 numpy>=2.5.3
 pydantic>=2.13.5
-ezmm>=0.5.2
-scrapeMM>=1.0.2
+ezmm~=0.5.2
+scrapeMM>=1.5.0
 openai~=2.54.0
 anthropic~=0.125.0
 PyYAML~=6.0.2

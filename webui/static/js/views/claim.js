@@ -4,7 +4,8 @@ import { api } from '../api.js';
 import { renderMultimodal } from '../media.js';
 import { E_c, E_f, math, typeset } from '../math.js';
 import {
-    badge, copyText, date, decimal, el, highlightJson, humanize, infoTip, num, PROXIMITY_STYLE,
+    badge, copyText, date, decimal, el, highlightJson, humanize, infoTip, languageName, num,
+    PROXIMITY_STYLE,
     REASON_HELP, ROLE_STYLE, SOURCE_KIND_ICON, STATUS_STYLE, truncate, truncated,
 } from '../util.js';
 
@@ -57,7 +58,9 @@ function head(detail) {
                     : null,
                 claim.released ? badge('released', { tone: 'info', icon: 'fa-box-open' }) : null,
                 claim.is_rectified ? badge('rectified', { tone: 'plain', icon: 'fa-pen-nib' }) : null,
-                claim.language ? badge(claim.language, { tone: 'plain', icon: 'fa-language' }) : null,
+                claim.language
+                    ? badge(languageName(claim.language), { tone: 'plain', icon: 'fa-language', title: claim.language })
+                    : null,
             ]),
         ]),
         el('div', { class: 'spacer', style: { flex: 1 } }),
@@ -662,13 +665,10 @@ function evidenceCard(item, index) {
                 title: REASON_HELP.later_event ?? '' })
             : null,
         badge(sources.length === 1 ? '1 source' : `${kept} of ${sources.length} sources`, {
-            tone: sources.length > 1 ? 'info' : 'plain', icon: 'fa-clone',
+            tone: 'plain', icon: 'fa-clone',
             title: 'Every source reports the same proposition, so the item survives '
                 + 'as long as one of them does.',
         }),
-        item.proposition?.is_multimodal
-            ? badge(`${item.proposition.n_media} media`, { tone: 'violet', icon: 'fa-photo-film' })
-            : null,
         item.dismissed ? badge('dismissed', { tone: 'bad', icon: 'fa-ban', title: item.dismissed_reason ?? '' }) : null,
     ];
 
