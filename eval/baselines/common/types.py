@@ -3,10 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
-# Verdict type - the three possible outcomes (3-class)
-Verdict = Literal["Intact", "Compromised", "Unknown"]
-
-# Extended verdict type including uncertainty levels (7-class)
+# The verdict the baseline predicts (7-class)
 Verdict7 = Literal[
     "Intact (certain)", "Intact (rather certain)", "Intact (rather uncertain)",
     "Unknown",
@@ -21,33 +18,11 @@ MAX_DELAY = 60.0  # seconds
 
 @dataclass
 class LabelScheme:
-    """Configuration for the label set used in fact-checking."""
+    """A label set with the numeric value of each label."""
 
     name: str
     labels: list[str]
     verdict_to_numeric: dict[str, float]
-    label_descriptions: dict[str, str]
-
-    @property
-    def verdict_regex_pattern(self) -> str:
-        """Build a regex alternation pattern matching all labels (case-insensitive)."""
-        # Sort longest-first so regex matches greedily
-        escaped = sorted(
-            (label.upper() for label in self.labels),
-            key=len, reverse=True,
-        )
-        # Escape parentheses for regex
-        parts = [l.replace("(", r"\(").replace(")", r"\)") for l in escaped]
-        return "|".join(parts)
-
-    def normalize_verdict(self, raw: str) -> str:
-        """Normalize a raw extracted verdict string to canonical label form."""
-        raw_lower = raw.strip().lower()
-        for label in self.labels:
-            if label.lower() == raw_lower:
-                return label
-        # Fallback: return Unknown
-        return "Unknown"
 
 
 # =============================================================================
@@ -63,11 +38,6 @@ LABEL_SCHEME_3 = LabelScheme(
         "Intact": 1.0,
         "Unknown": 0.0,
         "Compromised": -1.0,
-    },
-    label_descriptions={
-        "Intact": "The claim is factually accurate and any associated media is authentic and properly contextualized",
-        "Unknown": "There is insufficient evidence to determine the claim's accuracy",
-        "Compromised": "The claim is factually inaccurate, misleading, or contains manipulated/miscontextualized media",
     },
 )
 
@@ -97,48 +67,33 @@ LABEL_SCHEME_7 = LabelScheme(
         "Compromised (rather certain)": -2 / 3,
         "Compromised (certain)": -1.0,
     },
-    label_descriptions={
-        "Intact (certain)": "The claim is factually accurate with strong, unequivocal evidence",
-        "Intact (rather certain)": "The claim appears factually accurate with strong but not fully definitive evidence",
-        "Intact (rather uncertain)": "The claim weakly appears factually accurate based on limited evidence",
-        "Unknown": "Evidence is completely absent or irreconcilably contradictory — use ONLY as a last resort; if any directional lean exists (even weak), use the corresponding 'rather uncertain' bin instead",
-        "Compromised (rather uncertain)": "The claim weakly appears inaccurate or misleading based on limited evidence",
-        "Compromised (rather certain)": "The claim appears inaccurate or misleading with strong but not fully definitive evidence",
-        "Compromised (certain)": "The claim is factually inaccurate, misleading, or contains manipulated/miscontextualized media with strong, unequivocal evidence",
-    },
 )
 
-# The baseline predicts on the 7-class scheme. The 3-class scheme is kept for evaluation,
-# where 7-class predictions are coarsened to 3 classes (see metrics.py).
-
-# Convenience: default scheme and labels (backwards compatible)
-LABELS = LABELS_3
-DEFAULT_LABEL_SCHEME = LABEL_SCHEME_3
-
-LABEL_SCHEMES = {
-    3: LABEL_SCHEME_3,
-    7: LABEL_SCHEME_7,
-}
-
-
-def get_label_scheme(n_classes: int = 3) -> LabelScheme:
-    """Get a label scheme by number of classes (3 or 7)."""
-    if n_classes not in LABEL_SCHEMES:
-        raise ValueError(f"Unsupported label scheme: {n_classes}. Choose from {list(LABEL_SCHEMES.keys())}")
-    return LABEL_SCHEMES[n_classes]
+# The baseline predicts on the 7-class scheme. The 3-class scheme is only used for evaluation,
+# where 7-class labels are coarsened to 3 classes (see metrics.py).
 
 
 @dataclass
 class FactCheckResult:
     """Result from a fact-checking operation."""
 
-    verdict: str  # Verdict label from the 7-class scheme
+    verdict: str | None  # Verdict label from the 7-class scheme; None if the model gave no valid answer
     reasoning: str
     citations: list[str] = field(default_factory=list)
     model: str = ""
     provider: str = ""
     usage: dict = field(default_factory=dict)
-    justification: str = ""  # Parsed JUSTIFICATION field; "" when the model emitted none
+    justification: str = ""  # The justification of the model's JSON answer; "" when there is none
+    encountered_urls: list[str] = field(default_factory=list)  # URLs of the web_search results
+    retrieved_urls: list[str] = field(default_factory=list)  # URLs successfully fetched with fetch_url
+    linked_urls: list[str] = field(default_factory=list)  # URLs in the content of the fetched pages
+    quoted_urls: list[str] = field(default_factory=list)  # URLs cited in the justification
+    # The web_search results dropped and fetch_url calls refused because they are or show a
+    # blocked URL, with the rule that blocked them (see ToolSession.blocked); the model sees none
+    blocked: list[dict] = field(default_factory=list)
+    # Everything that happened, in order: the prompt, the model's reasoning, text and tool calls,
+    # and the tool results (dicts with "type" and, but for the prompt, the model call's "turn")
+    trace: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -150,4 +105,27 @@ class FactCheckResult:
             "provider": self.provider,
             "usage": self.usage,
             "justification": self.justification,
+            "encountered_urls": self.encountered_urls,
+            "retrieved_urls": self.retrieved_urls,
+            "linked_urls": self.linked_urls,
+            "quoted_urls": self.quoted_urls,
+            "blocked": self.blocked,
+            "trace": self.trace,
         }
+
+
+class FactCheckError(Exception):
+    """A fact-check that failed. Holds what it got to before: its trace, URLs and usage."""
+
+    status = "error"  # The claim's status in the results
+
+    def __init__(self, message: str, result: FactCheckResult):
+        super().__init__(message)
+        self.result = result
+
+
+class NoAnswerError(FactCheckError):
+    """A fact-check whose final response holds no valid answer: no JSON object with a valid
+    integrity and certainty, e.g. because the response was cut off or blocked."""
+
+    status = "no_answer"

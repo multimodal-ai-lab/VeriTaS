@@ -60,3 +60,22 @@ def test_unparseable_date_raises():
 
 def test_missing_date_is_unfiltered():
     assert "tbs" not in build_search_query("q", None).request_body()
+
+
+def test_searches_before_the_cutoff_date_and_shows_the_claim_date(monkeypatch):
+    """The cutoff is the day the claim's fact-check was published; the prompt still gives the claim date."""
+    from eval.baselines.common import tools
+    from scrapemm.search import SerperResponse
+    queries = []
+
+    async def fake_search(query):
+        queries.append(query)
+        return SerperResponse(organic=[])
+
+    monkeypatch.setattr(tools, "search", fake_search)
+    session = ToolSession(claim_date="2024-02-05", cutoff_date="2024-02-20T14:24:00")
+    session.web_search("q")
+    assert session.claim_day == CLAIM_DAY
+    assert queries[0].request_body()["tbs"].split("cd_max:")[1] == "2/19/2024"
+    # Without a cutoff, the claim date
+    assert ToolSession(claim_date="2024-02-05").cutoff_day == CLAIM_DAY

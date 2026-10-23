@@ -1,87 +1,101 @@
-"""Tests for parsing the JUSTIFICATION field out of two-step model responses."""
+"""Tests for parsing the model's JSON answer: the verdict (integrity + certainty) and the justification."""
 
 import pytest
 
-from eval.baselines.providers.base import BaseFactChecker, extract_justification
+from eval.baselines.common.parsing import extract_answer, extract_justification, extract_verdict
 
 
-class DummyFactChecker(BaseFactChecker):
-    """Concrete BaseFactChecker so the extraction helpers can be exercised."""
-
-    provider_name = "dummy"
-
-    def check_claim(self, claim, image_paths=None, video_paths=None, claim_date=None):
-        raise NotImplementedError
-
-
-@pytest.fixture
-def two_step_checker():
-    return DummyFactChecker(model="dummy")
-
-
-def test_extracts_from_exact_output_block():
-    response = (
-        "The photo was taken in 2019, not during the 2024 protest.\n\n"
-        "  DIRECTION: COMPROMISED\n"
-        "  CERTAINTY: rather certain\n"
-        "  JUSTIFICATION: Reverse image search places the photo at a 2019 rally.\n"
-        "  VERDICT: [COMPROMISED (RATHER CERTAIN)]\n"
+def _answer(integrity, certainty, justification="Per [AP](https://apnews.com/x) it is.") -> str:
+    return (
+        "```json\n"
+        "{\n"
+        f'  "integrity": {integrity},\n'
+        f'  "certainty": {certainty},\n'
+        f'  "justification": "{justification}"\n'
+        "}\n"
+        "```"
     )
-    assert extract_justification(response) == (
-        "Reverse image search places the photo at a 2019 rally."
-    )
-
-
-def test_returns_empty_when_absent():
-    assert extract_justification("Some analysis.\n\nVERDICT: [INTACT (CERTAIN)]") == ""
-
-
-def test_returns_empty_for_empty_response():
-    assert extract_justification("") == ""
 
 
 @pytest.mark.parametrize(
-    "line",
+    "integrity, certainty, expected",
     [
-        "**JUSTIFICATION:** The source confirms it.",
-        "- JUSTIFICATION: The source confirms it.",
-        "  justification : The source confirms it.",
+        ('"intact"', '"certain"', "Intact (certain)"),
+        ('"intact"', '"rather certain"', "Intact (rather certain)"),
+        ('"intact"', '"rather uncertain"', "Intact (rather uncertain)"),
+        ('"unknown"', "null", "Unknown"),
+        ('"compromised"', '"rather uncertain"', "Compromised (rather uncertain)"),
+        ('"compromised"', '"rather certain"', "Compromised (rather certain)"),
+        ('"compromised"', '"certain"', "Compromised (certain)"),
+        # Other casing and stray whitespace
+        ('"Compromised"', '"Rather Certain"', "Compromised (rather certain)"),
+        ('" intact "', '"certain "', "Intact (certain)"),
+        # "unknown" takes no certainty, but one given anyway does no harm
+        ('"unknown"', '"certain"', "Unknown"),
     ],
 )
-def test_tolerates_markdown_and_bullet_variants(line):
-    response = f"DIRECTION: INTACT\nCERTAINTY: certain\n{line}\nVERDICT: [INTACT (CERTAIN)]"
-    assert extract_justification(response) == "The source confirms it."
+def test_verdict_from_integrity_and_certainty(integrity, certainty, expected):
+    assert extract_verdict(_answer(integrity, certainty)) == expected
 
 
-def test_preserves_urls_and_markdown_links():
-    body = (
-        "Per [AP](https://apnews.com/article/a_(b),c) and "
-        "[Reuters](https://reut.rs/x?y=1&z=2), the photo is authentic."
-    )
-    response = f"CERTAINTY: certain\nJUSTIFICATION: {body}\nVERDICT: [INTACT (CERTAIN)]"
-    assert extract_justification(response) == body
+@pytest.mark.parametrize(
+    "integrity, certainty",
+    [
+        ('"intact"', "null"),  # A tendency needs a certainty
+        ('"compromised"', '"very certain"'),
+        ('"misleading"', '"certain"'),
+        ("null", "null"),
+    ],
+)
+def test_invalid_answer_is_no_verdict(integrity, certainty):
+    """Not "Unknown": the model did not answer as asked, and the claim is retried."""
+    assert extract_verdict(_answer(integrity, certainty)) is None
 
 
-def test_captures_trailing_justification_without_verdict_line():
-    response = "DIRECTION: INTACT\nCERTAINTY: certain\nJUSTIFICATION: Confirmed by the registry."
-    assert extract_justification(response) == "Confirmed by the registry."
+def test_justification_keeps_urls_and_markdown_links():
+    body = "Per [AP](https://apnews.com/article/a_(b),c) and [Reuters](https://reut.rs/x?y=1&z=2), it is authentic."
+    assert extract_justification(_answer('"intact"', '"certain"', body)) == body
 
 
-def test_verdict_fallback_ignores_label_words_inside_justification(two_step_checker):
-    """Two-step parsing fails here; the fallback must not read the justification."""
+def test_answer_without_code_block():
+    response = 'After checking: {"integrity": "intact", "certainty": "certain", "justification": "Confirmed."}'
+    assert extract_verdict(response) == "Intact (certain)"
+    assert extract_justification(response) == "Confirmed."
+
+
+def test_last_answer_wins():
+    draft = '{"integrity": "unknown", "certainty": null, "justification": "Draft."}'
+    final = '{"integrity": "compromised", "certainty": "certain", "justification": "Final."}'
+    response = f"First thought:\n{draft}\nAfter more research:\n```json\n{final}\n```"
+    assert extract_verdict(response) == "Compromised (certain)"
+    assert extract_justification(response) == "Final."
+
+
+def test_braces_and_line_breaks_inside_the_justification():
+    response = '{"integrity": "intact", "certainty": "certain", "justification": "The {quoted} part\nis real."}'
+    assert extract_verdict(response) == "Intact (certain)"
+    assert extract_justification(response) == "The {quoted} part\nis real."
+
+
+def test_other_json_objects_are_ignored():
     response = (
-        "Analysis of the image.\n"
-        "JUSTIFICATION: Nothing suggests the photo is compromised or manipulated.\n"
-        "INTACT (CERTAIN)"
+        '```json\n{"integrity": "intact", "certainty": "rather certain", "justification": "Confirmed."}\n```\n'
+        'Searched with {"query": "eiffel tower"}.'
     )
-    assert two_step_checker._extract_verdict(response) == "Intact (certain)"
+    assert extract_verdict(response) == "Intact (rather certain)"
+    assert extract_answer(response)["justification"] == "Confirmed."
 
 
-def test_two_step_verdict_still_parses_with_justification_present(two_step_checker):
-    response = (
-        "  DIRECTION: COMPROMISED\n"
-        "  CERTAINTY: rather certain\n"
-        "  JUSTIFICATION: The image predates the event.\n"
-        "  VERDICT: [COMPROMISED (RATHER CERTAIN)]"
-    )
-    assert two_step_checker._extract_verdict(response) == "Compromised (rather certain)"
+@pytest.mark.parametrize(
+    "response",
+    [
+        "",
+        "The claim is intact, I am certain.",
+        "VERDICT: Intact (certain)",  # The old format
+        '{"integrity": "intact", "certainty": "certain", "justification": "Trailing comma",}',
+    ],
+)
+def test_missing_or_broken_answer_is_no_verdict(response):
+    assert extract_answer(response) == {}
+    assert extract_verdict(response) is None
+    assert extract_justification(response) == ""

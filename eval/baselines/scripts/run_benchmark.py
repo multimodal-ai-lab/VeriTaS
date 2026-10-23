@@ -7,11 +7,12 @@ Runs the fact-checking baseline with any combination of providers:
 - Gemini (gemini-2.5-flash, ...)
 - Anthropic (claude-sonnet-4-6, ...)
 - Self-hosted models via vLLM (Llama 4, ...)
+- OpenRouter (z-ai/glm-5.3-flash, ...)
 
 Every provider runs the same baseline: the model verifies the claim with the
 web_search tool (results restricted to before the claim date) and the fetch_url
-tool (via the scrapeMM server), and answers on the 7-class label scheme in two
-steps (DIRECTION + CERTAINTY).
+tool (via the scrapeMM server), and answers with the claim's integrity, its certainty
+and a justification in JSON, which make a label of the 7-class scheme.
 
 Features:
 - Run single provider or multiple providers
@@ -28,7 +29,9 @@ import json
 import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, fields
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
@@ -36,8 +39,9 @@ from threading import Lock
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from baselines import UnifiedFactChecker, FactCheckResult
+from baselines import UnifiedFactChecker, FactCheckError, FactCheckResult
 from baselines.factchecker import DEFAULT_MODELS, DEFAULT_PROVIDERS
+from baselines.providers import DEFAULT_REASONING_EFFORT
 from baselines.common import (
     classify_integrity,
     compute_metrics,
@@ -45,11 +49,19 @@ from baselines.common import (
     print_metrics,
 )
 from baselines.common.metrics import compute_coarsened_metrics, COARSEN_7_TO_3
-from baselines.common.tools import MAX_FETCH_CHARS, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
-from baselines.common.types import LABEL_SCHEME_3, LABEL_SCHEME_7
+from baselines.common.media import MediaLimits
+from baselines.common.reviews import lookup_reviews, signatory_scopes
+from baselines.common.tools import (MAX_FETCH_CHARS, MAX_SEARCH_PAGES, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES,
+                                    temporary_media_store)
+from baselines.common.types import LABEL_SCHEME_7
+from baselines.scripts.fact_check_exposure import write_fact_check_exposure
+from baselines.scripts.run_statistics import write_run_statistics
 
 # Thread-safe CSV writing
 csv_lock = Lock()
+
+# The URL lists can exceed the csv module's default field size limit (128 KiB) when read back
+csv.field_size_limit(sys.maxsize)
 
 # =============================================================================
 # CSV utilities
@@ -68,8 +80,15 @@ CSV_COLUMNS = [
     "correct",
     "status",
     "error_message",
-    "justification"
+    "justification",
+    "encountered_urls",
+    "retrieved_urls",
+    "linked_urls",
+    "quoted_urls",
 ]
+
+# Per-claim URL lists, stored in the CSV as JSON arrays
+URL_LIST_FIELDS = ("encountered_urls", "retrieved_urls", "linked_urls", "quoted_urls")
 
 JUSTIFICATION_CSV_MAX_CHARS = 1000
 
@@ -95,6 +114,50 @@ def append_to_csv(csv_path: Path, record: dict):
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writerow(record)
+
+
+def prepare_resume(csv_path: Path, jsonl_path: Path, providers: list[str]) -> int:
+    """Prepare a run's results for resuming it: remove the rows of `providers` that are not
+    successes (errors, or lines a crash cut short) from the CSV and JSONL, so that their
+    claims are retried, and bring the CSV's header up to date with CSV_COLUMNS, so that the
+    rows appended next line up with it.
+
+    Returns the number of CSV rows removed.
+    """
+    def failed(record: dict) -> bool:
+        return record.get("provider") in providers and record.get("status") != "success"
+
+    n_dropped = 0
+    if csv_path.exists():
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = CSV_COLUMNS + [c for c in reader.fieldnames or [] if c not in CSV_COLUMNS]
+            rows = list(reader)
+        kept = [row for row in rows if not failed(row)]
+        n_dropped = len(rows) - len(kept)
+        tmp_path = csv_path.with_name(csv_path.name + ".tmp")
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(kept)
+        os.replace(tmp_path, csv_path)
+
+    if jsonl_path.exists():
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            lines = [line for line in f if line.strip()]
+        kept_lines = []
+        for line in lines:
+            try:
+                if not failed(json.loads(line)):
+                    kept_lines.append(line if line.endswith("\n") else line + "\n")
+            except json.JSONDecodeError:
+                pass  # A line a crash cut short
+        tmp_path = jsonl_path.with_name(jsonl_path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+        os.replace(tmp_path, jsonl_path)
+
+    return n_dropped
 
 
 def load_processed_claim_ids(csv_path: Path, provider: str | None = None) -> set:
@@ -127,7 +190,7 @@ def build_csv_record(
 ) -> dict:
     """Build a CSV record from claim processing results."""
     gt_integrity = ground_truth.get("integrity")
-    gt_class = classify_integrity(gt_integrity, LABEL_SCHEME_7) if gt_integrity is not None else None
+    gt_class = classify_integrity(gt_integrity) if gt_integrity is not None else None
 
     if status == "success" and result:
         verdict = result.verdict
@@ -151,7 +214,11 @@ def build_csv_record(
         "correct": correct,
         "status": status,
         "error_message": error_message,
-        "justification": format_justification_for_csv(result)
+        "justification": format_justification_for_csv(result),
+        **{
+            field: json.dumps(getattr(result, field), ensure_ascii=False) if result else None
+            for field in URL_LIST_FIELDS
+        },
     }
 
 
@@ -315,8 +382,10 @@ def plot_cross_confusion_matrix(metrics_7bin: dict, output_path: Path, provider:
 # Summary generation
 # =============================================================================
 
-def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[str]):
-    """Generate summary JSON and confusion matrix plots from CSV results."""
+def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[str], run_statistics: dict | None = None):
+    """Generate summary JSON and confusion matrix plots from CSV results. Each provider's summary
+    also gets its run statistics (see run_statistics.py), without the list of what was blocked by
+    claim, which only run_statistics.json holds."""
     if not csv_path.exists():
         print(f"  CSV file not found: {csv_path}")
         return
@@ -338,7 +407,9 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
 
         total = len(provider_results)
         successful = sum(1 for r in provider_results if r["status"] == "success")
-        errors = total - successful
+        # The model gave no valid answer, e.g. because its response was cut off
+        no_answer = sum(1 for r in provider_results if r["status"] == "no_answer")
+        errors = total - successful - no_answer
 
         y_true = []
         y_pred = []
@@ -372,7 +443,8 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
         if coarsened:
             metrics["coarsened_3class"] = coarsened
 
-        # Compute regression metrics (MSE, MAE)
+        # Compute regression metrics (MSE, MAE): the predicted label's value against the
+        # continuous ground-truth integrity. Only for the 7 bins the model predicts on.
         regression_metrics = compute_regression_metrics(gt_integrity_values, verdict_values, scheme=LABEL_SCHEME_7)
         if regression_metrics:
             metrics["mse"] = regression_metrics["mse"]
@@ -381,17 +453,21 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
         provider_summary = {
             "total_claims": total,
             "successful_runs": successful,
+            "no_answer": no_answer,
             "errors": errors,
             "comparisons_available": len(y_true),
             "metrics": metrics,
         }
         if coarsened:
             provider_summary["metrics_3class"] = coarsened
+        if statistics := (run_statistics or {}).get(provider):
+            blocked = {key: value for key, value in statistics["blocked"].items() if key != "by_claim"}
+            provider_summary["run_statistics"] = {**statistics, "blocked": blocked}
 
         summary["providers"][provider] = provider_summary
 
         print(f"\n=== {provider.upper()} ===")
-        print(f"  Total: {total}, Successful: {successful}, Errors: {errors}")
+        print(f"  Total: {total}, Successful: {successful}, No answer: {no_answer}, Errors: {errors}")
 
         if metrics:
             print_metrics(metrics)
@@ -420,6 +496,70 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
     return summary
 
 
+LEADERBOARD_REASONING_MIN_CHARS = 10
+LEADERBOARD_REASONING_MAX_CHARS = 500
+
+
+def _utf16_length(text: str) -> int:
+    """The length of `text` as JavaScript counts it, in UTF-16 code units, as the leaderboard
+    does: an emoji or other character outside the Basic Multilingual Plane counts twice."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def leaderboard_reasoning(result: dict) -> str:
+    """The reasoning of a verdict for the leaderboard, which takes LEADERBOARD_REASONING_MIN_CHARS
+    to LEADERBOARD_REASONING_MAX_CHARS characters, counted as JavaScript counts them (see
+    _utf16_length): the justification, or, if it is shorter than the minimum (or missing from the
+    answer), the whole final response, which holds the JSON answer and so is longer. Cut off at
+    the maximum, ending in "..."."""
+    reasoning = result["justification"]
+    if _utf16_length(reasoning) < LEADERBOARD_REASONING_MIN_CHARS:
+        reasoning = result["reasoning"]
+    if _utf16_length(reasoning) > LEADERBOARD_REASONING_MAX_CHARS:
+        # Cut between code units; a character cut in half (a lone surrogate) is dropped
+        units = reasoning.encode("utf-16-le")[:2 * (LEADERBOARD_REASONING_MAX_CHARS - 3)]
+        reasoning = units.decode("utf-16-le", errors="ignore") + "..."
+    return reasoning
+
+
+def write_leaderboard_results(jsonl_path: Path, output_dir: Path, providers: list[str]):
+    """Write each provider's verdicts in the leaderboard's format: a JSON list of
+    {"claim_id", "verdict", "reasoning"}, sorted by claim ID. The verdict is the label's value
+    (1 = Intact (certain) to -1 = Compromised (certain)), rounded to 2 decimals, the reasoning
+    is the justification, within the leaderboard's limits (see leaderboard_reasoning). Claims
+    that failed with an error have no verdict and are left out.
+
+    With one provider, the file is results_for_leaderboard.json, otherwise
+    results_for_leaderboard_<provider>.json.
+    """
+    if not jsonl_path.exists():
+        return
+
+    entries = {provider: [] for provider in providers}
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            record = json.loads(line)
+            if record["provider"] not in entries or record["status"] != "success":
+                continue
+            result = record["result"]
+            value = round(LABEL_SCHEME_7.verdict_to_numeric[result["verdict"]], 2)
+            entries[record["provider"]].append({
+                "claim_id": record["claim_id"],
+                "verdict": int(value) if value.is_integer() else value,
+                "reasoning": leaderboard_reasoning(result),
+            })
+
+    for provider, provider_entries in entries.items():
+        if not provider_entries:
+            continue
+        provider_entries.sort(key=lambda e: e["claim_id"])
+        name = "results_for_leaderboard.json" if len(providers) == 1 else f"results_for_leaderboard_{provider}.json"
+        path = output_dir / name
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[\n" + ",\n".join("  " + json.dumps(e, ensure_ascii=False) for e in provider_entries) + "\n]\n")
+        print(f"Leaderboard results saved to: {path}")
+
+
 def _metric_support(metrics: dict) -> int | None:
     if not metrics:
         return None
@@ -435,38 +575,6 @@ def _fmt_metric(value) -> str:
     if isinstance(value, float):
         return f"{value:.4f}"
     return str(value)
-
-
-def _compute_mse_mae_from_confusion(metrics: dict, label_to_numeric: dict[str, float]) -> tuple[float | None, float | None]:
-    """Compute MSE/MAE from a confusion matrix using label->numeric mapping."""
-    cm = (metrics or {}).get("confusion_matrix", {})
-    labels = cm.get("labels") if isinstance(cm, dict) else None
-    matrix = cm.get("matrix") if isinstance(cm, dict) else None
-    if not labels or not matrix:
-        return None, None
-
-    total = 0
-    sse = 0.0
-    sae = 0.0
-    for i, gt_label in enumerate(labels):
-        gt_val = label_to_numeric.get(gt_label)
-        if gt_val is None:
-            continue
-        for j, pred_label in enumerate(labels):
-            pred_val = label_to_numeric.get(pred_label)
-            if pred_val is None:
-                continue
-            count = matrix[i][j]
-            if not count:
-                continue
-            diff = gt_val - pred_val
-            sse += count * (diff ** 2)
-            sae += count * abs(diff)
-            total += count
-
-    if total == 0:
-        return None, None
-    return round(sse / total, 4), round(sae / total, 4)
 
 
 def write_property_metrics_table(
@@ -500,22 +608,20 @@ def write_property_metrics_table(
         property_name: str,
         binning: str,
         metrics: dict,
-        label_to_numeric: dict[str, float],
     ):
         if not metrics:
             return
         if property_name not in provider_data:
             provider_data[property_name] = {}
-        entry = {
+        provider_data[property_name][binning] = {
             "accuracy": metrics.get("accuracy"),
             "macro_f1": metrics.get("macro_f1"),
             "weighted_f1": metrics.get("weighted_f1"),
             "support": _metric_support(metrics),
+            # Against the continuous ground-truth integrity (see generate_summary_from_csv)
+            "mse": metrics.get("mse"),
+            "mae": metrics.get("mae"),
         }
-        mse, mae = _compute_mse_mae_from_confusion(metrics, label_to_numeric)
-        entry["mse"] = mse
-        entry["mae"] = mae
-        provider_data[property_name][binning] = entry
 
     for provider in providers:
         provider_data: dict[str, dict[str, dict]] = {}
@@ -523,21 +629,9 @@ def write_property_metrics_table(
 
         integrity_provider = ((integrity_summary or {}).get("providers") or {}).get(provider, {})
         integrity_metrics = integrity_provider.get("metrics", {})
-        add_metrics_block(
-            provider_data,
-            "integrity",
-            "7-bin",
-            integrity_metrics,
-            LABEL_SCHEME_7.verdict_to_numeric,
-        )
+        add_metrics_block(provider_data, "integrity", "7-bin", integrity_metrics)
         integrity_3 = integrity_provider.get("metrics_3class") or integrity_metrics.get("coarsened_3class")
-        add_metrics_block(
-            provider_data,
-            "integrity",
-            "3-bin",
-            integrity_3,
-            LABEL_SCHEME_3.verdict_to_numeric,
-        )
+        add_metrics_block(provider_data, "integrity", "3-bin", integrity_3)
 
     if not any(provider_tables.values()):
         return
@@ -681,6 +775,39 @@ def load_dataset(dataset_path: Path) -> dict:
         return json.load(f)
 
 
+def add_review_info(claims: list[dict], lookup=None) -> list[dict]:
+    """The claims with what their fact-check needs to know of their reviews (fact-checks), which
+    the tools block:
+        review_urls        the URLs of the reviews ("review_url" if the dataset gives no list)
+        review_date        the day the first of them was published, from the dataset or else from
+                           the database: web_search only returns content published before it.
+                           None if neither has it, and web_search falls back to the claim date
+        fact_check_scopes  the hosts, or hosts and paths, under which the reviews' publishers
+                           publish fact-checks, from the database (blocked along with the
+                           signatories', see signatory_scopes)
+    `lookup` looks the reviews up by their URLs, by default in the database (see lookup_reviews)."""
+    urls = {claim["id"]: claim.get("review_urls") or ([claim["review_url"]] if claim.get("review_url") else [])
+            for claim in claims}
+    reviews = (lookup or lookup_reviews)([url for claim_urls in urls.values() for url in claim_urls])
+
+    enriched = []
+    for claim in claims:
+        found = [reviews[url] for url in urls[claim["id"]] if url in reviews]
+        dates = [review.published for review in found if review.published]
+        enriched.append({
+            **claim,
+            "review_urls": urls[claim["id"]],
+            "review_date": claim.get("review_date") or (min(dates).isoformat() if dates else None),
+            "fact_check_scopes": sorted({scope for review in found for scope in review.fact_check_scopes}),
+        })
+    with_urls = [claim for claim in enriched if claim["review_urls"]]
+    print(f"Reviews: {sum(any(url in reviews for url in claim['review_urls']) for claim in with_urls)} of "
+          f"{len(with_urls)} claims with review URLs found in the database, "
+          f"{sum(bool(claim['fact_check_scopes']) for claim in enriched)} with fact-check scopes, "
+          f"{sum(not claim['review_date'] for claim in enriched)} without review date (searched before the claim date)")
+    return enriched
+
+
 def process_single_claim(
     claim: dict,
     idx: int,
@@ -690,6 +817,7 @@ def process_single_claim(
     dataset_dir: Path,
     csv_path: Path,
     jsonl_path: Path,
+    blocked_scopes: list[str],
 ) -> dict:
     """Process a single claim and return results."""
     claim_id = claim["id"]
@@ -706,18 +834,21 @@ def process_single_claim(
     }
 
     print(f"\n[{idx + 1}/{total}] [{provider}] Claim ID: {claim_id}")
-    print(f"  Text: {claim_text[:80]}..." if len(claim_text) > 80 else f"  Text: {claim_text}")
+    # Claims run in parallel, so every line names its claim
+    tag = f"[{claim_id}]"
+    print(f"  {tag} Text: {claim_text[:80]}..." if len(claim_text) > 80 else f"  {tag} Text: {claim_text}")
 
     # New format: media is directly in claim["media"] array with file_path
     media_items = claim.get("media", [])
     media_refs = media_items  # Keep reference for CSV record
     image_paths = []
     video_paths = []
+    started = time.monotonic()
 
     try:
         # Resolve media files if present
         if media_items:
-            print(f"  Found {len(media_items)} media item(s)")
+            print(f"  {tag} Found {len(media_items)} media item(s)")
             for item in media_items:
                 file_path = item.get("file_path")
                 if file_path:
@@ -728,10 +859,10 @@ def process_single_claim(
                         elif item.get("type") == "video":
                             video_paths.append(str(full_path))
                     else:
-                        print(f"    Warning: Media file not found: {full_path}")
+                        print(f"    {tag} Warning: Media file not found: {full_path}")
 
             if provider == "gemini" and video_paths:
-                print(f"  Using native video processing for Gemini")
+                print(f"  {tag} Using native video processing for Gemini")
 
         result = fc.check_claim(
             claim_text,
@@ -739,17 +870,31 @@ def process_single_claim(
             video_paths=video_paths if video_paths else None,
             claim_date=claim_date,
             provider=provider,
+            claim_id=claim_id,
+            # The claim's own fact-checks, the other fact-checks of their publishers and those of
+            # all IFCN signatories and EFCSN members would give the answer away; web_search only
+            # shows what was published before the first review
+            blocked_urls=claim.get("review_urls"),
+            cutoff_date=claim.get("review_date"),
+            blocked_scopes=[*blocked_scopes, *claim.get("fact_check_scopes", [])],
         )
 
         status = "success"
         error_message = None
-        print(f"  -> Verdict: {result.verdict}")
+        print(f"  {tag} -> Verdict: {result.verdict}")
 
+    except FactCheckError as e:
+        # Keep what the fact-check got to: its trace, URLs and usage
+        print(f"  {tag} -> {e.status.upper()}: {str(e)}")
+        result = e.result
+        status = e.status
+        error_message = str(e)
     except Exception as e:
-        print(f"  -> ERROR: {str(e)}")
+        print(f"  {tag} -> ERROR: {str(e)}")
         result = None
         status = "error"
         error_message = str(e)
+    duration = time.monotonic() - started
 
     # Build CSV record
     csv_record = build_csv_record(
@@ -769,13 +914,18 @@ def process_single_claim(
         "claim_text": claim_text,
         "claim_text_clean": claim_text,  # In new format, text is already clean
         "claim_date": claim_date,
+        "review_date": claim.get("review_date"),
+        "fact_check_scopes": claim.get("fact_check_scopes"),
         "num_images": len(image_paths),
         "num_videos": len(video_paths),
         "ground_truth": ground_truth,
         "provider": provider,
         "result": result.to_dict() if result else None,
         "status": status,
-        "error_message": error_message
+        "error_message": error_message,
+        # Wall-clock time of the fact-check, retries included; claims run in parallel and share
+        # the scrapeMM server and the APIs' rate limits
+        "duration_seconds": round(duration, 1),
     }
 
     # Thread-safe file writes
@@ -798,14 +948,17 @@ def run_benchmark(
     scrape_methods: list[str] | str | None = "auto",
     max_searches: int = DEFAULT_MAX_SEARCHES,
     max_fetches: int = DEFAULT_MAX_FETCHES,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    media_limits: MediaLimits = MediaLimits(),
+    openrouter_host: str | None = None,
 ):
     """
     Run the fact-checking baseline on VeriTaS claims.
 
     Args:
         dataset_path: Path to claims.json
-        output_dir: Directory to save results (auto-generated if None)
-        resume_dir: Directory of previous run to resume from
+        output_dir: Directory to save results (auto-generated if None). Must not contain results yet.
+        resume_dir: Directory of previous run to resume from. Its failed claims are retried.
         providers: List of providers to use (default: openai, gemini, anthropic)
         models: Dict mapping provider names to model identifiers
         limit: Maximum number of claims to process (None = all)
@@ -814,6 +967,10 @@ def run_benchmark(
                     integrations/browser/firecrawl/decodo, or "auto"). Default "auto".
         max_searches: Maximum number of web_search calls per claim.
         max_fetches: Maximum number of fetch_url calls per claim.
+        reasoning_effort: How much the models reason, passed to each API's effort setting.
+        media_limits: Which images and videos the models get, and in what form.
+        openrouter_host: The endpoint OpenRouter sends every request to, e.g. "deepinfra/fp8".
+                         Required for openrouter.
     """
     # Default providers
     if providers is None:
@@ -827,6 +984,8 @@ def run_benchmark(
     if resume_dir:
         output_dir = Path(resume_dir)
         print(f"Resuming from: {output_dir}")
+    elif output_dir:
+        output_dir = Path(output_dir)
     else:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         # Build model name for directory
@@ -836,12 +995,23 @@ def run_benchmark(
             model_name = "+".join(providers)
         output_dir = Path(__file__).parent.parent / "results" / f"{model_name}_{timestamp}"
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     # File paths
     csv_path = output_dir / "results.csv"
     jsonl_path = output_dir / "results_detailed.jsonl"
     config_path = output_dir / "run_config.json"
+
+    if not resume_dir and csv_path.exists():
+        raise ValueError(f"{output_dir} already contains results. Pass it as --resume to continue that run.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Retry the claims that failed before
+    if resume_dir:
+        n_failed = prepare_resume(csv_path, jsonl_path, providers)
+        if n_failed:
+            print(f"Retrying {n_failed} failed claim(s)")
+
+    blocked_scopes = signatory_scopes()
+    print(f"Fact-check scopes of IFCN signatories and EFCSN members blocked: {len(blocked_scopes)}")
 
     # Save run configuration immediately so it exists even if the run crashes
     started_at = datetime.now().isoformat()
@@ -856,6 +1026,12 @@ def run_benchmark(
         "max_searches": max_searches,
         "max_fetches": max_fetches,
         "max_fetch_chars": MAX_FETCH_CHARS,
+        "max_search_pages": MAX_SEARCH_PAGES,
+        "media_limits": asdict(media_limits),
+        "reasoning_effort": reasoning_effort,
+        "openrouter_host": openrouter_host,
+        "search_cutoff": "review_date",
+        "signatory_scopes": blocked_scopes,
         "resumed_from": str(resume_dir) if resume_dir else None,
         "started_at": started_at,
         "finished_at": None,
@@ -868,67 +1044,64 @@ def run_benchmark(
     data = load_dataset(dataset_path)
     all_claims = data["claims"]
     print(f"Total claims in dataset: {len(all_claims)}")
+    all_claims = add_review_info(all_claims)
 
     # Initialize fact-checker with all requested providers
     print(f"\nInitializing providers: {', '.join(providers)}")
     print(f"scrapeMM methods for fetch_url: {scrape_methods}")
     print(f"Tool limits per claim: {max_searches} web_search, {max_fetches} fetch_url "
           f"(max {MAX_FETCH_CHARS:,} chars each)")
+    print(f"Media limits: {media_limits}")
+    print(f"Reasoning effort: {reasoning_effort}")
+    if openrouter_host:
+        print(f"OpenRouter host: {openrouter_host}")
     fc = UnifiedFactChecker(
         providers=providers,
         models=models,
         scrape_methods=scrape_methods,
         max_searches=max_searches,
         max_fetches=max_fetches,
+        reasoning_effort=reasoning_effort,
+        media_limits=media_limits,
+        openrouter_host=openrouter_host,
     )
 
-    # Process each provider
-    for provider in providers:
-        print(f"\n{'='*60}")
-        print(f"Processing with {provider.upper()}")
-        print(f"{'='*60}")
+    # The fetched pages' media go to a temporary store on local disk, deleted claim by claim
+    with temporary_media_store() as media_store:
+        print(f"Media of fetched pages: {media_store} (temporary, deleted after each claim)")
 
-        # Load already processed claim IDs for this provider
-        processed_ids = set()
-        if resume_dir and csv_path.exists():
-            processed_ids = load_processed_claim_ids(csv_path, provider)
-            print(f"Already processed: {len(processed_ids)} claims")
-        elif not csv_path.exists():
-            init_csv(csv_path)
+        # Process each provider
+        for provider in providers:
+            print(f"\n{'='*60}")
+            print(f"Processing with {provider.upper()}")
+            print(f"{'='*60}")
 
-        # Filter out already processed claims
-        claims_to_process = [c for c in all_claims if c["id"] not in processed_ids]
-        print(f"Claims remaining: {len(claims_to_process)}")
+            # Load already processed claim IDs for this provider
+            processed_ids = set()
+            if resume_dir and csv_path.exists():
+                processed_ids = load_processed_claim_ids(csv_path, provider)
+                print(f"Already processed: {len(processed_ids)} claims")
+            elif not csv_path.exists():
+                init_csv(csv_path)
 
-        # Apply limit
-        if limit is not None:
-            claims_to_process = claims_to_process[:limit]
-        print(f"Claims to process this run: {len(claims_to_process)}")
+            # Filter out already processed claims
+            claims_to_process = [c for c in all_claims if c["id"] not in processed_ids]
+            print(f"Claims remaining: {len(claims_to_process)}")
 
-        if not claims_to_process:
-            print("No claims to process for this provider.")
-            continue
+            # Apply limit
+            if limit is not None:
+                claims_to_process = claims_to_process[:limit]
+            print(f"Claims to process this run: {len(claims_to_process)}")
 
-        total = len(claims_to_process)
+            if not claims_to_process:
+                print("No claims to process for this provider.")
+                continue
 
-        if num_workers == 1:
-            for idx, claim in enumerate(claims_to_process):
-                process_single_claim(
-                    claim=claim,
-                    idx=idx,
-                    total=total,
-                    fc=fc,
-                    provider=provider,
-                    dataset_dir=dataset_dir,
-                    csv_path=csv_path,
-                    jsonl_path=jsonl_path,
-                )
-        else:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {}
+            total = len(claims_to_process)
+
+            if num_workers == 1:
                 for idx, claim in enumerate(claims_to_process):
-                    future = executor.submit(
-                        process_single_claim,
+                    process_single_claim(
                         claim=claim,
                         idx=idx,
                         total=total,
@@ -937,15 +1110,33 @@ def run_benchmark(
                         dataset_dir=dataset_dir,
                         csv_path=csv_path,
                         jsonl_path=jsonl_path,
+                        blocked_scopes=blocked_scopes,
                     )
-                    futures[future] = claim["id"]
+            else:
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {}
+                    for idx, claim in enumerate(claims_to_process):
+                        future = executor.submit(
+                            process_single_claim,
+                            claim=claim,
+                            idx=idx,
+                            total=total,
+                            fc=fc,
+                            provider=provider,
+                            dataset_dir=dataset_dir,
+                            csv_path=csv_path,
+                            jsonl_path=jsonl_path,
+                            blocked_scopes=blocked_scopes,
+                        )
+                        futures[future] = claim["id"]
 
-                for future in as_completed(futures):
-                    claim_id = futures[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"  Claim {claim_id} failed: {e}")
+                    for future in as_completed(futures):
+                        claim_id = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            print(f"  Claim {claim_id} failed: {e}")
+
 
     # Update run configuration with post-run fields
     run_config["total_claims"] = len(all_claims)
@@ -957,15 +1148,19 @@ def run_benchmark(
     print("Processing complete!")
     print(f"Results directory: {output_dir}")
 
-    integrity_summary = generate_summary_from_csv(csv_path, output_dir, providers)
+    run_statistics = write_run_statistics(jsonl_path, output_dir)
+    integrity_summary = generate_summary_from_csv(csv_path, output_dir, providers, run_statistics)
     write_property_metrics_table(
         output_dir=output_dir,
         providers=providers,
         integrity_summary=integrity_summary,
     )
+    write_leaderboard_results(jsonl_path, output_dir, providers)
+    write_fact_check_exposure(jsonl_path, all_claims, output_dir)
 
 
-if __name__ == "__main__":
+def main():
+    """Run the benchmark with the command line's options."""
     parser = argparse.ArgumentParser(
         description="Run the fact-checking baseline on the VeriTaS dataset",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -992,12 +1187,13 @@ Examples:
     )
     parser.add_argument("--dataset", required=True,
                         help="Path to claims.json")
-    parser.add_argument("--output", default=None,
-                        help="Output directory (auto-generated if not specified)")
-    parser.add_argument("--resume", default=None,
-                        help="Resume from previous run directory")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument("--output", default=None,
+                              help="Output directory (auto-generated if not specified)")
+    output_group.add_argument("--resume", default=None,
+                              help="Resume from previous run directory, retrying its failed claims")
     parser.add_argument("--provider", default=None,
-                        help="Single provider to use (openai, gemini, anthropic, selfhosted)")
+                        help="Single provider to use (openai, gemini, anthropic, selfhosted, openrouter)")
     parser.add_argument("--providers", nargs="+", default=None,
                         help="Multiple providers to use")
     parser.add_argument("--model", default=None,
@@ -1015,6 +1211,25 @@ Examples:
              "integrations/browser/firecrawl/decodo, or 'auto' (used alone) to let "
              "the scrapeMM server pick per domain. Default: auto.",
     )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["minimal", "low", "medium", "high", "xhigh", "max"],
+        default=DEFAULT_REASONING_EFFORT,
+        help="How much the model reasons, passed to the API's effort setting (OpenAI: reasoning.effort, "
+             "Anthropic: output_config.effort, Gemini: thinking_level, vLLM: reasoning_effort, "
+             "OpenRouter: reasoning.effort). Which values a model takes depends on its vendor. "
+             f"Default: {DEFAULT_REASONING_EFFORT}.",
+    )
+    parser.add_argument(
+        "--openrouter-host",
+        default=None,
+        help="The endpoint OpenRouter sends every request to, as its tag in "
+             "https://openrouter.ai/api/v1/models/<model>/endpoints, e.g. deepinfra/fp8. Required for openrouter.",
+    )
+    media_group = parser.add_argument_group("media limits", "Which images and videos the models get, and in what form")
+    for limit in fields(MediaLimits):
+        media_group.add_argument(f"--{limit.name.replace('_', '-')}", type=type(limit.default), default=limit.default,
+                                 help=f"{limit.metadata['help']}. Default: {limit.default}.")
     args = parser.parse_args()
 
     # Determine providers
@@ -1039,4 +1254,11 @@ Examples:
         limit=args.limit,
         num_workers=args.workers,
         scrape_methods=args.scrapemm_methods,
+        reasoning_effort=args.reasoning_effort,
+        media_limits=MediaLimits(**{limit.name: getattr(args, limit.name) for limit in fields(MediaLimits)}),
+        openrouter_host=args.openrouter_host,
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -3,35 +3,33 @@
 from datetime import datetime
 from typing import Literal
 
+from .common.media import MediaLimits
 from .common.tools import DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
 from .common.types import FactCheckResult
 from .providers import (
     BaseFactChecker,
+    DEFAULT_REASONING_EFFORT,
     OpenAIFactChecker,
     GeminiFactChecker,
     AnthropicFactChecker,
     SelfhostedFactChecker,
+    OpenRouterFactChecker,
 )
-from .providers.base import extract_justification
 
 
-Provider = Literal["openai", "gemini", "anthropic", "selfhosted"]
-
-# Default models for each provider
-DEFAULT_MODELS = {
-    "openai": "gpt-5.2",
-    "gemini": "gemini-2.5-flash",
-    "anthropic": "claude-sonnet-4-6",
-    "selfhosted": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-}
+Provider = Literal["openai", "gemini", "anthropic", "selfhosted", "openrouter"]
 
 # Provider class mapping
-PROVIDER_CLASSES = {
+PROVIDER_CLASSES: dict[Provider, type[BaseFactChecker]] = {
     "openai": OpenAIFactChecker,
     "gemini": GeminiFactChecker,
     "anthropic": AnthropicFactChecker,
     "selfhosted": SelfhostedFactChecker,
+    "openrouter": OpenRouterFactChecker,
 }
+
+# Default models for each provider
+DEFAULT_MODELS = {provider: cls.default_model for provider, cls in PROVIDER_CLASSES.items()}
 
 DEFAULT_PROVIDERS: list[Provider] = ["openai", "gemini", "anthropic"]
 
@@ -42,7 +40,8 @@ class UnifiedFactChecker:
 
     Every provider runs the same baseline: the model verifies the claim with the
     web_search tool (results restricted to before the claim date) and the fetch_url
-    tool, and answers on the 7-class label scheme in two steps (DIRECTION + CERTAINTY).
+    tool, and answers with the claim's integrity, its certainty and a justification in JSON,
+    which make a label of the 7-class scheme.
 
     Example usage:
         # Single provider
@@ -51,7 +50,7 @@ class UnifiedFactChecker:
 
         # Multiple providers
         fc = UnifiedFactChecker(providers=["openai", "gemini", "anthropic"])
-        results = fc.check_claim_all_providers("The Earth is flat")
+        result = fc.check_claim("The Earth is flat", claim_date="2024-01-15", provider="openai")
     """
 
     def __init__(
@@ -64,29 +63,40 @@ class UnifiedFactChecker:
         scrape_methods: list[str] | str | None = "auto",
         max_searches: int = DEFAULT_MAX_SEARCHES,
         max_fetches: int = DEFAULT_MAX_FETCHES,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        media_limits: MediaLimits = MediaLimits(),
+        openrouter_host: str | None = None,
     ):
         """
         Initialize the unified fact-checker.
 
         Args:
-            provider: Single provider to use (openai, gemini, anthropic, or selfhosted).
+            provider: Single provider to use (openai, gemini, anthropic, selfhosted, or openrouter).
             providers: List of providers to initialize (for multi-provider mode).
             model: Model to use for single provider mode.
             models: Dict mapping provider names to model identifiers.
             api_keys: Dict mapping provider/service names to API keys.
-                      Keys: "openai", "google", "anthropic", "selfhosted"
+                      Keys: "openai", "google", "anthropic", "selfhosted", "openrouter"
             scrape_methods: Which scrapeMM backends fetch_url uses, in order (subset of
                         integrations/browser/firecrawl/decodo, or "auto"). Default "auto".
             max_searches: Maximum number of web_search calls per claim.
             max_fetches: Maximum number of fetch_url calls per claim.
+            reasoning_effort: How much the models reason, e.g. "low", "medium" or "high",
+                              passed as is to each API's effort setting. Default "medium".
+            media_limits: Which images and videos the models get, and in what form.
+            openrouter_host: The endpoint OpenRouter sends every request to, e.g. "deepinfra/fp8".
+                             Required for openrouter.
 
         Note: Specify either `provider` or `providers`, not both.
         """
         self.api_keys = api_keys or {}
-        self.models = models or {}
+        self.models = dict(models or {})
         self.scrape_methods = scrape_methods
         self.max_searches = max_searches
         self.max_fetches = max_fetches
+        self.reasoning_effort = reasoning_effort
+        self.media_limits = media_limits
+        self.openrouter_host = openrouter_host
         self._checkers: dict[Provider, BaseFactChecker] = {}
 
         # Determine which providers to initialize
@@ -106,29 +116,27 @@ class UnifiedFactChecker:
         for p in providers_to_init:
             self._init_provider(p)
 
-        self._default_provider = providers_to_init[0] if providers_to_init else None
+        self._default_provider = providers_to_init[0]
 
     def _init_provider(self, provider: Provider) -> None:
         """Initialize a single provider."""
         if provider not in PROVIDER_CLASSES:
             raise ValueError(f"Unknown provider: {provider}. Valid options: {list(PROVIDER_CLASSES.keys())}")
 
-        provider_class = PROVIDER_CLASSES[provider]
-        model = self.models.get(provider, DEFAULT_MODELS[provider])
         api_key = self.api_keys.get(provider) or self.api_keys.get(
             {"openai": "openai", "gemini": "google", "anthropic": "anthropic"}.get(provider)
         )
-
-        kwargs = {
-            "model": model,
-            "scrape_methods": self.scrape_methods,
-            "max_searches": self.max_searches,
-            "max_fetches": self.max_fetches,
-        }
-        if api_key:
-            kwargs["api_key"] = api_key
-
-        self._checkers[provider] = provider_class(**kwargs)
+        extra = {"host": self.openrouter_host} if provider == "openrouter" else {}
+        self._checkers[provider] = PROVIDER_CLASSES[provider](
+            **extra,
+            api_key=api_key,
+            model=self.models.get(provider),
+            scrape_methods=self.scrape_methods,
+            max_searches=self.max_searches,
+            max_fetches=self.max_fetches,
+            reasoning_effort=self.reasoning_effort,
+            media_limits=self.media_limits,
+        )
 
     def get_provider(self, provider: Provider | None = None) -> BaseFactChecker:
         """
@@ -148,11 +156,6 @@ class UnifiedFactChecker:
 
         return self._checkers[provider]
 
-    @property
-    def available_providers(self) -> list[Provider]:
-        """Get list of initialized providers."""
-        return list(self._checkers.keys())
-
     def check_claim(
         self,
         claim: str,
@@ -160,6 +163,10 @@ class UnifiedFactChecker:
         video_paths: list[str] | None = None,
         claim_date: str | datetime | None = None,
         provider: Provider | None = None,
+        claim_id: int | str | None = None,
+        blocked_urls: list[str] | None = None,
+        cutoff_date: str | datetime | None = None,
+        blocked_scopes: list[str] | None = None,
     ) -> FactCheckResult:
         """
         Fact-check a claim using a single provider.
@@ -171,114 +178,22 @@ class UnifiedFactChecker:
                          Note: Only Gemini supports native video processing.
                          Other providers will extract frames.
             claim_date: Date of the claim (ISO format string or datetime).
-                        web_search only returns content published before this day.
+                        web_search only returns content published before this day, unless
+                        cutoff_date is given.
             provider: Provider to use. If None, uses the default provider.
+            claim_id: ID of the claim, which tags the log lines of its tool calls and retries.
+            blocked_urls: URLs the tools never show or fetch, e.g. the claim's own fact-check,
+                          which would give the answer away.
+            cutoff_date: web_search only returns content published before this day, e.g. the
+                         day the claim's fact-check was published.
+            blocked_scopes: Hosts, or hosts and paths, whose URLs the tools never show or fetch,
+                            e.g. those under which the fact-check's publisher publishes
+                            fact-checks ("leadstories.com/hoax-alert").
 
         Returns:
             FactCheckResult with verdict, reasoning, citations, etc.
         """
         checker = self.get_provider(provider)
-        result = checker.check_claim(claim, image_paths, video_paths, claim_date)
-        if not result.justification:
-            # `reasoning` holds the raw model response for every provider.
-            result.justification = extract_justification(result.reasoning or "")
-        return result
-
-    def check_claim_all_providers(
-        self,
-        claim: str,
-        image_paths: list[str] | None = None,
-        video_paths: list[str] | None = None,
-        claim_date: str | datetime | None = None,
-    ) -> dict[Provider, FactCheckResult]:
-        """
-        Fact-check a claim using all initialized providers.
-
-        Args:
-            claim: The claim text to verify.
-            image_paths: Optional list of image file paths to include.
-            video_paths: Optional list of video file paths to include.
-            claim_date: Date of the claim (ISO format string or datetime).
-
-        Returns:
-            Dict mapping provider names to FactCheckResults.
-        """
-        results = {}
-        for provider in self._checkers:
-            try:
-                results[provider] = self.check_claim(
-                    claim, image_paths, video_paths, claim_date, provider
-                )
-            except Exception as e:
-                # Store error as result
-                results[provider] = FactCheckResult(
-                    verdict="Unknown",
-                    reasoning=f"Error: {str(e)}",
-                    provider=provider,
-                )
-        return results
-
-    def check_claim_with_consensus(
-        self,
-        claim: str,
-        image_paths: list[str] | None = None,
-        video_paths: list[str] | None = None,
-        claim_date: str | datetime | None = None,
-        min_agreement: int = 2,
-    ) -> tuple[FactCheckResult | None, dict[Provider, FactCheckResult]]:
-        """
-        Fact-check a claim using all providers and determine consensus.
-
-        Args:
-            claim: The claim text to verify.
-            image_paths: Optional list of image file paths to include.
-            video_paths: Optional list of video file paths to include.
-            claim_date: Date of the claim (ISO format string or datetime).
-            min_agreement: Minimum number of providers that must agree
-                          for a consensus verdict.
-
-        Returns:
-            Tuple of (consensus_result, all_results) where consensus_result
-            is None if no consensus was reached.
-        """
-        all_results = self.check_claim_all_providers(claim, image_paths, video_paths, claim_date)
-
-        # Count verdicts
-        verdict_counts: dict[str, int] = {}
-        for result in all_results.values():
-            verdict = result.verdict
-            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
-
-        # Find consensus
-        consensus_verdict = None
-        for verdict, count in verdict_counts.items():
-            if count >= min_agreement:
-                consensus_verdict = verdict
-                break
-
-        if consensus_verdict is None:
-            return None, all_results
-
-        # Build consensus result
-        agreeing_providers = [
-            p for p, r in all_results.items() if r.verdict == consensus_verdict
-        ]
-        combined_citations = []
-        combined_reasoning_parts = []
-
-        for provider in agreeing_providers:
-            result = all_results[provider]
-            combined_reasoning_parts.append(f"[{provider.upper()}]: {result.reasoning}")
-            for citation in result.citations:
-                if citation not in combined_citations:
-                    combined_citations.append(citation)
-
-        consensus_result = FactCheckResult(
-            verdict=consensus_verdict,
-            reasoning="\n\n".join(combined_reasoning_parts),
-            citations=combined_citations,
-            provider=",".join(agreeing_providers),
-            model=",".join(all_results[p].model for p in agreeing_providers),
-        )
-
-        return consensus_result, all_results
+        return checker.check_claim(claim, image_paths, video_paths, claim_date, claim_id=claim_id,
+                                   blocked_urls=blocked_urls, cutoff_date=cutoff_date,
+                                   blocked_scopes=blocked_scopes)
