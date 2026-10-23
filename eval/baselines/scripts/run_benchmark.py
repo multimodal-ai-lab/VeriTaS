@@ -385,7 +385,8 @@ def plot_cross_confusion_matrix(metrics_7bin: dict, output_path: Path, provider:
 def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[str], run_statistics: dict | None = None):
     """Generate summary JSON and confusion matrix plots from CSV results. Each provider's summary
     also gets its run statistics (see run_statistics.py), without the list of what was blocked by
-    claim, which only run_statistics.json holds."""
+    claim, which only run_statistics.json holds. The summary ends with every URL the tools blocked,
+    by provider, sorted, each with the rule that first blocked it (`blocked_urls`)."""
     if not csv_path.exists():
         print(f"  CSV file not found: {csv_path}")
         return
@@ -486,6 +487,15 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
                     output_dir / f"confusion_matrix_{provider}_3bin_vs_7bin.png",
                     provider,
                 )
+
+    summary["blocked_urls"] = {}
+    for provider in summary["providers"]:
+        by_claim = (run_statistics or {}).get(provider, {}).get("blocked", {}).get("by_claim", {})
+        rules = {}
+        for entries in by_claim.values():
+            for entry in entries:
+                rules.setdefault(entry["url"], entry["rule"])
+        summary["blocked_urls"][provider] = dict(sorted(rules.items()))
 
     # Save summary
     summary_path = output_dir / "summary.json"

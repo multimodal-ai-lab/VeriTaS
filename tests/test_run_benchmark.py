@@ -110,6 +110,33 @@ def test_output_dir_is_used_and_resume_retries_failed_claims(dataset, tmp_path, 
     assert "by_claim" not in statistics["blocked"] and "web_search_results" in statistics["blocked"]
 
 
+def test_the_summary_ends_with_every_blocked_url(tmp_path):
+    csv_path = tmp_path / "results.csv"
+    rb.init_csv(csv_path)
+    result = rb.FactCheckResult(verdict="Intact (certain)", reasoning="", provider="openai")
+    rb.append_to_csv(csv_path, rb.build_csv_record(1, "claim A", [], {"integrity": 1.0}, result, "openai", "success"))
+    scope = "a URL in the fact-check scope fullfact.org"
+    preview = "whose title or snippet shows fullfact.org/x, a URL in the fact-check scope fullfact.org"
+    by_claim = {
+        "1": [{"tool": "web_search", "query": "q", "url": "https://fullfact.org/x", "rule": scope},
+              {"tool": "fetch_url", "url": "https://example.org/fact-check", "rule": "a URL with the slug ..."}],
+        "2": [{"tool": "web_search", "query": "q", "url": "https://www.instagram.com/p/1/", "rule": preview},
+              {"tool": "web_search", "query": "q2", "url": "https://fullfact.org/x", "rule": scope}],
+    }
+    statistics = {"openai": {"blocked": {"claims": 2, "web_search_results": 3, "fetch_url": 1, "by_claim": by_claim}}}
+
+    rb.generate_summary_from_csv(csv_path, tmp_path, ["openai"], statistics)
+
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert list(summary) == ["providers", "blocked_urls"]
+    assert summary["blocked_urls"] == {"openai": {
+        "https://example.org/fact-check": "a URL with the slug ...",
+        "https://fullfact.org/x": scope,
+        "https://www.instagram.com/p/1/": preview,
+    }}
+    assert list(summary["blocked_urls"]["openai"]) == sorted(summary["blocked_urls"]["openai"])
+
+
 def test_a_failed_claim_keeps_its_trace_and_urls_and_no_answer_is_counted_apart(dataset, tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
     monkeypatch.setattr(FakeFactChecker, "no_answer", {"claim B"})

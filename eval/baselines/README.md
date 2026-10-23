@@ -374,7 +374,7 @@ Results are saved to `results/<model>_YYYY-MM-DD_HH-MM/`:
 results/gpt-5.2_2024-12-22_14-30/
 ├── results.csv                 # Per-claim results (incl. justification and evidence URLs as JSON arrays)
 ├── results_detailed.jsonl      # Full details with the final response, evidence URLs and the full trace
-├── summary.json                # Metrics (accuracy, F1, MSE/MAE, confusion matrix), 7-bin and coarsened 3-bin, and the run statistics
+├── summary.json                # Metrics (accuracy, F1, MSE/MAE, confusion matrix), 7-bin and coarsened 3-bin, the run statistics, and at the end every blocked URL
 ├── confusion_matrix_*.png      # 7-bin, coarsened 3-bin and 3-bin-vs-7-bin plots per provider
 ├── property_metrics_table.*    # Integrity metrics table (md/csv/pdf)
 ├── results_for_leaderboard.json  # Verdicts and justifications for the leaderboard
@@ -423,7 +423,7 @@ others). Runs from before 2026-10-21 recorded no cache tokens. Under `blocked`, 
 dropped and every `fetch_url` call they refused, with the rule that blocked it
 (`{"tool": "web_search", "query": ..., "url": ..., "rule": "a URL in the fact-check scope fullfact.org"}`). Each
 claim's line of `results_detailed.jsonl` holds the same list (`result.blocked`) and its `duration_seconds`; runs from
-before 2026-10-23 recorded neither. It is also written at the end of every run, and `summary.json` has the same statistics per provider (`run_statistics`), but for the list of what was blocked by claim. For the results of an earlier run:
+before 2026-10-23 recorded neither. It is also written at the end of every run, and `summary.json` has the same statistics per provider (`run_statistics`), but for the list of what was blocked by claim. Instead, `summary.json` ends with every URL the tools blocked, by provider, once each and sorted, with the rule that first blocked it (`blocked_urls`: `{"gemini": {"https://fullfact.org/…": "a URL in the fact-check scope fullfact.org", …}}`). For the results of an earlier run:
 `python eval/baselines/scripts/run_statistics.py <results dir>`.
 
 MSE and MAE compare the predicted label's value (-1, -2/3, ..., 1) with the claim's continuous
