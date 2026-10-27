@@ -240,6 +240,22 @@ def test_the_claim_media_follow_its_text_frames_without_native_video(monkeypatch
     assert before.endswith('"claim <video:1>') and isinstance(video, ezmm.Video)
 
 
+def test_the_tools_know_the_images_the_claim_takes_in_every_request(monkeypatch, tmp_path, ezmm_registry):
+    """They count toward the cap on images per request: its images, and its videos' frames
+    for models without native video."""
+    image_path = _png(tmp_path / "photo.png")
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"mp4")
+    monkeypatch.setattr(base, "extract_video_frames", lambda path, n, max_side: [Image("image/jpeg", b"frame")] * n)
+    sessions = []
+    monkeypatch.setattr(base.ToolSession, "close", lambda session: sessions.append(session))
+
+    for native_video in (False, True):
+        checker = ScriptedFactChecker([FINAL], native_video=native_video, media_limits=MediaLimits(video_frames=3))
+        checker.check_claim("claim", image_paths=[image_path], video_paths=[str(video_path)], claim_date="2024-02-05")
+    assert [session.claim_images for session in sessions] == [4, 1]
+
+
 def test_claim_images_are_scaled_down_only_when_too_large(tmp_path, ezmm_registry):
     small = ezmm.Image(file_path=_png(tmp_path / "small.png", size=(2000, 1000)))
     large = ezmm.Image(file_path=_png(tmp_path / "large.png", color="blue", size=(3000, 1500)))

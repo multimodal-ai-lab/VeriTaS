@@ -1238,7 +1238,8 @@ Examples:
     )
     media_group = parser.add_argument_group("media limits", "Which images and videos the models get, and in what form")
     for limit in fields(MediaLimits):
-        media_group.add_argument(f"--{limit.name.replace('_', '-')}", type=type(limit.default), default=limit.default,
+        media_group.add_argument(f"--{limit.name.replace('_', '-')}", default=limit.default,
+                                 type=int if limit.default is None else type(limit.default),
                                  help=f"{limit.metadata['help']}. Default: {limit.default}.")
     args = parser.parse_args()
 

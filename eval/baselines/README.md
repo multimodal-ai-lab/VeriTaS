@@ -127,6 +127,7 @@ and the providers as `media_limits`, and options of `run_benchmark.py`:
 | `--page-videos` | 2 | Videos shown per fetched page, the first ones in page order |
 | `--total-images` | 40 | Images of fetched pages shown in a whole fact-check |
 | `--total-videos` | 4 | Videos of fetched pages shown in a whole fact-check |
+| `--request-images` | none | Images in one request at most, the claim's included and a video counting as `--video-frames` images: page images and videos beyond them are not shown. For hosts that take fewer than the limits above add up to, e.g. 64 on OpenRouter's Near AI |
 | `--video-frames` | 5 | Frames per video for models without native video (all but Gemini) |
 | `--native-video-seconds` | 120 | Page videos longer than this reach models with native video as frames too. The claim's videos are always native |
 | `--page-image-side` | 1024 | Longest side, in pixels, of the page images and of the frames of page videos |

@@ -224,6 +224,8 @@ class BaseFactChecker(ABC):
             claim_id=claim_id,
             cutoff_date=cutoff_date,
             blocked_scopes=blocked_scopes or (),
+            claim_images=len(image_paths or [])
+                         + (0 if self.native_video else self.media_limits.video_frames * len(video_paths or [])),
         )
 
         media = ([ezmm.Image(file_path=path) for path in image_paths or []]

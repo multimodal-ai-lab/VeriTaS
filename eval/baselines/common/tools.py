@@ -433,6 +433,7 @@ class ToolSession:
         claim_id: int | str | None = None,
         cutoff_date: str | datetime | date | None = None,
         blocked_scopes: Iterable[str] = (),
+        claim_images: int = 0,
     ):
         """
         Args:
@@ -464,6 +465,9 @@ class ToolSession:
                             and fragment, are blocked: search results that are or show them are
                             dropped, fetch_url refuses them and fetched pages lose their links.
                             The rest of the sites is not blocked.
+            claim_images: The images the claim's media take in every request (its images, and
+                          the frames of its videos for models without native video), which
+                          count toward media_limits.request_images.
         """
         self.log_prefix = f"[{claim_id}] " if claim_id is not None else ""
         self.claim_day = parse_claim_day(claim_date)
@@ -475,6 +479,7 @@ class ToolSession:
         self.max_fetches = max_fetches
         self.max_fetch_chars = max_fetch_chars
         self.media_limits = media_limits
+        self.claim_images = claim_images
         # Host -> the paths at and under which all is blocked ("" for all of the host), each with
         # the rule that blocks it, for the log (see blocked_by)
         self.blocked_scopes: dict[str, dict[str, str]] = {}
@@ -760,8 +765,8 @@ class ToolSession:
     def _page_content(self, sequence: Iterable) -> tuple[list, list[dict], int]:
         """A fetched page's content as the model sees it, in page order: its text, cut at
         max_fetch_chars characters (an image or video counts as long as its reference), with its
-        images and videos in their places, as far as the media limits per page and per
-        fact-check allow. A note takes the place of the media beyond these, of media shown
+        images and videos in their places, as far as the media limits per page, per fact-check
+        and per request allow. A note takes the place of the media beyond these, of media shown
         before (on this page or an earlier one) and of images that can't be read.
 
         Returns the parts (text and ezMM items), the media shown (for the trace) and the
@@ -770,6 +775,8 @@ class ToolSession:
         limits = self.media_limits
         page_limits = {"image": limits.page_images, "video": limits.page_videos}
         total_limits = {"image": limits.total_images, "video": limits.total_videos}
+        # The images each takes in a request (a video's frames: a bound for models with native video)
+        request_images = {"image": 1, "video": limits.video_frames}
         parts, media = [], []
         n_chars = sum(len(part) if isinstance(part, str) else len(part.reference) for part in sequence)
         budget = self.max_fetch_chars
@@ -789,7 +796,10 @@ class ToolSession:
                 parts.append(f"[the {part.kind} shown above again]")
             elif (part.kind not in page_limits
                   or sum(m["kind"] == part.kind for m in media) >= page_limits[part.kind]
-                  or sum(m["kind"] == part.kind for m in shown) >= total_limits[part.kind]):
+                  or sum(m["kind"] == part.kind for m in shown) >= total_limits[part.kind]
+                  or (limits.request_images is not None
+                      and self.claim_images + sum(request_images[m["kind"]] for m in shown) + request_images[part.kind]
+                      > limits.request_images)):
                 parts.append(f"[{part.kind} not shown]")
             elif part.kind == "image" and not is_readable_image(part.file_path, limits.page_image_side):
                 parts.append("[image in a format that cannot be shown]")

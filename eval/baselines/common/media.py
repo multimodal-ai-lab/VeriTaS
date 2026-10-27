@@ -38,6 +38,11 @@ class MediaLimits:
         "help": "Images of fetched pages shown in a whole fact-check"})
     total_videos: int = field(default=4, metadata={
         "help": "Videos of fetched pages shown in a whole fact-check"})
+    request_images: int | None = field(default=None, metadata={
+        "help": "Images in one request at most, the claim's included and a video counting as "
+                "video_frames images: page images and videos beyond them are not shown. For hosts "
+                "that take fewer than the limits above add up to, e.g. 64 on OpenRouter's Near AI "
+                "(None: no cap)"})
     video_frames: int = field(default=10, metadata={
         "help": "Frames per video for models without native video (all but Gemini)"})
     native_video_seconds: float = field(default=120.0, metadata={

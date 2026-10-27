@@ -593,6 +593,24 @@ def test_fetch_url_limits_the_media_of_the_whole_fact_check(monkeypatch, tmp_pat
     assert [m["reference"] for m in session.shown_media] == [red.reference, green.reference]
 
 
+def test_fetch_url_keeps_each_request_within_its_image_cap(monkeypatch, tmp_path, ezmm_registry):
+    """Some hosts take fewer images per request than the other limits add up to, e.g. 64 on
+    OpenRouter's Near AI. The claim's images count, and a video counts as its frames."""
+    red, green, blue = (_image(tmp_path, color, color) for color in ("red", "green", "blue"))
+    (tmp_path / "clip.mp4").write_bytes(b"mp4")
+    video = ezmm.Video(file_path=str(tmp_path / "clip.mp4"))
+    pages = {"https://example.com/a": page("A", red, video), "https://example.com/b": page("B", green, blue)}
+    _fake_retrieve(monkeypatch, lambda url: pages[url])
+    session = _session_that_saw(*pages, media_limits=MediaLimits(request_images=5, video_frames=2), claim_images=1)
+
+    session.fetch_url("https://example.com/a")
+    second = session.fetch_url("https://example.com/b")
+
+    # 1 of the claim, 1 + 2 of the first page, 1 of the second: the next one is over the cap
+    assert second.text.endswith(f"B {green.reference} [image not shown] \n**End of content of https://example.com/b:**")
+    assert [m["reference"] for m in session.shown_media] == [red.reference, video.reference, green.reference]
+
+
 def test_temporary_media_store(tmp_path):
     """ezMM's store is an SQLite database: on a network file system, each registration waits for a lock."""
     before = item_registry.path
