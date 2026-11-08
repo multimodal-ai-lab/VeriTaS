@@ -86,10 +86,10 @@ def render(sequence: ItemSequence) -> str:
 
 
 def load_image(path: str | Path, max_side: int) -> Image:
-    """Read an image file as JPEG, scaled down to `max_side` pixels on its longest side.
-    Fetched pages carry images in any format and size; the APIs take a few formats of limited
-    size. Raises if the image library can't decode it (SVG, a truncated file). Read from the
-    file, not via ezMM, which keeps every image it decodes in memory."""
+    """Read an image file as JPEG, scaled down to `max_side` pixels on its longest side: the
+    APIs take a few formats of limited size. Raises if the image library can't decode it (SVG,
+    a truncated file). Read from the file, not via ezMM, which keeps every image it decodes
+    in memory."""
     from PIL import Image as PILImage
 
     with PILImage.open(path) as image:
@@ -97,7 +97,6 @@ def load_image(path: str | Path, max_side: int) -> Image:
 
 
 def _jpeg(image, max_side: int | None) -> Image:
-    """A PIL image as JPEG, scaled down to `max_side` pixels on its longest side if given."""
     image = image.convert("RGB")
     if max_side:
         image.thumbnail((max_side, max_side))
@@ -117,9 +116,8 @@ def is_readable_image(path: str | Path, max_side: int) -> bool:
 
 
 def load_claim_image(path: str | Path, max_side: int) -> Image:
-    """Read a claim's image file as it is, or, if it is larger than `max_side` pixels on its
-    longest side, as with load_image. Re-encoding would blur the traces of editing a
-    fact-checker looks for."""
+    """As load_image, but an image within `max_side` is read as it is: re-encoding would blur
+    the traces of editing a fact-checker looks for."""
     from PIL import Image as PILImage
 
     with PILImage.open(path) as image:

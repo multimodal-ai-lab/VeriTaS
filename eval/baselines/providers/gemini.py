@@ -30,14 +30,12 @@ VIDEO_MIME_TYPES = {
     ".m4v": "video/mp4",
 }
 
-# Disables function calling, forcing the model to give its verdict
 NO_FUNCTION_CALLING = types.ToolConfig(
     function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.NONE)
 )
 
 
 def gemini_tool() -> types.Tool:
-    """The tools in Gemini format."""
     return types.Tool(function_declarations=[
         types.FunctionDeclaration(
             name=tool["name"],
@@ -62,8 +60,8 @@ class GeminiFactChecker(BaseFactChecker):
         return [types.Content(role="user", parts=self._gemini_parts(prompt))]
 
     def _gemini_parts(self, parts: list[Part]) -> list[types.Part]:
-        """Text, images and videos, in order, as Gemini's parts. Videos are uploaded with the
-        File API: inline, each later request, which repeats the conversation, would repeat them."""
+        """Videos are uploaded with the File API: inline, each later request, which repeats the
+        conversation, would repeat them."""
         gemini_parts = []
         for part in parts:
             if isinstance(part, str):
@@ -113,8 +111,8 @@ class GeminiFactChecker(BaseFactChecker):
 
     @staticmethod
     def _stop_reason(response: types.GenerateContentResponse) -> str | None:
-        """Why the model stopped: the candidate's finish reason ("STOP", "MAX_TOKENS", "SAFETY",
-        "MALFORMED_FUNCTION_CALL", ...), or why the prompt was blocked if there is no candidate."""
+        """The candidate's finish reason ("STOP", "MAX_TOKENS", "SAFETY", "MALFORMED_FUNCTION_CALL",
+        ...), or the prompt's block reason if there is no candidate."""
         if response.candidates:
             reason = response.candidates[0].finish_reason
         else:
@@ -123,8 +121,7 @@ class GeminiFactChecker(BaseFactChecker):
         return getattr(reason, "name", reason)
 
     def _thinking_config(self) -> types.ThinkingConfig:
-        """Summaries of the model's thoughts, as parts marked `thought`, at the reasoning effort.
-        Gemini 2 models have no thinking levels (the API rejects them), only a token budget:
+        """Gemini 2 models have no thinking levels (the API rejects them), only a token budget:
         they think as much as they decide to."""
         if self.model.startswith(("gemini-2.", "models/gemini-2.")):
             return types.ThinkingConfig(include_thoughts=True)
@@ -144,7 +141,6 @@ class GeminiFactChecker(BaseFactChecker):
         history.append(types.Content(role="user", parts=responses + self._gemini_parts(with_media)))
 
     def _add_text(self, history: list, text: str):
-        # In the user turn with the function responses, after them
         history[-1].parts.append(types.Part.from_text(text=text))
 
     def _end_conversation(self, history: list):
@@ -160,10 +156,9 @@ class GeminiFactChecker(BaseFactChecker):
                         print(f"    Warning: Could not delete uploaded file {name}: {e}")
 
     def _upload_video(self, video_path: str) -> types.Part | None:
-        """A video uploaded with the File API, by its URI. None if the upload fails."""
         try:
             uploaded_file = self.client.files.upload(file=video_path)
-            # Wait for file to become ACTIVE (required before use)
+            # The file can't be used until ACTIVE
             max_wait = 60  # seconds
             wait_interval = 2
             waited = 0

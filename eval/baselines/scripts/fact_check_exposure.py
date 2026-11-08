@@ -42,7 +42,6 @@ from baselines.common.tools import ToolSession  # noqa: E402
 SHOWN = ("search_result", "retrieved", "linked", "search_preview", "fetched_page")
 OWN = ("cited", "fetch_attempt", "searched", "mentioned")
 
-# Characters of context on each side of the slug or URL in an excerpt
 EXCERPT_CHARS = 150
 
 
@@ -53,15 +52,13 @@ def _excerpt(text: str, start: int, end: int) -> str:
 
 
 def _first_change(text: str, changed: str) -> int:
-    """The position of the first character in which `text` and `changed` differ."""
     return next((i for i, (a, b) in enumerate(zip(text, changed)) if a != b), min(len(text), len(changed)))
 
 
 def claim_exposure(record: dict, review_urls: list[str]) -> dict[str, str]:
-    """The ways in which the claim's fact-checks, at `review_urls`, show in `record`, the claim's
-    line of results_detailed.jsonl (see above), each with an excerpt of where it first does: the
-    URL, the title or snippet of the search result, or the text around the slug or URL, with
-    Google's breaks of the slug taken out."""
+    """The ways (see above) the claim's fact-checks at `review_urls` show in `record`, its line of
+    results_detailed.jsonl, each with an excerpt of where it first does, Google's breaks of the
+    slug taken out."""
     session = ToolSession(claim_date=record.get("claim_date"), blocked_urls=review_urls)
     result = record.get("result") or {}
     ways = {}
@@ -115,9 +112,8 @@ def claim_exposure(record: dict, review_urls: list[str]) -> dict[str, str]:
 
 
 def exposure_summary(jsonl_path: Path, claims: list[dict]) -> dict:
-    """Per provider: the number of claims, of those the tools showed their fact-check in any
-    way, of those only the model itself had it in any way, the number of claims per way, and
-    the ways of each claim that has any, each with its excerpt (see claim_exposure)."""
+    """Per provider: how many claims the tools showed their fact-check and how many only the model
+    had it, the claims per way, and each claim's ways with excerpts (see claim_exposure)."""
     review_urls = {int(claim["id"]): claim.get("review_urls") or [claim["review_url"]]
                    for claim in claims if claim.get("review_urls") or claim.get("review_url")}
     summary = {}
@@ -149,7 +145,6 @@ def exposure_summary(jsonl_path: Path, claims: list[dict]) -> dict:
 
 
 def write_fact_check_exposure(jsonl_path: Path, claims: list[dict], output_dir: Path) -> dict:
-    """Write the exposure_summary of a run to fact_check_exposure.json in `output_dir`."""
     if not jsonl_path.exists():
         return {}
     summary = exposure_summary(jsonl_path, claims)

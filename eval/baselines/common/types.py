@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
-# The verdict the baseline predicts (7-class)
 Verdict7 = Literal[
     "Intact (certain)", "Intact (rather certain)", "Intact (rather uncertain)",
     "Unknown",
@@ -69,8 +68,8 @@ LABEL_SCHEME_7 = LabelScheme(
     },
 )
 
-# The baseline predicts on the 7-class scheme. The 3-class scheme is only used for evaluation,
-# where 7-class labels are coarsened to 3 classes (see metrics.py).
+# The baseline predicts 7-class labels; the 3-class scheme only serves their coarsening in
+# evaluation (metrics.py).
 
 
 @dataclass

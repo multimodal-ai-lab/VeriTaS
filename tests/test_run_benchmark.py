@@ -1,5 +1,3 @@
-"""Tests for run_benchmark's output directory and resume handling, with a fake fact-checker."""
-
 import csv
 import json
 from datetime import datetime
@@ -20,9 +18,9 @@ class FakeFactChecker:
     """Stands in for UnifiedFactChecker: fails on the claims in `failing`."""
 
     failing: set[str] = set()
-    no_answer: set[str] = set()  # Claims the model gives no valid answer for
-    media_stores: list = []  # ezMM's store during each fact-check
-    blocked: dict = {}  # The blocked URLs, search cutoff and blocked scopes per claim ID
+    no_answer: set[str] = set()
+    media_stores: list = []
+    blocked: dict = {}
 
     def __init__(self, **kwargs):
         pass
@@ -45,7 +43,6 @@ class FakeFactChecker:
 @pytest.fixture
 def dataset(tmp_path, monkeypatch):
     monkeypatch.setattr(rb, "UnifiedFactChecker", FakeFactChecker)
-    # The database, which knows claim A's review
     monkeypatch.setattr(rb, "lookup_reviews", lambda urls: {
         "https://factcheck.example.org/claim-a": Review(datetime(2024, 2, 10, 8), ["factcheck.example.org"])})
     monkeypatch.setattr(rb, "signatory_scopes", lambda: ["signatory.example.org", "other.example.org/fact-checks"])
@@ -75,7 +72,6 @@ def test_output_dir_is_used_and_resume_retries_failed_claims(dataset, tmp_path, 
 
     expected = {"1": "success", "2": "error"}
     assert _rows(run_dir) == (expected, expected)
-    # The failed claim has no verdict for the leaderboard
     leaderboard = json.loads((run_dir / "results_for_leaderboard.json").read_text())
     assert leaderboard == [{"claim_id": 1, "verdict": 1, "reasoning": "claim A is true."}]
 
@@ -100,11 +96,9 @@ def test_output_dir_is_used_and_resume_retries_failed_claims(dataset, tmp_path, 
     # MSE and MAE only for the 7 bins: the model's actual prediction against the ground truth
     assert "mse" in summary["providers"]["openai"]["metrics"]
     assert "mse" not in summary["providers"]["openai"]["metrics_3class"]
-    # Every claim records how long its fact-check took, and the run its statistics
     with open(run_dir / "results_detailed.jsonl", encoding="utf-8") as f:
         assert all(json.loads(line)["duration_seconds"] >= 0 for line in f)
     assert json.loads((run_dir / "run_statistics.json").read_text())["openai"]["successful_claims"] == 2
-    # The summary has them too, but for the list of what was blocked by claim
     statistics = summary["providers"]["openai"]["run_statistics"]
     assert statistics["successful_claims"] == 2 and "tokens" in statistics
     assert "by_claim" not in statistics["blocked"] and "web_search_results" in statistics["blocked"]
@@ -154,7 +148,6 @@ def test_a_failed_claim_keeps_its_trace_and_urls_and_no_answer_is_counted_apart(
     summary = json.loads((run_dir / "summary.json").read_text())["providers"]["openai"]
     assert (summary["successful_runs"], summary["no_answer"], summary["errors"]) == (1, 1, 0)
 
-    # Retried on resume, like an error
     monkeypatch.setattr(FakeFactChecker, "no_answer", set())
     rb.run_benchmark(dataset_path=str(dataset), resume_dir=str(run_dir), providers=["openai"])
     assert _rows(run_dir) == ({"1": "success", "2": "success"},) * 2
@@ -296,11 +289,10 @@ def test_write_run_statistics(tmp_path):
     records = [
         record(1, [["web_search", "web_search"], ["fetch_url"]], (100, 10, 60, 0), duration=30.0, blocked=[dropped, refused]),
         record(2, [["web_search"]], (50, 5, 20, 0), duration=10.0, blocked=[]),
-        record(3, [], (30, 3, 0, 0), duration=20.0, blocked=[]),  # Answered without tools
+        record(3, [], (30, 3, 0, 0), duration=20.0, blocked=[]),
         record(4, [["web_search"]] * 5, (200, 20, 100, 10), status="no_answer", duration=99.0, blocked=[dropped]),
         # From before durations, blocks and cache tokens were recorded
         record(5, [["web_search", "web_search", "web_search"]], (40, 4)),
-        # OpenRouter says what it billed
         record(6, [["web_search"]], (80, 8, 40, 0), duration=15.0, blocked=[], provider="openrouter", cost=0.0012),
         record(7, [], (20, 2, 0, 0), status="no_answer", duration=5.0, blocked=[], provider="openrouter", cost=0.0003),
     ]
@@ -356,7 +348,7 @@ def test_write_fact_check_exposure(tmp_path):
                    *fetch(fact_check, f"Error: Cannot fetch {fact_check}. fetch_url only fetches ...")],
                quoted_urls=[fact_check + "?utm_source=x"]),
         record(4, search("the claim", "[1] Other\nURL: https://x.org/4\nSnippet: Nothing to see")),
-        record(5),  # No review URL
+        record(5),
         record(6, encountered_urls=[f"https://web.archive.org/web/2026/{fact_check}"]),
     ]
     jsonl_path = tmp_path / "results_detailed.jsonl"
@@ -366,7 +358,6 @@ def test_write_fact_check_exposure(tmp_path):
     rb.write_fact_check_exposure(jsonl_path, claims, tmp_path)
 
     stats = json.loads((tmp_path / "fact_check_exposure.json").read_text())["gemini"]
-    # Each way with an excerpt of where it first shows
     assert stats["claims_by_id"] == {
         "1": {"search_preview": "Snippet: Fact Check: The claim ... fact-check-the-claim-is ..."},
         "2": {"linked": fact_check, "fetched_page": f"**Content of https://x.org/2:** See [it](/{fact_check.split('/', 3)[3]})."},

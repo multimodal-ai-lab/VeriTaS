@@ -87,7 +87,6 @@ CSV_COLUMNS = [
     "quoted_urls",
 ]
 
-# Per-claim URL lists, stored in the CSV as JSON arrays
 URL_LIST_FIELDS = ("encountered_urls", "retrieved_urls", "linked_urls", "quoted_urls")
 
 JUSTIFICATION_CSV_MAX_CHARS = 1000
@@ -117,13 +116,10 @@ def append_to_csv(csv_path: Path, record: dict):
 
 
 def prepare_resume(csv_path: Path, jsonl_path: Path, providers: list[str]) -> int:
-    """Prepare a run's results for resuming it: remove the rows of `providers` that are not
-    successes (errors, or lines a crash cut short) from the CSV and JSONL, so that their
-    claims are retried, and bring the CSV's header up to date with CSV_COLUMNS, so that the
-    rows appended next line up with it.
-
-    Returns the number of CSV rows removed.
-    """
+    """Remove the rows of `providers` that are not successes (errors, or lines a crash cut short)
+    from the CSV and JSONL, so that their claims are retried, and bring the CSV's header up to
+    date with CSV_COLUMNS, so that the rows appended next line up with it. Returns the number
+    of CSV rows removed."""
     def failed(record: dict) -> bool:
         return record.get("provider") in providers and record.get("status") != "success"
 
@@ -439,13 +435,11 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
 
         metrics = compute_metrics(y_true, y_pred, labels=LABEL_SCHEME_7.labels)
 
-        # Compute coarsened 3-bin metrics
         coarsened = compute_coarsened_metrics(y_true, y_pred)
         if coarsened:
             metrics["coarsened_3class"] = coarsened
 
-        # Compute regression metrics (MSE, MAE): the predicted label's value against the
-        # continuous ground-truth integrity. Only for the 7 bins the model predicts on.
+        # The predicted label's value against the continuous ground-truth integrity, 7 bins only
         regression_metrics = compute_regression_metrics(gt_integrity_values, verdict_values, scheme=LABEL_SCHEME_7)
         if regression_metrics:
             metrics["mse"] = regression_metrics["mse"]
@@ -474,7 +468,6 @@ def generate_summary_from_csv(csv_path: Path, output_dir: Path, providers: list[
             print_metrics(metrics)
             plot_confusion_matrix(metrics, output_dir / f"confusion_matrix_{provider}.png", provider)
 
-            # Plot coarsened 3-bin confusion matrix
             if coarsened:
                 plot_confusion_matrix(
                     coarsened,
@@ -537,11 +530,7 @@ def write_leaderboard_results(jsonl_path: Path, output_dir: Path, providers: lis
     {"claim_id", "verdict", "reasoning"}, sorted by claim ID. The verdict is the label's value
     (1 = Intact (certain) to -1 = Compromised (certain)), rounded to 2 decimals, the reasoning
     is the justification, within the leaderboard's limits (see leaderboard_reasoning). Claims
-    that failed with an error have no verdict and are left out.
-
-    With one provider, the file is results_for_leaderboard.json, otherwise
-    results_for_leaderboard_<provider>.json.
-    """
+    that failed with an error have no verdict and are left out."""
     if not jsonl_path.exists():
         return
 
@@ -881,9 +870,8 @@ def process_single_claim(
             claim_date=claim_date,
             provider=provider,
             claim_id=claim_id,
-            # The claim's own fact-checks, the other fact-checks of their publishers and those of
-            # all IFCN signatories and EFCSN members would give the answer away; web_search only
-            # shows what was published before the first review
+            # Fact-checks by the claim's reviewers, IFCN signatories and EFCSN members would give the
+            # answer away; web_search only shows what was published before the first review
             blocked_urls=claim.get("review_urls"),
             cutoff_date=claim.get("review_date"),
             blocked_scopes=[*blocked_scopes, *claim.get("fact_check_scopes", [])],
@@ -933,8 +921,7 @@ def process_single_claim(
         "result": result.to_dict() if result else None,
         "status": status,
         "error_message": error_message,
-        # Wall-clock time of the fact-check, retries included; claims run in parallel and share
-        # the scrapeMM server and the APIs' rate limits
+        # Retries included; claims run in parallel and share the scrapeMM server and the APIs' rate limits
         "duration_seconds": round(duration, 1),
     }
 
@@ -982,7 +969,6 @@ def run_benchmark(
         openrouter_host: The endpoint OpenRouter sends every request to, e.g. "deepinfra/fp8".
                          Required for openrouter.
     """
-    # Default providers
     if providers is None:
         providers = list(DEFAULT_PROVIDERS)
 
@@ -1014,7 +1000,6 @@ def run_benchmark(
         raise ValueError(f"{output_dir} already contains results. Pass it as --resume to continue that run.")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Retry the claims that failed before
     if resume_dir:
         n_failed = prepare_resume(csv_path, jsonl_path, providers)
         if n_failed:
@@ -1076,17 +1061,14 @@ def run_benchmark(
         openrouter_host=openrouter_host,
     )
 
-    # The fetched pages' media go to a temporary store on local disk, deleted claim by claim
     with temporary_media_store() as media_store:
         print(f"Media of fetched pages: {media_store} (temporary, deleted after each claim)")
 
-        # Process each provider
         for provider in providers:
             print(f"\n{'='*60}")
             print(f"Processing with {provider.upper()}")
             print(f"{'='*60}")
 
-            # Load already processed claim IDs for this provider
             processed_ids = set()
             if resume_dir and csv_path.exists():
                 processed_ids = load_processed_claim_ids(csv_path, provider)
@@ -1094,11 +1076,9 @@ def run_benchmark(
             elif not csv_path.exists():
                 init_csv(csv_path)
 
-            # Filter out already processed claims
             claims_to_process = [c for c in all_claims if c["id"] not in processed_ids]
             print(f"Claims remaining: {len(claims_to_process)}")
 
-            # Apply limit
             if limit is not None:
                 claims_to_process = claims_to_process[:limit]
             print(f"Claims to process this run: {len(claims_to_process)}")
@@ -1170,7 +1150,6 @@ def run_benchmark(
 
 
 def main():
-    """Run the benchmark with the command line's options."""
     parser = argparse.ArgumentParser(
         description="Run the fact-checking baseline on the VeriTaS dataset",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1249,7 +1228,7 @@ Examples:
     elif args.providers:
         providers = args.providers
     else:
-        providers = None  # Will default to DEFAULT_PROVIDERS
+        providers = None
 
     # Set up models dict if model specified
     models = None

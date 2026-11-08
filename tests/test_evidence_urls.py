@@ -1,5 +1,3 @@
-"""Tests for the per-claim evidence URLs: encountered, retrieved, linked and quoted."""
-
 import pytest
 from baseline_fakes import ScriptedFactChecker, fake_retrieve, fake_search
 
@@ -11,14 +9,11 @@ from eval.baselines.providers.base import Step, Text, ToolCall
     "text, expected",
     [
         ("Per [AP](https://apnews.com/article/x).", ["https://apnews.com/article/x"]),
-        # Parentheses inside a markdown link URL stay intact
         ("See [wiki](https://en.wikipedia.org/wiki/Foo_(bar)) here.", ["https://en.wikipedia.org/wiki/Foo_(bar)"]),
         ("[AP](https://apnews.com/article/a_(b),c)", ["https://apnews.com/article/a_(b),c"]),
-        # Bare URLs lose trailing punctuation and unbalanced parentheses
         ("Confirmed by https://reut.rs/x?y=1&z=2.", ["https://reut.rs/x?y=1&z=2"]),
         ("(see https://example.org/page).", ["https://example.org/page"]),
         ("<https://example.org/auto>", ["https://example.org/auto"]),
-        # Order of appearance, no duplicates, links and bare URLs mixed
         (
             "Both [A](https://a.org/1) and https://b.org/2, again [A](https://a.org/1).",
             ["https://a.org/1", "https://b.org/2"],
@@ -36,13 +31,10 @@ def test_extract_urls(text, expected):
     [
         ("[Movies](/movies/) and [x](news/a.html)",
          ["https://www.news18.com/movies/", "https://www.news18.com/movies/bollywood/news/a.html"]),
-        # Protocol-relative links get the page's scheme
         ("![img](//im.rediff.com/a.jpg)", ["https://im.rediff.com/a.jpg"]),
         ("[up](../tv/) [q](?page=2)",
          ["https://www.news18.com/movies/tv/", "https://www.news18.com/movies/bollywood/x?page=2"]),
-        # No web pages
         ("[top](#top) [mail](mailto:a@b.org) [js](javascript:;)", []),
-        # Absolute links and bare URLs as without a base URL, in order of appearance
         ("[A](https://a.org/1) then [B](/b), see https://c.org/3.",
          ["https://a.org/1", "https://www.news18.com/b", "https://c.org/3"]),
     ],
@@ -70,16 +62,14 @@ FACT_CHECK = "https://fc.org/2026/07/the-claim-is-false"
         # With its title and an image, over several lines, as in a fact-checker's list of articles
         (f'[Image\n<image:7>\nPublished on 21/09/2026\n### The claim is false]({FACT_CHECK} "The claim is false") Next',
          " Next"),
-        ("[The claim is false](/2026/07/the-claim-is-false/#top)", ""),  # Relative
+        ("[The claim is false](/2026/07/the-claim-is-false/#top)", ""),
         # A text with brackets, or too long, may begin anywhere before: only the target and title go
         (f'[![thumbnail](https://cdn.org/t.jpg)]({FACT_CHECK}/ "The claim is false") Next',
          "[![thumbnail](https://cdn.org/t.jpg) Next"),
         (f"[[S1] The claim is false]({FACT_CHECK})", "[[S1] The claim is false"),
         ("[" + "x" * 1001 + f"]({FACT_CHECK})", "[" + "x" * 1001),
-        # Bare URLs, also in HTML links
         (f'Link: {FACT_CHECK}. <{FACT_CHECK}> <a href="{FACT_CHECK}">The claim</a>',
          'Link: . <> <a href="">The claim</a>'),
-        # Other links stay, also on the same site
         (f"[Other](https://fc.org/2026/07/other), [it]({FACT_CHECK}), https://b.org/x",
          "[Other](https://fc.org/2026/07/other), , https://b.org/x"),
         ("No links here.", "No links here."),

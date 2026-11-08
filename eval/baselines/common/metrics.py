@@ -116,7 +116,6 @@ def compute_metrics(y_true: list, y_pred: list, labels: list = LABELS_7) -> dict
 
 
 def compute_coarsened_metrics(y_true: list[str], y_pred: list[str]) -> dict:
-    """Coarsen 7-class labels to 3-class and compute the classification metrics on them."""
     y_true_c = [coarsen_label(l) for l in y_true]
     y_pred_c = [coarsen_label(l) for l in y_pred]
 
@@ -191,7 +190,6 @@ def print_metrics(metrics: dict):
     print(f"\n  === Classification Metrics ===")
     print(f"  Accuracy:         {metrics['accuracy']:.2%}")
 
-    # Show coarsened 3-bin accuracy
     coarsened = metrics.get("coarsened_3class")
     if coarsened:
         print(f"  Accuracy (3-bin): {coarsened['accuracy']:.2%}")
@@ -211,6 +209,5 @@ def print_metrics(metrics: dict):
 
     _print_confusion_matrix(metrics["confusion_matrix"])
 
-    # Show coarsened 3-bin confusion matrix
     if coarsened:
         _print_confusion_matrix(coarsened["confusion_matrix"], title="Confusion Matrix (coarsened 3-bin)")

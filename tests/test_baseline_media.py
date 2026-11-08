@@ -1,5 +1,3 @@
-"""Tests for turning media into what the models get."""
-
 import io
 import subprocess
 
@@ -11,7 +9,6 @@ from eval.baselines.common.media import extract_video_frames
 
 
 def _video(path, codec: str, size="320x240") -> str:
-    """A 2-second test video: 10 frames per second."""
     subprocess.run([get_ffmpeg_exe(), "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=duration=2:size={size}:rate=10",
                     "-c:v", codec, *(["-cpu-used", "8"] if codec == "libaom-av1" else []), "-y", str(path)],
                    check=True)

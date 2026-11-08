@@ -19,7 +19,6 @@ from .providers import (
 
 Provider = Literal["openai", "gemini", "anthropic", "selfhosted", "openrouter"]
 
-# Provider class mapping
 PROVIDER_CLASSES: dict[Provider, type[BaseFactChecker]] = {
     "openai": OpenAIFactChecker,
     "gemini": GeminiFactChecker,
@@ -28,7 +27,6 @@ PROVIDER_CLASSES: dict[Provider, type[BaseFactChecker]] = {
     "openrouter": OpenRouterFactChecker,
 }
 
-# Default models for each provider
 DEFAULT_MODELS = {provider: cls.default_model for provider, cls in PROVIDER_CLASSES.items()}
 
 DEFAULT_PROVIDERS: list[Provider] = ["openai", "gemini", "anthropic"]

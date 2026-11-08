@@ -77,5 +77,4 @@ def test_searches_before_the_cutoff_date_and_shows_the_claim_date(monkeypatch):
     session.web_search("q")
     assert session.claim_day == CLAIM_DAY
     assert queries[0].request_body()["tbs"].split("cd_max:")[1] == "2/19/2024"
-    # Without a cutoff, the claim date
     assert ToolSession(claim_date="2024-02-05").cutoff_day == CLAIM_DAY

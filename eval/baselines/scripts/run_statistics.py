@@ -36,15 +36,13 @@ TOKENS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tok
 
 
 def _mean_and_median(values: list[float], digits: int = 2) -> dict:
-    """The mean and median of `values`, rounded to `digits` decimals (None if there are none)."""
     if not values:
         return {"mean": None, "median": None}
     return {"mean": round(statistics.mean(values), digits), "median": round(statistics.median(values), digits)}
 
 
 def _usage(records: list[dict], successful: list[dict], kind: str, digits: int = 2) -> dict:
-    """One kind of usage ("input_tokens", ..., "cost") of the fact-checks that recorded it: per
-    successful fact-check, mean and median, and in all, of all fact-checks."""
+    """Usage of `kind` per successful fact-check (mean, median) and in all, failed ones included."""
     def used(selection):
         return [r["result"]["usage"][kind] for r in selection
                 if r.get("result") and kind in (r["result"].get("usage") or {})]
@@ -53,7 +51,6 @@ def _usage(records: list[dict], successful: list[dict], kind: str, digits: int =
 
 
 def run_statistics(jsonl_path: Path) -> dict:
-    """The statistics of the run whose results are in `jsonl_path` (see above), per provider."""
     records = {}
     with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
@@ -92,7 +89,6 @@ def run_statistics(jsonl_path: Path) -> dict:
 
 
 def write_run_statistics(jsonl_path: Path, output_dir: Path) -> dict:
-    """Write the run_statistics of a run to run_statistics.json in `output_dir`."""
     if not jsonl_path.exists():
         return {}
     summary = run_statistics(jsonl_path)

@@ -9,8 +9,8 @@ import anthropic as anthropic_sdk
 from ..common.tools import anthropic_tools
 from .base import BaseFactChecker, Part, Reasoning, Step, Text, ToolCall, only_text, resolve_api_key
 
-# Output tokens per model call, thinking included. The SDK refuses non-streaming requests that
-# could take more than 10 minutes, i.e. above about 21,000 tokens (Claude Opus 4 and 4.1: 8192).
+# Thinking included. The SDK refuses non-streaming requests that could take over 10 minutes,
+# i.e. above about 21,000 tokens (Claude Opus 4 and 4.1: 8192).
 MAX_TOKENS = 16384
 
 
@@ -28,7 +28,6 @@ class AnthropicFactChecker(BaseFactChecker):
 
     @staticmethod
     def _content(parts: list[Part]) -> list[dict]:
-        """Text and images, in order, as content blocks."""
         return [
             {"type": "text", "text": part} if isinstance(part, str)
             else {"type": "image", "source": {"type": "base64", "media_type": part.mime_type, "data": part.base64}}
@@ -42,8 +41,8 @@ class AnthropicFactChecker(BaseFactChecker):
             messages=messages,
             tools=anthropic_tools(),
             tool_choice={"type": "auto" if allow_tools else "none"},
-            # Adaptive thinking, which Claude 5 models always do, with a summary of it in the
-            # thinking blocks: they are empty by default. On Claude 4.6 models, this turns thinking on.
+            # Thinking blocks are empty unless display is "summarized". On Claude 4.6 models,
+            # this turns thinking on.
             thinking={"type": "adaptive", "display": "summarized"},
             extra_body={
                 # In the body, as older SDKs lack the output_config parameter
@@ -86,5 +85,5 @@ class AnthropicFactChecker(BaseFactChecker):
         ]})
 
     def _add_text(self, messages: list, text: str):
-        # In the user turn with the tool results, after them: user and assistant turns alternate
+        # Into the user turn with the tool results: user and assistant turns must alternate
         messages[-1]["content"].append({"type": "text", "text": text})

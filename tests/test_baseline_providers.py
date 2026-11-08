@@ -1,6 +1,5 @@
-"""Tests for the providers' message formats, incl. how they get the model's reasoning. The real
-SDKs build the requests and parse the responses; a mock transport stands in for the server
-(for Gemini, a fake client returns the SDK's own types)."""
+"""The real SDKs build the requests and parse the responses; a mock transport stands in for the
+server (for Gemini, a fake client returns the SDK's own types)."""
 
 import base64
 import json
@@ -90,15 +89,12 @@ def test_openai_uses_the_responses_api_with_reasoning_summaries(monkeypatch, tmp
     assert first["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert [(t["type"], t["name"], t["strict"]) for t in first["tools"]] == [
         ("function", "web_search", False), ("function", "fetch_url", False)]
-    # The claim's image right after its text and its reference
     before, image, after = first["input"][0]["content"]
     assert before["text"].endswith('# The Claim\n"The Eiffel Tower is in Paris <image:1>')
-    # As it is: the claim's images are not re-encoded
     encoded = base64.b64encode(image_path.read_bytes()).decode()
     assert image == {"type": "input_image", "image_url": f"data:image/png;base64,{encoded}", "detail": "auto"}
     assert after["text"].startswith('"\nPublished on: February 05, 2024')
 
-    # The model's output goes back in full, followed by the function's result
     assert second["input"][1:3] == [reasoning, function_call]
     output = second["input"][3]
     assert (output["type"], output["call_id"]) == ("function_call_output", "call_1")
@@ -140,7 +136,6 @@ def test_anthropic_requests_summarized_thinking_and_passes_it_back(monkeypatch):
     assert first["cache_control"] == {"type": "ephemeral"}
     assert "system" not in first
     assert first["messages"][0]["content"] == [{"type": "text", "text": PROMPT}]
-    # The thinking block goes back unchanged, incl. its signature
     assert second["messages"][1] == {"role": "assistant", "content": [thinking, tool_use]}
     assert second["messages"][2]["content"][0]["tool_use_id"] == "toolu_1"
 
@@ -183,7 +178,7 @@ def test_gemini_requests_thoughts_and_keeps_them_out_of_the_answer(monkeypatch):
     assert all(config.thinking_config.include_thoughts for config in configs)
     assert all(config.thinking_config.model_dump(mode="json")["thinking_level"] == "MEDIUM" for config in configs)
     assert all(config.system_instruction is None for config in configs)
-    assert result.reasoning == FINAL_TEXT  # The final answer without the thoughts
+    assert result.reasoning == FINAL_TEXT
     assert result.verdict == "Intact (certain)"
     assert result.usage == {"input_tokens": 20, "output_tokens": 10, "cache_read_tokens": 8, "cache_write_tokens": 0}
     assert _trace_types(result) == TRACE_TYPES
@@ -354,7 +349,6 @@ def test_gemini_gets_page_media_in_order_after_the_function_responses_and_videos
     assert (text.text, image.inline_data.data, more.text) == ("Content of the page <image:7>", b"jpg", "and more text <video:1>")
     assert video_part.file_data.file_uri.endswith("/files/abc") and uploads == [str(video.file_path)]
 
-    # The uploads are deleted when the fact-check ends
     checker._end_conversation(history)
     assert deleted == ["files/abc"]
 
@@ -394,7 +388,6 @@ def test_the_last_turn_message_follows_the_tool_results_in_each_api(tmp_path):
     gemini_checker._add_text(history, text)
     assert len(history) == 1 and history[0].parts[-1].text == text
 
-    # Chat completions: a user message, or the one with the tool results' images
     chat_checker = SelfhostedFactChecker(api_key="test", base_url="https://vllm.test/v1")
     messages = []
     chat_checker._add_tool_results(messages, CALLS, [SEARCH, SEARCH])

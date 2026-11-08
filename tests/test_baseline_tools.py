@@ -1,5 +1,3 @@
-"""Tests for the baseline's web_search and fetch_url tools, with scrapeMM mocked."""
-
 import asyncio
 import io
 from datetime import date
@@ -175,7 +173,7 @@ def test_fetch_url_rejects_unseen_urls(monkeypatch):
         assert session.fetch_url(url).text.startswith(f"Error: Cannot fetch {url}.")
 
     assert calls == []
-    assert session.n_fetches == 0  # Rejected fetches don't use up the budget
+    assert session.n_fetches == 0
     assert session.retrieved_urls == []
 
 
@@ -190,9 +188,7 @@ def test_fetch_url_allows_urls_from_search_results_and_fetched_pages(monkeypatch
     session = ToolSession(claim_date="2024-02-05")
     session.web_search("eiffel tower")  # Result: https://example.com/old
 
-    # "www." makes no difference
     assert "Content of https://www.example.com/old" in session.fetch_url("https://www.example.com/old").text
-    # Relative links are saved as full URLs
     assert session.linked_urls == [
         "https://factcheck.afp.com/x", "https://archive.example.org/y", "https://www.example.com/"]
 
@@ -222,7 +218,6 @@ def test_the_claims_fact_check_is_never_shown_or_fetched(monkeypatch, capsys):
     assert "The claim is false" not in text and "factcheck.example.org" not in text
     assert session.encountered_urls == ["https://example.com/old"]
 
-    # The page's link to the fact-check is gone, with its text and title
     text = session.fetch_url("https://example.com/old").text
     assert "See  and [another](https://example.com/other)." in text and "The claim is false" not in text
     assert session.linked_urls == ["https://example.com/other"]
@@ -271,14 +266,13 @@ LEAD_STORIES_SCOPES = ["leadstories.com/hoax-alert", "verifica.efe.com", "xn--80
     ("https://www.leadstories.com/hoax-alert/2026/07/fact-check-other.html", True),
     ("http://leadstories.com/Hoax-Alert/", True),
     ("https://verifica.efe.com/anything/", True),
-    (f"https://{'xn--80aa2aboqjl0g5e'.encode().decode('idna')}.leadstories.com/factcheck/x", True),  # Unicode host
+    (f"https://{'xn--80aa2aboqjl0g5e'.encode().decode('idna')}.leadstories.com/factcheck/x", True),
     ("https://leadstories.com/about", False),
     ("https://leadstories.com/hoax-alerts/x", False),  # Not under the path
     ("https://efe.com/verifica/x", False),
     ("https://arabic.leadstories.com/hoax-alert/x", False),  # Subdomains are scopes of their own
 ])
 def test_the_fact_check_scopes_of_the_publishers_are_blocked(url, blocked):
-    """The publishers' fact-checks, but not the rest of their sites."""
     assert ToolSession(blocked_scopes=LEAD_STORIES_SCOPES).is_blocked(url) == blocked
 
 
@@ -315,7 +309,7 @@ def test_the_tools_show_no_fact_check_of_the_publisher(monkeypatch, capsys):
 
 def test_search_results_that_show_a_blocked_url_are_left_out(monkeypatch, capsys):
     """Fact-checkers' posts announce their fact-checks with the headline and a link, which Google
-    may break with spaces or cut short. Such results are left out whole; the others stay as they are."""
+    may break with spaces or cut short."""
     fact_check = "https://www.thip.media/health-news-fact-check/fact-check-can-eating-dalchini/153121/"
     shown = [
         f"Fact Check: Can eating dalchini cure diabetes? {fact_check}?utm_medium=social",
@@ -352,7 +346,7 @@ def test_search_results_that_show_a_blocked_url_are_left_out(monkeypatch, capsys
     ("https://dogrulukpayi.com/dogrulama/ucuz-mama-kedileri-gay-yapar-mi?utm_source=x", True),
     ("https://www.dogrulukpayi.com/dogrulama/ucuz-mama-kedileri", False),
     ("https://web.archive.org/web/2026/https://www.dogrulukpayi.com/dogrulama/ucuz-mama-kedileri-gay-yapar-mi", True),
-    ("https://example.com/ucuz-mama-kedileri-gay-yapar-mi", True),  # A copy
+    ("https://example.com/ucuz-mama-kedileri-gay-yapar-mi", True),
     ("https://aapnews.aap.com.au/news/bird-flu-denial-sweeps-social-media-as-australian-cases-surge", True),
     ("https://www.thip.media/health-news-fact-check/fact-check-can-eating-dalchini/153121/", True),
     ("https://www.thip.media/health-news-fact-check/other-article-on-the-site/153999/", False),
@@ -445,7 +439,6 @@ def test_the_log_says_what_was_blocked_and_by_which_rule(monkeypatch, capsys):
         "https://verifica.efe.com/b",
     ]:
         assert line in log
-    # The results record them too, as the log has them
     assert [(entry["tool"], entry["url"]) for entry in session.blocked] == [
         *(("web_search", link) for link, _ in results[:6]), ("fetch_url", "https://fullfact.org/other")]
     assert session.blocked[0] == {"tool": "web_search", "query": "q", "url": "https://fullfact.org/health/x/",
@@ -561,9 +554,6 @@ def test_fetch_url_shows_the_page_media_in_their_places(monkeypatch, tmp_path, e
 
     result = session.fetch_url("https://example.com/page")
 
-    # The media shown stay ezMM items in their places. Notes replace the SVG and the truncated
-    # JPEG, which can't be read, the repeated image and the third image, beyond the limit; the
-    # image past the cut is gone
     assert [part for part in result.content if not isinstance(part, str)] == [first, second, video]
     unreadable = "[image in a format that cannot be shown]"
     assert (f"Intro {first.reference} text {unreadable} {unreadable} {second.reference} [the image shown above again] "
@@ -587,7 +577,6 @@ def test_fetch_url_limits_the_media_of_the_whole_fact_check(monkeypatch, tmp_pat
     session.fetch_url("https://example.com/a")
     second = session.fetch_url("https://example.com/b")
 
-    # The image shown on the first page is not shown again; the third one is over the total
     assert second.text.endswith("B [the image shown above again] [image not shown] end \n**End of content of https://example.com/b:**")
     assert second.media == []
     assert [m["reference"] for m in session.shown_media] == [red.reference, green.reference]
@@ -636,7 +625,7 @@ def test_page_media_files_are_deleted_once_no_fact_check_uses_them(monkeypatch, 
 
         first.close()
         assert not own.file_path.exists()
-        assert shared.file_path.exists()  # The second fact-check still uses it
+        assert shared.file_path.exists()
         second.close()
         assert not shared.file_path.exists()
         assert claim_image.file_path.exists()
@@ -701,7 +690,7 @@ def test_tool_formats():
 
 
 def test_prompt_renders_the_claim_like_the_pipeline():
-    """Like veritas' Claim.__str__: the text in quotes and the publication date."""
+    """Like veritas' Claim.__str__."""
     prompt, = build_prompt("The Earth is flat", date(2024, 2, 5))
     assert '# The Claim\n"The Earth is flat"\nPublished on: February 05, 2024\n\n# Rules' in prompt
     assert '"integrity": "compromised" | "intact" | "unknown",' in prompt
@@ -714,5 +703,4 @@ def test_prompt_says_what_day_it_is():
     prompt, = build_prompt("The Earth is flat", date(2024, 2, 5), today=date(2026, 10, 19))
     assert "\n\nToday is October 19, 2026.\n\n# Task Details" in prompt
     assert "{{ today }}" not in prompt
-    # The actual day by default
     assert f"Today is {date.today().strftime('%B %d, %Y')}." in build_prompt("The Earth is flat")[0]

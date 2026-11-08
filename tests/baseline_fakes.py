@@ -1,6 +1,3 @@
-"""Test doubles for the fact-checking baseline: a provider that replays scripted model steps,
-and fakes for scrapeMM's search and retrieve."""
-
 import pytest
 from ezmm import MultimodalSequence
 from ezmm.common import registry

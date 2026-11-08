@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Convert a VeriTaS dataset export into the claims file run_benchmark.py reads.
-
-The export (see its readme.txt) holds claims.json, a list of claims with their aggregated
-verdict, and the media in images/ and videos/. run_benchmark.py reads the release format
-written by scripts/export/export.py: {"claims": [...]}, each claim with "id", "text", "date",
-the ratings ("integrity", "veracity", "context_coverage") and its media, whose "file_path" is
-relative to the claims file. So the converted file goes next to the export's claims.json. Each
-claim also gets the URLs of its reviews ("review_url" the first, "review_urls" all) and the day
-the first of them was published ("review_date"), before which web_search searches.
+"""Convert a VeriTaS dataset export (claims.json with the media in images/ and videos/, see its
+readme.txt) into the claims file run_benchmark.py reads: the release format of
+scripts/export/export.py. Media paths are relative to the claims file, so the converted file goes
+next to the export's claims.json. Each claim also gets the URLs of its reviews ("review_url" the
+first, "review_urls" all) and the day the first of them was published ("review_date"), before
+which web_search searches.
 
 Scores are kept as exported, not rounded like in export.py: rounding can move a score into
 another bin.
@@ -22,14 +19,12 @@ from pathlib import Path
 
 
 def convert_rating(rating: dict | None) -> dict | None:
-    """A rating of the export as the release format has it: its score and justification."""
     if not rating:
         return None
     return {"score": rating["score"], "justification": rating.get("explanation")}
 
 
 def convert_claim(claim: dict) -> dict:
-    """A claim of the export in the release format."""
     verdict = claim.get("verdict") or {}
     media_verdicts = {mv["reference"]: mv for mv in verdict.get("media_verdicts") or []}
     reviews = claim.get("reviews") or []
@@ -49,7 +44,6 @@ def convert_claim(claim: dict) -> dict:
         "date": claim["date"],
         "review_url": reviews[0]["url"] if reviews else None,
         "review_urls": [review["url"] for review in reviews],
-        # The day the first review was published, before which web_search searches
         "review_date": min((review["published"] for review in reviews if review.get("published")), default=None),
         "media": media,
         "veracity": convert_rating(verdict.get("veracity")),

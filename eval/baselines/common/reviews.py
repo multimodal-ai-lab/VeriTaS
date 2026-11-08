@@ -13,13 +13,12 @@ from pathlib import Path
 import asyncpg
 import yaml
 
-# The project's config.yaml, whose "database" section says how to connect
+# Its "database" section says how to connect
 CONFIG_PATH = Path(__file__).resolve().parents[3] / "config.yaml"
 
 
 @dataclass
 class Review:
-    """A review as the database has it."""
     published: datetime | None
     fact_check_scopes: list[str] = field(default_factory=list)
 
@@ -60,8 +59,7 @@ def signatory_scopes(config_path: Path = CONFIG_PATH) -> list[str]:
 
 
 async def _fetch(config_path: Path, query: str, *args) -> list:
-    """The rows of `query`, with the parameters `args`, over a read-only connection to the
-    database. Raises RuntimeError on any failure, reading the config included."""
+    """Raises RuntimeError on any failure, reading the config included."""
     try:
         with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f)["database"]

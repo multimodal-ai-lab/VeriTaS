@@ -139,7 +139,7 @@ def test_last_turn_disables_tools_and_tells_the_model():
     # The message comes right before the last model call, after the last tool results (the
     # scripted model calls a tool even then, whose result follows)
     assert checker.conversation[-3:-1] == [base.LAST_TURN_MESSAGE, checker.steps[0]]
-    assert isinstance(checker.conversation[-4], list)  # The tool results before it
+    assert isinstance(checker.conversation[-4], list)
     assert checker.conversation.count(base.LAST_TURN_MESSAGE) == 1
     trace = no_answer.value.result.trace
     assert {"turn": MAX_TURNS - 1, "type": "message", "text": base.LAST_TURN_MESSAGE} in trace
@@ -152,9 +152,9 @@ def test_a_model_done_before_the_last_turn_gets_no_message():
 
 
 @pytest.mark.parametrize("final", [
-    Step([Reasoning("Let me weigh the evidence")], stop_reason="max_tokens"),  # Cut off while thinking
-    Step([], stop_reason="SAFETY"),  # Blocked
-    Step([Text("Let me search for more.")], stop_reason="end_turn"),  # Ended without calling a tool
+    Step([Reasoning("Let me weigh the evidence")], stop_reason="max_tokens"),
+    Step([], stop_reason="SAFETY"),
+    Step([Text("Let me search for more.")], stop_reason="end_turn"),
     Step([Text('{"integrity": "intact", "justification": "No certainty."}')], stop_reason="end_turn"),
 ])
 def test_a_final_response_without_a_valid_answer_is_no_answer(monkeypatch, final):
@@ -167,7 +167,6 @@ def test_a_final_response_without_a_valid_answer_is_no_answer(monkeypatch, final
 
     assert no_answer.value.status == "no_answer"
     assert f"(stop reason: {final.stop_reason})" in str(no_answer.value)
-    # Everything up to it is kept
     result = no_answer.value.result
     assert result.verdict is None and result.encountered_urls == ["https://example.com/a"]
     assert result.trace[-1] == {"turn": 1, "type": "stop", "reason": final.stop_reason}
@@ -229,7 +228,6 @@ def test_the_claim_media_follow_its_text_frames_without_native_video(monkeypatch
     checker.check_claim("claim", image_paths=[image_path], video_paths=[str(video_path)], claim_date="2024-02-05")
     before, image, between, frames, after = checker.conversation[0]
     assert before.endswith('# The Claim\n"claim <image:1>')
-    # The claim's image as it is
     assert image == Image("image/png", Path(image_path).read_bytes())
     assert (between, frames) == ("<video:1> (1 frames of the video)", frame)
     assert after.startswith('"\nPublished on: February 05, 2024')
@@ -279,7 +277,6 @@ def test_long_page_videos_reach_native_video_models_as_frames(monkeypatch, tmp_p
     assert checker._parts([video], claim=True) == [video.reference, video]
     monkeypatch.setattr(ezmm.Video, "duration", property(lambda video: 120.0))
     assert checker._parts([video]) == [video.reference, video]
-    # A video whose length can't be read, as ezMM can't open it
     monkeypatch.setattr(ezmm.Video, "duration", property(_unopenable))
     monkeypatch.setattr(base, "extract_video_frames", lambda path, n, max_side: [])
     assert checker._parts([video]) == [f"{video.reference} (0 frames of the video)"]
@@ -300,7 +297,6 @@ def test_sequences_become_text_with_each_medium_after_its_reference(monkeypatch,
     parts = ScriptedFactChecker([FINAL], media_limits=MediaLimits(page_image_side=1000))._parts(sequence)
     assert [p if isinstance(p, str) else type(p).__name__ for p in parts] == [
         "Intro <image:1>", "Image", "middle <video:1> (2 frames of the video)", "Image", "Image", "end"]
-    # Scaled down to max_side, as JPEG
     assert parts[1].mime_type == "image/jpeg"
     assert PILImage.open(io.BytesIO(parts[1].data)).size == (1000, 500)
 
@@ -323,4 +319,4 @@ def test_the_conversation_and_tool_session_are_ended_even_if_the_claim_fails(mon
     with pytest.raises(FactCheckError):
         checker.check_claim("claim", claim_date="2024-02-05")
     assert ended == [checker.conversation]
-    assert len(closed) == 1  # Its page media get deleted
+    assert len(closed) == 1

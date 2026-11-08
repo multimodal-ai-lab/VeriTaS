@@ -18,7 +18,6 @@ from ..common.prompts import build_prompt
 from ..common.tools import ToolSession, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
 from ..common.types import FactCheckError, FactCheckResult, NoAnswerError, MAX_RETRIES, BASE_DELAY, MAX_DELAY
 
-# Import API keys from Veritas config (if available)
 try:
     from veritas import api_secrets
 except ImportError:
@@ -33,28 +32,22 @@ Part = str | Image | ezmm.Video
 
 
 def only_text(parts: list[Part]) -> str | None:
-    """The text of `parts` if they are text alone, else None."""
     return parts[0] if len(parts) == 1 and isinstance(parts[0], str) else None
 
 
-# How much the model reasons, in every provider's API (see `reasoning_effort` in BaseFactChecker)
 DEFAULT_REASONING_EFFORT = "medium"
 
-# HTTP status codes of rate limits and transient server errors, which are retried.
-# 529: Anthropic's API is overloaded.
+# 529: Anthropic's API is overloaded
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 529}
 
 
 def is_retryable(error: Exception) -> bool:
-    """Whether `error` is a rate limit or a transient server error, judged by its HTTP status
-    code: `status_code` in the OpenAI and Anthropic SDKs, `code` in Google's."""
+    """The HTTP status is `status_code` in the OpenAI and Anthropic SDKs, `code` in Google's."""
     status = getattr(error, "status_code", None) or getattr(error, "code", None)
     return status in RETRYABLE_STATUS_CODES
 
 
 def resolve_api_key(api_key: str | None, secret_name: str, env_var: str) -> str:
-    """The API key: `api_key` if given, else `api_secrets.<secret_name>` from config.yaml,
-    else the environment variable `env_var`."""
     key = api_key or (api_secrets or {}).get(secret_name) or os.environ.get(env_var)
     if not key:
         raise ValueError(
@@ -68,15 +61,12 @@ def resolve_api_key(api_key: str | None, secret_name: str, env_var: str) -> str:
 
 @dataclass
 class ToolCall:
-    """A tool call of the model."""
-
     id: str | None
     name: str
     args: dict | None  # None if the model's arguments were not a JSON object
 
     @classmethod
     def from_json(cls, id: str | None, name: str, arguments: str | None) -> "ToolCall":
-        """A tool call whose arguments are a JSON string, as in OpenAI's APIs."""
         try:
             args = json.loads(arguments or "{}")
         except json.JSONDecodeError:
@@ -93,15 +83,12 @@ class Reasoning:
 
 @dataclass
 class Text:
-    """Text the model wrote."""
-
     text: str
 
 
 @dataclass
 class Step:
-    """One model call: its output in order (reasoning, text and tool calls), the tokens it used
-    and why the model stopped, as its API says ("end_turn", "max_tokens", "SAFETY", ...).
+    """One model call. stop_reason is the API's own ("end_turn", "max_tokens", "SAFETY", ...).
     input_tokens counts the whole prompt, the tokens read from and written to the API's prompt
     cache included."""
 
@@ -131,10 +118,8 @@ class BaseFactChecker(ABC):
 
     Every provider runs the same baseline: the model verifies the claim with the
     web_search and fetch_url tools and answers with the claim's integrity, its certainty
-    and a justification in JSON, which make a label of the 7-class scheme. The loop lives
-    in `check_claim`; a provider only
-    implements its API's message format in `_start_conversation`, `_step` and
-    `_add_tool_results`.
+    and a justification in JSON, which make a label of the 7-class scheme. The loop lives in
+    `check_claim`; a provider only implements its API's message format in the abstract methods.
     """
 
     provider_name: str = "base"
@@ -234,17 +219,13 @@ class BaseFactChecker(ABC):
         conversation = self._start_conversation(self._parts(prompt, claim=True))
 
         tokens = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
-        # The tokens, and the cost if the API says it
         usage = dict.fromkeys(tokens, 0)
-        # Everything that happened, in order: the model's reasoning, text and tool calls, why it
-        # stopped, the tool results and the messages to it
         trace = [{"type": "prompt", "text": render(prompt)}]
         step = Step([])
         try:
             for turn in range(MAX_TURNS):
                 last_turn = turn == MAX_TURNS - 1
                 if last_turn:
-                    # Tool use is disabled to force a verdict, and the model is told so
                     self._add_text(conversation, LAST_TURN_MESSAGE)
                     trace.append({"turn": turn, "type": "message", "text": LAST_TURN_MESSAGE})
                 step = self._call_with_retry(self._step, conversation, allow_tools=not last_turn, log=session.log)
@@ -255,7 +236,6 @@ class BaseFactChecker(ABC):
                 trace += [{"turn": turn, "type": TRACE_TYPES[type(item)], **asdict(item)} for item in step.output]
                 trace.append({"turn": turn, "type": "stop", "reason": step.stop_reason})
 
-                # The model is done once it stops calling tools
                 if not step.tool_calls:
                     break
                 results = [session.call(call.name, call.args) for call in step.tool_calls]
@@ -277,11 +257,8 @@ class BaseFactChecker(ABC):
         return result
 
     def _parts(self, sequence: ItemSequence, claim: bool = False) -> list[Part]:
-        """An ezMM sequence as the model gets it, in order: its text, with each image and video
-        right after its reference, so that the model can name it. The claim's images stay as they
-        are unless larger than claim_image_side; a page's become JPEGs of at most page_image_side
-        (see MediaLimits). Videos are frames unless the provider has native_video, and so are
-        page videos longer than native_video_seconds. Adjacent text is joined, as by ezMM."""
+        """An ezMM sequence as the model gets it: its text, with each image and video right after
+        its reference, so that the model can name it. Adjacent text is joined, as by ezMM."""
         limits = self.media_limits
         max_side = limits.claim_image_side if claim else limits.page_image_side
         parts = []
@@ -306,8 +283,7 @@ class BaseFactChecker(ABC):
         return parts
 
     def _is_short(self, video: ezmm.Video) -> bool:
-        """Whether a page video is at most native_video_seconds long. Not if its length can't be
-        read: ezMM raises for a file it can't open."""
+        """False if the length can't be read: ezMM raises for a file it can't open."""
         try:
             return video.duration <= self.media_limits.native_video_seconds
         except Exception:
@@ -337,7 +313,6 @@ class BaseFactChecker(ABC):
         """Add text to the conversation as the user's, after the last tool results."""
 
     def _make_result(self, final_text: str, session: ToolSession, usage: dict, trace: list[dict]) -> FactCheckResult:
-        """Build the result of a fact-check from the model's final response, its tool session and its trace."""
         justification = extract_justification(final_text)
         citations = list(dict.fromkeys(
             session.encountered_urls + session.retrieved_urls + extract_urls(final_text)

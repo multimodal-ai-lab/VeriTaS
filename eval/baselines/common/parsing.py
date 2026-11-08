@@ -58,10 +58,9 @@ _BARE_URL = re.compile(r"https?://[^\s<>\"'\[\]]+")
 
 
 def _link_url(target: str, base_url: str | None) -> str | None:
-    """The URL a markdown link's target points to: the target itself if it is absolute,
-    resolved against `base_url` if it is relative ("/about", "//cdn.example.org/a.jpg"). None
-    if it is relative and there is no `base_url`, or if it points to no web page ("#top",
-    "mailto:...", "javascript:;")."""
+    """A relative target ("/about", "//cdn.example.org/a.jpg") is resolved against `base_url`.
+    None if there is none, or if the target points to no web page ("#top", "mailto:...",
+    "javascript:;")."""
     if target.startswith(("http://", "https://")):
         return target
     if base_url is None or target.startswith("#"):

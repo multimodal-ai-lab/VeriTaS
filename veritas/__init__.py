@@ -24,8 +24,7 @@ nextcloud = globals.get("nextcloud")
 # Any other initialization
 set_ezmm_path(ezmm_path)
 
-# Point the scrapeMM client at its server. persist=False keeps the API key out of
-# scrapeMM's per-user config file.
+# persist=False keeps the API key out of scrapeMM's per-user config file
 if scrapemm_config.get("url"):
     scrapemm.configure(api_url=scrapemm_config["url"], api_key=scrapemm_config.get("api_key"), persist=False)
 

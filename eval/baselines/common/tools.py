@@ -1,25 +1,13 @@
-"""
-Retrieval tools for the fact-checking baseline.
+"""Retrieval tools for the fact-checking baseline: web_search (Google via Serper, on the
+scrapeMM server) and fetch_url (a page's main content, via the scrapeMM server).
 
-The model verifies a claim with two tools:
-- web_search: Google results (Serper, via the scrapeMM server) published before the
-  claim date. Returns titles, URLs, dates and snippets only.
-- fetch_url: The main content of a web page, without navigation, headers, footers and
-  the like (via the scrapeMM server): its text, truncated to MAX_FETCH_CHARS characters,
-  and some of its images and videos in their places (see MediaLimits).
-  Only URLs the model has seen, in web_search results or in fetched pages, can be
-  fetched: any other would bypass the cutoff (a search engine's results page, an
-  archived copy, or a fact-check the model remembers).
+fetch_url only fetches URLs the model has seen in web_search results or fetched pages: any
+other would bypass the cutoff (a search engine's results page, an archived copy, a
+fact-check the model remembers).
 
-scrapeMM is the client of a scrapeMM server. Its URL and API key are read from the
-`scrapemm` section of config.yaml (see veritas/__init__.py), or else from the
-SCRAPEMM_API_URL / SCRAPEMM_API_KEY environment variables.
-
-Cutoff semantics: the claim's own day is excluded, not just capped. Search APIs filter
-at day granularity with an inclusive end date, so a cutoff on the claim day itself would
-admit content published hours *after* the claim. scrapeMM's `SerperQuery(before=day)`
-leaves out the given day and everything after it, so the claim day is passed as `before`
-as is (see `build_search_query`).
+The claim's own day is excluded from web_search, not just capped: search APIs filter at
+day granularity with an inclusive end date, so a cutoff on the claim day itself would
+admit content published hours *after* the claim.
 """
 
 import asyncio
@@ -31,7 +19,7 @@ import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Literal
@@ -43,6 +31,7 @@ from scrapemm import QuotaExceededError, RateLimitError, ServerError, retrieve
 from scrapemm.common.outcome import decisive_error
 from scrapemm.search import SerperOrganicResult, SerperQuery, search
 
+from .google_links import GoogleLinkResolver, is_google_redirect, is_hidden_redirect, plain_target
 from .media import ItemSequence, MediaLimits, is_readable_image, render
 from .parsing import extract_urls, remove_links
 
@@ -51,31 +40,28 @@ try:
 except ImportError:
     pass
 
-MAX_FETCH_CHARS = 25_000  # Maximum characters of page content returned by fetch_url
-DEFAULT_MAX_SEARCHES = 40  # Maximum web_search calls per claim
-DEFAULT_MAX_FETCHES = 40  # Maximum fetch_url calls per claim
-MAX_VIDEO_BYTES = 50 * 1024 * 1024  # Larger videos are downloaded at a lower resolution
-# Seconds a fetch_url call may take. A fetch can hang on the scrapeMM server, whose heartbeats
-# keep the client from timing out, and with it the fact-check and the end of the run.
+MAX_FETCH_CHARS = 25_000
+DEFAULT_MAX_SEARCHES = 40
+DEFAULT_MAX_FETCHES = 40
+MAX_VIDEO_BYTES = 50 * 1024 * 1024  # Larger videos are downscaled, not refused
+# A fetch can hang on the scrapeMM server, whose heartbeats keep the client from timing out
 FETCH_TIMEOUT = 180
 NUM_SEARCH_RESULTS = 10
-MAX_SEARCH_PAGES = 3  # Pages of Google results web_search requests at most to get NUM_SEARCH_RESULTS unblocked ones
+MAX_SEARCH_PAGES = 3
 SEARCH_RETRIES = 3
+UNRESOLVED_REDIRECT = "behind a Google redirect that could not be resolved"
 
 ScrapeMethods = list[str] | Literal["auto"]
 
 
 class SearchQuotaExceededError(BaseException):
-    """Raised when the search provider's credits are used up. Inherits BaseException so it
-    propagates past bare `except Exception` handlers and terminates the run."""
+    """Inherits BaseException to propagate past the bare `except Exception` handlers and
+    terminate the run."""
 
 
 class _AsyncRunner:
-    """Manages a single background thread with an event loop for running async code.
-
-    This avoids creating new threads/event loops for each scrape operation,
-    preventing file descriptor exhaustion under concurrent load.
-    """
+    """One background thread with an event loop for all async calls: a thread and loop per
+    scrape exhausted file descriptors under concurrent load."""
 
     _instance = None
     _lock = threading.Lock()
@@ -98,7 +84,6 @@ class _AsyncRunner:
         self._start_lock = threading.Lock()
 
     def _start_loop(self):
-        """Start the background event loop thread."""
         with self._start_lock:
             if self._started:
                 return
@@ -109,57 +94,46 @@ class _AsyncRunner:
             atexit.register(self._shutdown)
 
     def _run_loop(self):
-        """Run the event loop forever in the background thread."""
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
     def _shutdown(self):
-        """Shutdown the event loop cleanly."""
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
             if self._thread:
                 self._thread.join(timeout=5)
 
     def run(self, coro):
-        """Run a coroutine and return its result (blocking)."""
         if not self._started:
             self._start_loop()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result()
 
 
-# Global async runner instance
 _async_runner = _AsyncRunner()
 
 
 def _run_async(coro):
-    """Run an async coroutine from sync code using a shared background event loop."""
     return _async_runner.run(coro)
 
 
-# =============================================================================
-# The fetched pages' media
-# =============================================================================
-
 class _PageMediaFiles:
-    """The files of the fetched pages' media, as scrapeMM downloads them into ezMM's store, and
-    how many running fact-checks use each. Parallel fact-checks can fetch pages that share a
-    file (a site's logo, say), so a file is deleted only once none uses it any more, and only
-    in a temporary store (see temporary_media_store): never a persistent store's files, nor the
-    claim's own, which ezMM gives a page's identical medium."""
+    """How many running fact-checks use each file of the fetched pages' media. Parallel
+    fact-checks can fetch pages that share a file (a site's logo), so a file is deleted only
+    once none uses it, and only in a temporary store (see temporary_media_store): never a
+    persistent store's files, nor the claim's own, which ezMM gives a page's identical medium."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._users: Counter[Path] = Counter()
-        self.temporary_store: Path | None = None  # Set by temporary_media_store
+        self.temporary_store: Path | None = None
 
     def acquire(self, paths: set[Path]):
         with self._lock:
             self._users.update(paths)
 
     def release(self, paths: set[Path]):
-        """Stop using the files, deleting those in the temporary store that no fact-check uses."""
-        with self._lock:  # Also while deleting, so that no fact-check takes up a file being deleted
+        with self._lock:  # Also while deleting: no fact-check may take up a file being deleted
             self._users.subtract(paths)
             for path in paths:
                 if self._users[path] <= 0:
@@ -173,13 +147,13 @@ _page_media_files = _PageMediaFiles()
 
 @contextmanager
 def temporary_media_store() -> Iterator[Path]:
-    """While the block runs, keep ezMM's items, among them the media scrapeMM downloads for
-    fetched pages, in a temporary folder on local disk (in $TMPDIR, else /tmp), and delete each
-    fact-check's page media when it ends. The folder is deleted afterwards.
+    """Keep ezMM's store, with the media scrapeMM downloads for fetched pages, in a temporary
+    folder on local disk while the block runs, and delete each fact-check's page media when it
+    ends.
 
     ezMM's store is an SQLite database, and scrapeMM registers every medium of a page in it, one
     write transaction each. On a network file system (the repository's .ezmm/ on /mnt/vast),
-    each of them waits for a lock: fetches took minutes. Slurm jobs on several nodes sharing the
+    each waits for a lock: fetches took minutes. Slurm jobs on several nodes sharing the
     database could also corrupt it.
     """
     previous = item_registry.path
@@ -194,15 +168,11 @@ def temporary_media_store() -> Iterator[Path]:
 
 
 def _use_store(path: Path):
-    """Point ezMM's registry, which scrapeMM's client uses too, to the store at `path`."""
+    """scrapeMM's client uses ezMM's registry too."""
     item_registry.close()  # ezMM can't move a registry with open connections
     item_registry.clear_cache()
     set_ezmm_path(path)
 
-
-# =============================================================================
-# Tool definitions
-# =============================================================================
 
 WEB_SEARCH_TOOL = {
     "name": "web_search",
@@ -242,31 +212,23 @@ TOOL_DEFINITIONS = [WEB_SEARCH_TOOL, FETCH_URL_TOOL]
 
 
 def responses_tools() -> list[dict]:
-    """The tools in OpenAI Responses API format. Not strict, as in the other APIs: the
-    Responses API makes functions strict by default, which our schemas don't satisfy."""
+    """The Responses API makes functions strict by default, which our schemas don't satisfy."""
     return [{"type": "function", "strict": False, **tool} for tool in TOOL_DEFINITIONS]
 
 
 def chat_completions_tools() -> list[dict]:
-    """The tools in OpenAI chat completions format (as served by vLLM)."""
     return [{"type": "function", "function": tool} for tool in TOOL_DEFINITIONS]
 
 
 def anthropic_tools() -> list[dict]:
-    """The tools in Anthropic format."""
     return [
         {"name": tool["name"], "description": tool["description"], "input_schema": tool["parameters"]}
         for tool in TOOL_DEFINITIONS
     ]
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
 def normalize_scrape_methods(methods: list[str] | str | None) -> ScrapeMethods:
-    """Normalize `methods` into the form scrapeMM's retrieve() expects:
-    either the literal "auto" or a non-empty list[str] of backend names."""
+    """scrapeMM's retrieve() takes the literal "auto" or a non-empty list of backend names."""
     if methods is None or methods == "auto" or methods == ["auto"]:
         return "auto"
     if isinstance(methods, str):
@@ -276,11 +238,8 @@ def normalize_scrape_methods(methods: list[str] | str | None) -> ScrapeMethods:
 
 
 def parse_claim_day(claim_date: str | datetime | date | None) -> date | None:
-    """Return the calendar day a claim was made on, or None if no date is given.
-
-    Raises ValueError for a date that cannot be parsed, so that a malformed date never
-    silently degrades into an unfiltered search.
-    """
+    """Raises ValueError for a date that cannot be parsed, so that a malformed date never
+    silently degrades into an unfiltered search."""
     if claim_date is None or claim_date == "":
         return None
     if isinstance(claim_date, datetime):
@@ -294,11 +253,8 @@ def parse_claim_day(claim_date: str | datetime | date | None) -> date | None:
 
 
 def build_search_query(query: str, cutoff_date: str | datetime | date | None, page: int = 1) -> SerperQuery:
-    """Build the Serper query for a page of a web_search call's Google results.
-
-    The cutoff day itself is passed as `before`: scrapeMM leaves out that day and
-    everything after it (Google's `cd_max` becomes the day before the cutoff).
-    """
+    """The cutoff day itself is passed as `before`: scrapeMM leaves out that day and
+    everything after it (Google's `cd_max` becomes the day before the cutoff)."""
     return SerperQuery(
         q=query,
         num=NUM_SEARCH_RESULTS,
@@ -310,7 +266,6 @@ def build_search_query(query: str, cutoff_date: str | datetime | date | None, pa
 
 
 def format_search_results(query: str, results: list[SerperOrganicResult]) -> str:
-    """Format web_search results for the model."""
     if not results:
         return f"**No results found for query: {query}**"
 
@@ -327,13 +282,12 @@ def format_search_results(query: str, results: list[SerperOrganicResult]) -> str
 
 
 def _page_of(url: str) -> str:
-    """The normalized URL without its query (see normalize_url): blocked URLs are blocked
-    whatever tracking parameters they come with."""
+    """Without the query: blocked URLs are blocked whatever tracking parameters they come with."""
     return normalize_url(url).split("?", 1)[0]
 
 
 def _ascii_host(host: str) -> str:
-    """A host name in lower case and ASCII, as the publishers' fact-check scopes have it
+    """Lower case and ASCII, as the publishers' fact-check scopes have it
     ("XN--80AA.example.org" or its Unicode form -> "xn--80aa.example.org")."""
     try:
         return host.lower().encode("idna").decode("ascii")
@@ -342,43 +296,37 @@ def _ascii_host(host: str) -> str:
 
 
 def _scope_of(scope: str) -> tuple[str, str]:
-    """A publisher's fact-check scope, or a blocked URL, as the host and the path under which it
-    publishes its fact-checks, the path in lower case ("leadstories.com/hoax-alert" ->
-    ("leadstories.com", "hoax-alert"), "fullfact.org" -> ("fullfact.org", ""),
-    "https://www.example.org/a/b/?x=1" -> ("example.org", "a/b"))."""
+    """A fact-check scope or blocked URL as host and lower-case path ("leadstories.com/hoax-alert"
+    -> ("leadstories.com", "hoax-alert"), "https://www.example.org/a/b/?x=1" -> ("example.org", "a/b"))."""
     host, _, path = _page_of(scope if "://" in scope else f"https://{scope}").partition("/")
     return _ascii_host(host), path.lower()
 
 
-# A host, maybe with a path, in a search result's title or snippet, with or without scheme
-# ("leadstories.com/hoax-alert/2026/07/..."), but not in an e-mail address
+# A host, maybe with a path, with or without scheme ("leadstories.com/hoax-alert/2026/07/..."),
+# but not in an e-mail address
 _HOST_AND_PATH = re.compile(r"(?<![\w.@-])(?:https?://)?(?:www\.)?((?:[\w-]+\.)+[^\W\d_]{2,})(?:/([^\s\"'<>()\[\]]*))?")
 # The spaces with which Google breaks URLs and slugs in titles and snippets, before or after a
 # "-", "/" or "." ("https://maldita. es/desinfo/...", "2026-09-15- maryam-...")
 _GOOGLE_BREAK = re.compile(r"(?<=[-/.]) | (?=[-/.])")
 
-# The shortest slug that tells an article apart from all others
 MIN_SLUG_LENGTH = 12
-# The shortest piece of a slug that counts as the slug where Google cut it short in a search
-# result's title or snippet ("...hontiveros-did-not-say-she-would-not-run ...")
+# A piece this long counts as the slug where Google cut it short in a title or snippet
 MIN_SLUG_PIECE_LENGTH = 20
 
 
 def _slug_of(url: str) -> str | None:
-    """The slug of an article's URL, the last segment of its path with a letter in it
-    ("https://www.dogrulukpayi.com/dogruluk-kontrolu/ucuz-mama-kedileri-gay-yapar-mi" ->
-    "ucuz-mama-kedileri-gay-yapar-mi"). None if it is too short to tell the article apart, as
-    "n-31898"."""
+    """The last path segment with a letter in it ("https://www.dogrulukpayi.com/dogruluk-kontrolu/
+    ucuz-mama-kedileri-gay-yapar-mi" -> "ucuz-mama-kedileri-gay-yapar-mi"). None if too short to
+    tell the article apart, as "n-31898"."""
     _, *segments = _page_of(url).split("/")
     slug = next((segment for segment in reversed(segments) if re.search(r"[^\W\d_]", segment)), "")
     return slug if len(slug) >= MIN_SLUG_LENGTH else None
 
 
 def normalize_url(url: str) -> str:
-    """A URL as fetch_url compares it with the URLs the model has seen: without scheme, "www.",
-    trailing slash and fragment, host in lower case and percent-encoding decoded
-    ("https://www.Example.org/a%20b/#top" -> "example.org/a b"). The model may write a URL it
-    saw in any of these forms. "" if the URL has no host."""
+    """Without scheme, "www.", trailing slash and fragment, host in lower case and
+    percent-encoding decoded ("https://www.Example.org/a%20b/#top" -> "example.org/a b"): the
+    model may write a URL it saw in any of these forms. "" if the URL has no host."""
     try:
         parts = urlsplit(url.strip())
     except ValueError:  # Malformed, e.g. "https://[x"
@@ -390,18 +338,12 @@ def normalize_url(url: str) -> str:
     return f"{host}{unquote(parts.path).rstrip('/')}{query}"
 
 
-# =============================================================================
-# Tool execution
-# =============================================================================
-
 @dataclass
 class ToolResult:
-    """What a tool call returns to the model, as an ezMM sequence: text and, of a fetched
-    page, the images and videos shown, in their places. Text alone may be given as a string."""
+    """Text and, of a fetched page, the images and videos shown, in their places."""
 
     content: ItemSequence | str
-    # The page's media shown, for the trace: their reference, kind and source URL (their files are
-    # deleted after the fact-check in a temporary store)
+    # For the trace: reference, kind and source URL of each medium shown
     media: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
@@ -415,11 +357,8 @@ class ToolResult:
 
 
 class ToolSession:
-    """Executes the tool calls of a single fact-check.
-
-    Holds the per-claim state (call counts, the URLs the model saw and retrieved), so
-    create one per claim: providers are shared across worker threads.
-    """
+    """The tool calls of a single fact-check: one per claim, providers are shared across
+    worker threads."""
 
     def __init__(
         self,
@@ -434,40 +373,27 @@ class ToolSession:
         cutoff_date: str | datetime | date | None = None,
         blocked_scopes: Iterable[str] = (),
         claim_images: int = 0,
+        link_resolver: GoogleLinkResolver | None = None,
     ):
         """
         Args:
-            claim_date: Date of the claim, which the prompt gives. Raises ValueError if it cannot
-                        be parsed, as does cutoff_date.
-            scrape_methods: Which scrapeMM backends fetch_url uses, in order. A subset of
-                            {"integrations", "browser", "firecrawl", "decodo"}, or "auto"
-                            to let the scrapeMM server choose per domain.
-            max_searches: Maximum number of web_search calls.
-            max_fetches: Maximum number of fetch_url calls.
-            max_fetch_chars: Maximum characters of page content returned by fetch_url.
-            media_limits: How many images and videos of the fetched pages are shown.
-            blocked_urls: URLs the tools never show or fetch, and whose links fetched pages
-                          lose: the claim's own fact-checks, which would give the answer away.
-                          They are blocked like blocked_scopes, with all pages under them
-                          (".../amp"), and so is any URL with their slug in its path, on any
-                          site (see _slug_of): sites serve an article under several paths, and
-                          archives and other sites copy it. A search result whose title or
-                          snippet has the slug, or a piece of it, is dropped too. Google's date
-                          filter lets them through at times, and fact-checkers' pages link to
-                          them in their current versions.
-            claim_id: ID of the claim, which tags the session's log lines.
-            cutoff_date: web_search only returns content published before this day: the day the
-                         claim's fact-check was published. The claim date if not given.
-            blocked_scopes: The fact-check scopes of fact-checkers: the hosts, or hosts and
-                            paths, under which they publish fact-checks
-                            ("leadstories.com/hoax-alert"), e.g. those of all IFCN signatories
-                            and EFCSN members. URLs in them, whatever their scheme, "www.", query
-                            and fragment, are blocked: search results that are or show them are
-                            dropped, fetch_url refuses them and fetched pages lose their links.
-                            The rest of the sites is not blocked.
-            claim_images: The images the claim's media take in every request (its images, and
-                          the frames of its videos for models without native video), which
-                          count toward media_limits.request_images.
+            claim_date: Raises ValueError if it cannot be parsed, as does cutoff_date.
+            scrape_methods: scrapeMM backends in order, a subset of {"integrations", "browser",
+                            "firecrawl", "decodo"}, or "auto" to let the server choose per domain.
+            blocked_urls: The claim's own fact-checks: blocked like blocked_scopes, with all
+                          pages under them (".../amp"), and so is any URL with their slug in its
+                          path on any site and any search result whose title or snippet has the
+                          slug or a piece of it. Google's date filter lets them through
+                          at times, and fact-checkers' pages link to them in their current versions.
+            cutoff_date: The day the claim's fact-check was published; the claim date if not given.
+            blocked_scopes: Hosts, or hosts and paths, under which fact-checkers publish
+                            fact-checks ("leadstories.com/hoax-alert"), e.g. of all IFCN
+                            signatories and EFCSN members. URLs in them are blocked whatever
+                            their scheme, "www.", query and fragment; the rest of the site is not.
+            claim_images: The images the claim's media take in every request (video frames for
+                          models without native video), which count toward
+                          media_limits.request_images.
+            link_resolver: One with the Serper API key of config.yaml or the environment if not given.
         """
         self.log_prefix = f"[{claim_id}] " if claim_id is not None else ""
         self.claim_day = parse_claim_day(claim_date)
@@ -480,8 +406,7 @@ class ToolSession:
         self.max_fetch_chars = max_fetch_chars
         self.media_limits = media_limits
         self.claim_images = claim_images
-        # Host -> the paths at and under which all is blocked ("" for all of the host), each with
-        # the rule that blocks it, for the log (see blocked_by)
+        # Host -> blocked path ("" for the whole host) -> the rule that blocks it, for the log
         self.blocked_scopes: dict[str, dict[str, str]] = {}
         for entry, rule in [*((url, f"at or under the claim's fact-check {url}") for url in blocked_urls),
                             *((scope, f"in the fact-check scope {scope}") for scope in blocked_scopes)]:
@@ -489,30 +414,26 @@ class ToolSession:
             if host:
                 self.blocked_scopes.setdefault(host, {}).setdefault(path, rule)
         self.blocked_slugs = {_slug_of(url) for url in blocked_urls} - {None}
+        self.link_resolver = link_resolver or GoogleLinkResolver()
 
         self.n_searches = 0
         self.n_fetches = 0
-        self.encountered_urls: list[str] = []  # URLs of the web_search results, in order
-        self.retrieved_urls: list[str] = []  # URLs successfully fetched with fetch_url, in order
-        self.linked_urls: list[str] = []  # URLs in the fetched content shown to the model, in order
-        self.shown_media: list[dict] = []  # The fetched pages' images and videos shown to the model
-        # The web_search results dropped and the fetch_url calls refused because they are or show
-        # a blocked URL, in order: {"tool", "url", "rule"} (see blocked_by), and "query" for searches
+        self.encountered_urls: list[str] = []  # Of the web_search results
+        self.retrieved_urls: list[str] = []
+        self.linked_urls: list[str] = []  # In the fetched content shown to the model
+        self.shown_media: list[dict] = []
+        # {"tool", "url", "rule"} per dropped search result or refused fetch, and "query" for searches
         self.blocked: list[dict] = []
-        self.media_files: set[Path] = set()  # The files of all media of the fetched pages, shown or not
+        self.media_files: set[Path] = set()  # Of all media of the fetched pages, shown or not
 
     def log(self, message: str):
-        """Print a log line, tagged with the claim it belongs to: claims run in parallel."""
         print(f"    {self.log_prefix}{message}")
 
     def close(self):
-        """End the session: the files of the fetched pages' media get deleted, unless another
-        fact-check uses them too (in a temporary store only, see temporary_media_store)."""
         _page_media_files.release(self.media_files)
         self.media_files = set()
 
     def call(self, name: str, args: dict | None) -> ToolResult:
-        """Execute a tool call and return its result for the model."""
         if not isinstance(args, dict):
             return ToolResult(f"Error: Invalid arguments for {name}. Expected a JSON object.")
         if name == "web_search":
@@ -522,7 +443,6 @@ class ToolSession:
         return ToolResult(f"Error: Unknown tool '{name}'. Available tools: web_search, fetch_url.")
 
     def web_search(self, query: str) -> str:
-        """Search the web for content published before the cutoff date."""
         if not query.strip():
             return "Error: The search query must not be empty."
         if self.n_searches >= self.max_searches:
@@ -543,10 +463,9 @@ class ToolSession:
 
     def _search(self, query: str, want: int = NUM_SEARCH_RESULTS,
                 max_pages: int = MAX_SEARCH_PAGES) -> tuple[list[SerperOrganicResult], int, int]:
-        """The first `want` results for `query` that neither are nor show a blocked URL, from as
-        many pages of Google results as it takes, up to `max_pages`: blocked results leave a page
-        with fewer. A page with fewer than NUM_SEARCH_RESULTS results is not always the last, and
-        later pages repeat some results, so paging stops at a page that brings no new result.
+        """The first `want` unblocked results, from up to `max_pages` pages of Google results. A
+        page with fewer than NUM_SEARCH_RESULTS results is not always the last, and later pages
+        repeat some results, so paging stops at a page that brings no new result.
 
         Returns the results, the number of blocked results and the number of pages requested.
         """
@@ -554,15 +473,18 @@ class ToolSession:
         for page in range(1, max_pages + 1):
             # Only organic results: the knowledge graph, answer box, top stories etc. are not
             # date-filtered by Google and would leak information from after the claim date.
-            new = [r for r in self._search_page(query, page).organic if r.link and r.link not in seen]
+            organic = self._resolve_redirects(self._search_page(query, page).organic, query)
+            new = [r for r in organic if r.link and r.link not in seen]
             if not new:
                 return results, n_blocked, page
             seen.update(r.link for r in new)
-            # Also the results whose title or snippet shows a blocked URL: mostly the
-            # fact-checkers' own posts, which give a fact-check's headline with its URL
+            # A title or snippet showing a blocked URL is mostly a fact-checker's own post, which
+            # gives the fact-check's headline with its URL
             allowed = []
             for r in new:
-                if reason := self.blocked_by(r.link):
+                if is_hidden_redirect(r.link):
+                    rule = f"a URL {UNRESOLVED_REDIRECT}"
+                elif reason := self.blocked_by(r.link):
                     rule = f"a URL {reason}"
                 elif reason := self._blocked_in_preview(f"{r.title or ''} {r.snippet or ''}"):
                     rule = f"whose title or snippet {reason}"
@@ -577,11 +499,20 @@ class ToolSession:
                 return results[:want], n_blocked, page
         return results, n_blocked, max_pages
 
+    def _resolve_redirects(self, results: list[SerperOrganicResult], query: str) -> list[SerperOrganicResult]:
+        """A redirect Serper does not resolve stays as it is."""
+        links = [r.link for r in results]
+        n_redirects = sum(map(is_google_redirect, links))
+        if not n_redirects:
+            return results
+        resolved = _run_async(self.link_resolver.resolve(links, log=self.log))
+        n_resolved = n_redirects - sum(map(is_hidden_redirect, resolved))
+        self.log(f"web_search: {query!r}: resolved {n_resolved} of {n_redirects} Google redirects")
+        return [replace(r, link=link) if link != r.link else r for r, link in zip(results, resolved)]
+
     def _find_blocked_slug(self, text: str) -> tuple[str, re.Match] | None:
-        """Where `text` has the slug of a blocked article, in a URL or not ("fact-checks/<slug>"),
-        also where Google broke it with a space before or after a "-", "/" or "." ("2026-09-15-
-        maryam-..."): `text` decoded and with these spaces taken out, and the slug's match in it.
-        None if it has none."""
+        """`text` decoded and with Google's breaks taken out, and the match of a blocked slug in
+        it, in a URL or not ("fact-checks/<slug>"). None if it has none."""
         text = _GOOGLE_BREAK.sub("", unquote(text))
         for slug in self.blocked_slugs:
             if match := re.search(r"(?<![\w-])" + re.escape(slug) + r"(?![\w-])", text):
@@ -589,11 +520,9 @@ class ToolSession:
         return None
 
     def _slug_in(self, text: str) -> str | None:
-        """Which slug of a blocked article `text` has (see _find_blocked_slug), or which piece of
-        one, where Google cut it short at either end in a search result's title or snippet: a word
-        or path segment of `text` of at least MIN_SLUG_PIECE_LENGTH characters, as the log gives it
-        ("'...-is-false.html', a piece of the slug ..."). Whether a piece is of the blocked article
-        or of another one with a similar slug is unknown. None if it has none."""
+        """The blocked slug `text` has, or a word or path segment of it that is a piece of one,
+        where Google cut the slug short at either end, as the log gives it. Whether a piece is of
+        the blocked article or of another one with a similar slug is unknown. None if it has none."""
         if found := self._find_blocked_slug(text):
             return f"the slug {found[1].group(0)} of the claim's fact-check"
         text = _GOOGLE_BREAK.sub("", unquote(text))
@@ -603,18 +532,16 @@ class ToolSession:
                      if len(part) >= MIN_SLUG_PIECE_LENGTH and part in slug), None)
 
     def _blocked_in_preview(self, preview: str) -> str | None:
-        """What blocked a search result's title or snippet shows, for the log ("shows
-        leadstories.com/hoax-alert/..., a URL in the fact-check scope leadstories.com/hoax-alert"):
-        the slug of a blocked URL or a piece of it (see _slug_in), or a blocked URL, with or without
-        scheme, also where Google broke it with spaces after or before a ".", "-" or "/"
-        ("https://leadstories. com/hoax-alert/...") or cut it short: then if it is the start of a
-        blocked URL or of a blocked fact-check scope ("https://leadstories.com/hoa ..."). Whether
-        that is the blocked article or another one of the site is unknown. None if it shows none."""
+        """What blocked a title or snippet shows, for the log: a blocked slug or a piece of it
+        (see _slug_in), or a blocked URL, also where Google broke it with spaces
+        ("https://leadstories. com/hoax-alert/...") or cut it short, then if it is the start of a
+        blocked URL or scope ("https://leadstories.com/hoa ..."), whether or not that is the
+        blocked article. None if it shows none."""
         if slug := self._slug_in(preview):
             return f"has {slug}"
         scopes = [(f"{host}/{path}".rstrip("/"), rule)
                   for host, paths in self.blocked_scopes.items() for path, rule in paths.items()]
-        # As it is and with Google's breaks taken out, which also join a sentence to the next
+        # Both as it is and without Google's breaks, which also join a sentence to the next
         text = unquote(preview)
         for text in (text, _GOOGLE_BREAK.sub("", text)):
             for m in _HOST_AND_PATH.finditer(text):
@@ -628,13 +555,13 @@ class ToolSession:
         return None
 
     def blocked_by(self, url: str) -> str | None:
-        """Why `url` is blocked, as the log gives it ("in the fact-check scope fullfact.org"): it is
-        at or under a blocked URL or in a blocked fact-check scope, whatever its scheme, "www.",
-        query and fragment: on the same host (subdomains have scopes of their own) and at or under
-        the path, in any case. Or it has the slug of a blocked URL in its path (see _slug_of), on
-        any site: sites serve an article under several paths, e.g. in another section, under
-        another date or on a subdomain, and archives and other sites copy it. None if it is not
-        blocked."""
+        """Why `url` is blocked, as the log gives it, or None: on a blocked host (subdomains have
+        scopes of their own) at or under a blocked path, in any case; or with a blocked slug in
+        its path on any site (sites serve an article under several paths, archives and other
+        sites copy it). A Google redirect with its target in the clear is blocked as its target."""
+        if target := plain_target(url):
+            reason = self.blocked_by(target)
+            return f"{reason}, behind a Google redirect" if reason else None
         host, _, path = _page_of(url).partition("/")
         if slug := next((slug for slug in self.blocked_slugs if slug in path.split("/")), None):
             return f"with the slug {slug} of the claim's fact-check in its path"
@@ -643,12 +570,9 @@ class ToolSession:
                      if not scope_path or path == scope_path or path.startswith(f"{scope_path}/")), None)
 
     def is_blocked(self, url: str) -> bool:
-        """Whether `url` is blocked (see blocked_by)."""
         return self.blocked_by(url) is not None
 
     def _search_page(self, query: str, page: int):
-        """Get a page of Google results for `query` from the scrapeMM server, retrying transient
-        errors."""
         search_query = build_search_query(query, self.cutoff_day, page)
         for attempt in range(SEARCH_RETRIES):
             try:
@@ -661,22 +585,26 @@ class ToolSession:
                 time.sleep(2 ** attempt + random.uniform(0, 1))
 
     def seen_urls(self) -> set[str]:
-        """The URLs fetch_url may fetch, normalized: those of the web_search results and those
-        in fetched pages."""
         return {normalize_url(url) for url in self.encountered_urls + self.linked_urls} - {""}
 
     def fetch_url(self, url: str) -> ToolResult:
-        """Fetch the content of a web page the model has seen a link to: its text and some of
-        its images and videos."""
         url = url.strip()
         if not url.startswith(("http://", "https://")):
             return ToolResult(f"Error: '{url}' is not a valid URL. Provide a full URL starting with http:// or https://.")
         reason = self.blocked_by(url)
+        target = plain_target(url) or url
+        # Search results come resolved, so the model can only have seen such a link in a fetched page
+        if not reason and is_hidden_redirect(url) and normalize_url(url) in self.seen_urls():
+            (target,) = _run_async(self.link_resolver.resolve([url], log=self.log))
+            if is_hidden_redirect(target):
+                reason = UNRESOLVED_REDIRECT
+            elif reason := self.blocked_by(target):
+                reason += ", behind a Google redirect"
         if reason:
             self.blocked.append({"tool": "fetch_url", "url": url, "rule": f"a URL {reason}"})
         if reason or normalize_url(url) not in self.seen_urls():
-            # A blocked URL gets the answer of any URL not seen: another answer would tell the
-            # model that it guessed the claim's fact-check
+            # A blocked URL gets the answer of an unseen one: any other would tell the model it
+            # guessed the claim's fact-check
             self.log(f"fetch_url: {url} -> " + (f"blocked, a URL {reason}" if reason else "rejected, URL not seen"))
             return ToolResult(f"Error: Cannot fetch {url}. fetch_url only fetches URLs that appeared in web_search "
                               f"results or in fetched pages. Use them as they appeared.")
@@ -684,14 +612,17 @@ class ToolSession:
             return ToolResult(f"Fetch limit of {self.max_fetches} fetch_url calls reached. "
                               f"Continue with the information gathered so far.")
         self.n_fetches += 1
+        if target != url:
+            self.log(f"fetch_url: {url} -> the Google redirect's target {target}")
+            url = target
 
         try:
             response = _run_async(asyncio.wait_for(retrieve(
                 url,
                 show_progress=False,
-                output_format="multimodal",  # The text, with the page's images and videos downloaded
+                output_format="multimodal",
                 methods=self.scrape_methods,
-                strip=True,  # Only the main content, without navigation, footers, cookie banners etc.
+                strip=True,  # Main content only: no navigation, footers, cookie banners
                 max_video_size=MAX_VIDEO_BYTES,
                 downscale_videos=True,
             ), FETCH_TIMEOUT))
@@ -730,17 +661,15 @@ class ToolSession:
         return ToolResult(content, media)
 
     def _remove_blocked_links(self, sequence: Iterable, page_url: str) -> tuple[list, list[tuple[str, str]]]:
-        """A fetched page's content without its links to the blocked URLs, with their text and
-        title, which may give the fact-check's verdict away (see remove_links). The text of a
-        link may hold images, e.g. a teaser's, which go with it.
+        """Without the links to blocked URLs, with their text and title, which may give the
+        fact-check's verdict away, and any images in that text (a teaser's, say).
 
-        Returns the content and the links removed, each as its URL and the rule that blocks it
-        (see blocked_by).
+        Returns the content and the links removed, each as its URL and the rule that blocks it.
         """
         parts = list(sequence)
         if not self.blocked_scopes:
             return parts, []
-        # The items stand in the text as placeholders that no link target or URL takes in
+        # Placeholders for the items that no link target or URL takes in
         text, items = [], []
         for part in parts:
             if isinstance(part, str):
@@ -763,11 +692,9 @@ class ToolSession:
         return content, removed
 
     def _page_content(self, sequence: Iterable) -> tuple[list, list[dict], int]:
-        """A fetched page's content as the model sees it, in page order: its text, cut at
-        max_fetch_chars characters (an image or video counts as long as its reference), with its
-        images and videos in their places, as far as the media limits per page, per fact-check
-        and per request allow. A note takes the place of the media beyond these, of media shown
-        before (on this page or an earlier one) and of images that can't be read.
+        """The text cut at max_fetch_chars (an image or video counts as long as its reference), with
+        the media in their places as far as the limits per page, per fact-check and per request
+        allow; a note stands for the media beyond these, shown before, or unreadable.
 
         Returns the parts (text and ezMM items), the media shown (for the trace) and the
         length of the whole page in characters.
@@ -810,7 +737,6 @@ class ToolSession:
 
 
 def _add_unique(target: list[str], urls: Iterable[str]):
-    """Append the URLs not yet in `target`, keeping their order."""
     for url in urls:
         if url not in target:
             target.append(url)

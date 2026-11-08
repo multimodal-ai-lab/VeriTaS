@@ -27,7 +27,6 @@ def _answer(integrity, certainty, justification="Per [AP](https://apnews.com/x) 
         ('"compromised"', '"rather uncertain"', "Compromised (rather uncertain)"),
         ('"compromised"', '"rather certain"', "Compromised (rather certain)"),
         ('"compromised"', '"certain"', "Compromised (certain)"),
-        # Other casing and stray whitespace
         ('"Compromised"', '"Rather Certain"', "Compromised (rather certain)"),
         ('" intact "', '"certain "', "Intact (certain)"),
         # "unknown" takes no certainty, but one given anyway does no harm

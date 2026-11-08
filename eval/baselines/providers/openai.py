@@ -25,7 +25,6 @@ class OpenAIFactChecker(BaseFactChecker):
 
     @staticmethod
     def _content(parts: list[Part]) -> list[dict]:
-        """Text and images, in order, as input content."""
         return [
             {"type": "input_text", "text": part} if isinstance(part, str)
             else {"type": "input_image", "image_url": f"data:{part.mime_type};base64,{part.base64}", "detail": "auto"}
@@ -38,7 +37,7 @@ class OpenAIFactChecker(BaseFactChecker):
             input=items,
             tools=responses_tools(),
             tool_choice="auto" if allow_tools else "none",
-            # The raw reasoning is not available, only a summary of it
+            # Only a summary of the reasoning is available
             reasoning={"effort": self.reasoning_effort, "summary": "auto"},
         )
         # Keep the whole output: reasoning models need their reasoning items passed
