@@ -11,7 +11,7 @@ requests~=2.34.2
 beautifulsoup4~=4.15.0
 markdownify~=1.2.3
 playwright~=1.61.0
-tqdm~=4.68.4
+tqdm~=4.70.1
 python-dateutil~=2.9.0.post0
 langcodes~=3.5.1
 python-multipart>=0.0.9
@@ -23,7 +23,7 @@ json_repair~=0.61.5
 langdetect~=1.0.9
 ijson~=3.5.1
 opencv-python
-google-genai[aiohttp]~=1.55.0
+google-genai[aiohttp]~=1.65.0
 async_lru
 oauthlib
 pytest-asyncio
