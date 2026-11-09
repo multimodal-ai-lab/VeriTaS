@@ -8,7 +8,7 @@ from ezmm.common.registry import item_registry
 from eval.baselines.scripts import run_benchmark as rb
 
 # The classes as run_benchmark knows them: it imports the package as "baselines", not "eval.baselines"
-from baselines.common.reviews import Review, lookup_reviews, signatory_scopes  # noqa: E402
+from baselines.common.reviews import Review, database_configured, lookup_reviews, signatory_scopes  # noqa: E402
 from baselines.common.types import NoAnswerError  # noqa: E402
 
 MediaLimits = rb.MediaLimits
@@ -43,6 +43,7 @@ class FakeFactChecker:
 @pytest.fixture
 def dataset(tmp_path, monkeypatch):
     monkeypatch.setattr(rb, "UnifiedFactChecker", FakeFactChecker)
+    monkeypatch.setattr(rb, "database_configured", lambda: True)
     monkeypatch.setattr(rb, "lookup_reviews", lambda urls: {
         "https://factcheck.example.org/claim-a": Review(datetime(2024, 2, 10, 8), ["factcheck.example.org"])})
     monkeypatch.setattr(rb, "signatory_scopes", lambda: ["signatory.example.org", "other.example.org/fact-checks"])
@@ -177,6 +178,77 @@ def test_the_claims_own_fact_check_is_blocked(dataset, tmp_path, monkeypatch):
     assert {(r["claim_id"], r["review_date"]) for r in records} == {(1, "2024-02-10T08:00:00"), (2, None)}
     run_config = json.loads((tmp_path / "run" / "run_config.json").read_text())
     assert (run_config["signatory_scopes"], run_config["max_search_pages"]) == (signatories, rb.MAX_SEARCH_PAGES)
+
+
+def test_the_blocked_scopes_can_come_from_a_file_instead_of_the_database(dataset, tmp_path, monkeypatch):
+    def no_database():
+        raise AssertionError("the database must not be asked for the signatories' scopes")
+
+    monkeypatch.setattr(rb, "signatory_scopes", no_database)
+    monkeypatch.setattr(FakeFactChecker, "blocked", {})
+    scopes = ["file.example.org", "other.example.org/checks"]
+    scopes_file = tmp_path / "scopes.json"
+    scopes_file.write_text(json.dumps(scopes))
+
+    rb.run_benchmark(dataset_path=str(dataset), output_dir=str(tmp_path / "run"), providers=["openai"],
+                     blocked_scopes_path=str(scopes_file))
+
+    # The claim's own fact-checker's scopes still come from the database
+    assert {claim_id: blocked[2] for claim_id, blocked in FakeFactChecker.blocked.items()} == {
+        1: [*scopes, "factcheck.example.org"], 2: scopes}
+    run_config = json.loads((tmp_path / "run" / "run_config.json").read_text())
+    assert (run_config["signatory_scopes"], run_config["blocked_scopes_file"]) == (scopes, str(scopes_file))
+
+
+def test_without_a_database_the_run_needs_a_blocked_scopes_file_and_asks_nothing(dataset, tmp_path, monkeypatch):
+    def no_database(*args):
+        raise AssertionError("there is no database to ask")
+
+    monkeypatch.setattr(rb, "database_configured", lambda: False)
+    monkeypatch.setattr(rb, "lookup_reviews", no_database)
+    monkeypatch.setattr(rb, "signatory_scopes", no_database)
+    monkeypatch.setattr(FakeFactChecker, "blocked", {})
+    with pytest.raises(ValueError, match="--blocked-scopes"):
+        rb.run_benchmark(dataset_path=str(dataset), output_dir=str(tmp_path / "run"), providers=["openai"])
+    assert not (tmp_path / "run").exists()
+
+    claims = json.loads(dataset.read_text())["claims"]
+    claims[0]["review_date"] = "2024-02-10T08:00:00"
+    dataset.write_text(json.dumps({"claims": claims}))
+    scopes_file = tmp_path / "scopes.json"
+    scopes_file.write_text(json.dumps(["file.example.org"]))
+    rb.run_benchmark(dataset_path=str(dataset), output_dir=str(tmp_path / "run"), providers=["openai"],
+                     blocked_scopes_path=str(scopes_file))
+
+    assert FakeFactChecker.blocked == {
+        1: (["https://factcheck.example.org/claim-a"], "2024-02-10T08:00:00", ["file.example.org"]),
+        2: ([], None, ["file.example.org"]),
+    }
+    assert json.loads((tmp_path / "run" / "run_config.json").read_text())["database"] is False
+
+
+@pytest.mark.parametrize("content", ['{"scopes": ["a.org"]}', '["a.org", 3]', '["a.org", " "]'])
+def test_a_blocked_scopes_file_must_hold_a_list_of_scopes(tmp_path, content):
+    path = tmp_path / "scopes.json"
+    path.write_text(content)
+    with pytest.raises(ValueError, match="JSON list"):
+        rb.load_blocked_scopes(path)
+
+
+def test_load_fact_checker_scopes_saves_the_databases_scopes_for_run_benchmark(tmp_path, monkeypatch):
+    from eval.baselines.scripts import load_fact_checker_scopes as script
+
+    monkeypatch.setattr(script, "signatory_scopes", lambda: ["a.org", "b.org/checks", "проверка.рф"])
+    output = tmp_path / "new" / "scopes.json"
+    monkeypatch.setattr("sys.argv", ["load_fact_checker_scopes.py", str(output)])
+    script.main()
+    assert rb.load_blocked_scopes(output) == ["a.org", "b.org/checks", "проверка.рф"]
+
+    runs = []
+    monkeypatch.setattr(rb, "run_benchmark", lambda **kwargs: runs.append(kwargs))
+    monkeypatch.setattr("sys.argv", ["run_benchmark.py", "--dataset", "claims.json", "--blocked-scopes", str(output)])
+    rb.main()
+    assert runs[0]["blocked_scopes_path"] == str(output)
 
 
 def test_media_limits_are_command_line_options(monkeypatch, dataset):
@@ -404,3 +476,12 @@ def test_the_database_queries_fail_with_a_pointer_to_the_config(tmp_path):
         lookup_reviews(["https://a.org/1"], config_path=tmp_path / "missing.yaml")
     with pytest.raises(RuntimeError, match="database section"):
         signatory_scopes(config_path=tmp_path / "missing.yaml")
+
+
+def test_database_configured(tmp_path):
+    config = tmp_path / "config.yaml"
+    assert not database_configured(config_path=config)
+    config.write_text("scrapemm:\n  url: http://localhost\n")
+    assert not database_configured(config_path=config)
+    config.write_text("database:\n  host: localhost\n")
+    assert database_configured(config_path=config)

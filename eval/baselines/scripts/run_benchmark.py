@@ -50,7 +50,7 @@ from baselines.common import (
 )
 from baselines.common.metrics import compute_coarsened_metrics, COARSEN_7_TO_3
 from baselines.common.media import MediaLimits
-from baselines.common.reviews import lookup_reviews, signatory_scopes
+from baselines.common.reviews import database_configured, lookup_reviews, signatory_scopes
 from baselines.common.tools import (MAX_FETCH_CHARS, MAX_SEARCH_PAGES, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES,
                                     temporary_media_store)
 from baselines.common.types import LABEL_SCHEME_7
@@ -774,6 +774,16 @@ def load_dataset(dataset_path: Path) -> dict:
         return json.load(f)
 
 
+def load_blocked_scopes(path: Path) -> list[str]:
+    """The fact-check scopes in a JSON file written by load_fact_checker_scopes.py: a list of "host"
+    or "host/path" entries."""
+    with open(path, encoding="utf-8") as f:
+        scopes = json.load(f)
+    if not isinstance(scopes, list) or not all(isinstance(scope, str) and scope.strip() for scope in scopes):
+        raise ValueError(f"{path} must hold a JSON list of fact-check scopes (\"host\" or \"host/path\")")
+    return scopes
+
+
 def add_review_info(claims: list[dict], lookup=None) -> list[dict]:
     """The claims with what their fact-check needs to know of their reviews (fact-checks), which
     the tools block:
@@ -948,6 +958,7 @@ def run_benchmark(
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     media_limits: MediaLimits = MediaLimits(),
     openrouter_host: str | None = None,
+    blocked_scopes_path: str | None = None,
 ):
     """
     Run the fact-checking baseline on VeriTaS claims.
@@ -968,9 +979,18 @@ def run_benchmark(
         media_limits: Which images and videos the models get, and in what form.
         openrouter_host: The endpoint OpenRouter sends every request to, e.g. "deepinfra/fp8".
                          Required for openrouter.
+        blocked_scopes_path: JSON file with the fact-check scopes blocked for every claim (see
+                             load_blocked_scopes). If None, those of all IFCN signatories and EFCSN
+                             members are read from the database when the run (or resume) starts.
+                             Required if config.yaml has no database section: the run then takes
+                             the review dates from the dataset alone and blocks no claim's
+                             fact-checker scopes beyond these.
     """
     if providers is None:
         providers = list(DEFAULT_PROVIDERS)
+    use_database = database_configured()
+    if not use_database and not blocked_scopes_path:
+        raise ValueError("config.yaml has no database section: pass the fact-check scopes to block with --blocked-scopes")
 
     # Setup paths
     dataset_path = Path(dataset_path)
@@ -1005,8 +1025,12 @@ def run_benchmark(
         if n_failed:
             print(f"Retrying {n_failed} failed claim(s)")
 
-    blocked_scopes = signatory_scopes()
-    print(f"Fact-check scopes of IFCN signatories and EFCSN members blocked: {len(blocked_scopes)}")
+    if blocked_scopes_path:
+        blocked_scopes = load_blocked_scopes(Path(blocked_scopes_path))
+        print(f"Fact-check scopes blocked, from {blocked_scopes_path}: {len(blocked_scopes)}")
+    else:
+        blocked_scopes = signatory_scopes()
+        print(f"Fact-check scopes of IFCN signatories and EFCSN members blocked: {len(blocked_scopes)}")
 
     # Save run configuration immediately so it exists even if the run crashes
     started_at = datetime.now().isoformat()
@@ -1027,6 +1051,8 @@ def run_benchmark(
         "openrouter_host": openrouter_host,
         "search_cutoff": "review_date",
         "signatory_scopes": blocked_scopes,
+        "blocked_scopes_file": str(blocked_scopes_path) if blocked_scopes_path else None,
+        "database": use_database,
         "resumed_from": str(resume_dir) if resume_dir else None,
         "started_at": started_at,
         "finished_at": None,
@@ -1039,7 +1065,9 @@ def run_benchmark(
     data = load_dataset(dataset_path)
     all_claims = data["claims"]
     print(f"Total claims in dataset: {len(all_claims)}")
-    all_claims = add_review_info(all_claims)
+    if not use_database:
+        print("No database: review dates from the dataset only, no claim's fact-checker scopes added")
+    all_claims = add_review_info(all_claims, lookup=None if use_database else lambda urls: {})
 
     # Initialize fact-checker with all requested providers
     print(f"\nInitializing providers: {', '.join(providers)}")
@@ -1215,6 +1243,15 @@ Examples:
         help="The endpoint OpenRouter sends every request to, as its tag in "
              "https://openrouter.ai/api/v1/models/<model>/endpoints, e.g. deepinfra/fp8. Required for openrouter.",
     )
+    parser.add_argument(
+        "--blocked-scopes",
+        default=None,
+        help="JSON file with the fact-check scopes to block for every claim, a list of \"host\" or "
+             "\"host/path\" entries, as load_fact_checker_scopes.py writes it. Default: those of all IFCN "
+             "signatories and EFCSN members, read from the VeriTaS database when the run starts. The "
+             "scopes of each claim's own fact-checkers are read from the database if config.yaml has a "
+             "database section. Required without one.",
+    )
     media_group = parser.add_argument_group("media limits", "Which images and videos the models get, and in what form")
     for limit in fields(MediaLimits):
         media_group.add_argument(f"--{limit.name.replace('_', '-')}", default=limit.default,
@@ -1247,6 +1284,7 @@ Examples:
         reasoning_effort=args.reasoning_effort,
         media_limits=MediaLimits(**{limit.name: getattr(args, limit.name) for limit in fields(MediaLimits)}),
         openrouter_host=args.openrouter_host,
+        blocked_scopes_path=args.blocked_scopes,
     )
 
 

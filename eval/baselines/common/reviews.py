@@ -23,6 +23,14 @@ class Review:
     fact_check_scopes: list[str] = field(default_factory=list)
 
 
+def database_configured(config_path: Path = CONFIG_PATH) -> bool:
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            return bool((yaml.safe_load(f) or {}).get("database"))
+    except FileNotFoundError:
+        return False
+
+
 def lookup_reviews(urls: list[str], config_path: Path = CONFIG_PATH) -> dict[str, Review]:
     """The reviews at `urls`, each with its publishing date and its publisher's fact-check scopes.
     A URL in several reviews (of several claims) gets the earliest date and all scopes. URLs that
