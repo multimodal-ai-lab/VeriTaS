@@ -395,52 +395,6 @@ def test_write_run_statistics(tmp_path):
                                 "by_claim": {"1": [dropped, refused], "4": [dropped]}}
 
 
-def test_write_fact_check_exposure(tmp_path):
-    fact_check = "https://leadstories.com/hoax-alert/2026/07/fact-check-the-claim-is-false.html"
-
-    def record(claim_id, trace=(), **urls):
-        return {"claim_id": claim_id, "provider": "gemini", "status": "success", "claim_date": "2026-07-10",
-                "result": {"trace": list(trace), **urls}}
-
-    def search(query, text):
-        return [{"turn": 0, "type": "tool_call", "id": "s", "name": "web_search", "args": {"query": query}},
-                {"turn": 0, "type": "tool_result", "id": "s", "name": "web_search", "text": text}]
-
-    def fetch(url, text):
-        return [{"turn": 1, "type": "tool_call", "id": "f", "name": "fetch_url", "args": {"url": url}},
-                {"turn": 1, "type": "tool_result", "id": "f", "name": "fetch_url", "text": text}]
-
-    records = [
-        record(1, search("the claim", "**Search results for: the claim**\n\n[1] Post\nURL: https://x.org/1\n"
-                                      "Snippet: Fact Check: The claim ... fact-check-the-claim-is ...")),
-        record(2, fetch("https://x.org/2", f"**Content of https://x.org/2:**\n\nSee [it](/{fact_check.split('/', 3)[3]})."),
-               linked_urls=[fact_check]),
-        # The model alone: it guesses the URL, which the reply only repeats, and cites it
-        record(3, [{"turn": 0, "type": "reasoning", "text": "The slug is likely fact-check-the-claim-is-false.html"},
-                   *fetch(fact_check, f"Error: Cannot fetch {fact_check}. fetch_url only fetches ...")],
-               quoted_urls=[fact_check + "?utm_source=x"]),
-        record(4, search("the claim", "[1] Other\nURL: https://x.org/4\nSnippet: Nothing to see")),
-        record(5),
-        record(6, encountered_urls=[f"https://web.archive.org/web/2026/{fact_check}"]),
-    ]
-    jsonl_path = tmp_path / "results_detailed.jsonl"
-    jsonl_path.write_text("".join(json.dumps(r) + "\n" for r in records))
-    claims = [{"id": i, "review_url": fact_check} for i in (1, 2, 3, 4, 6)] + [{"id": 5}]
-
-    rb.write_fact_check_exposure(jsonl_path, claims, tmp_path)
-
-    stats = json.loads((tmp_path / "fact_check_exposure.json").read_text())["gemini"]
-    assert stats["claims_by_id"] == {
-        "1": {"search_preview": "Snippet: Fact Check: The claim ... fact-check-the-claim-is ..."},
-        "2": {"linked": fact_check, "fetched_page": f"**Content of https://x.org/2:** See [it](/{fact_check.split('/', 3)[3]})."},
-        "3": {"cited": fact_check + "?utm_source=x", "fetch_attempt": fact_check,
-              "mentioned": "The slug is likely fact-check-the-claim-is-false.html"},
-        "6": {"search_result": f"https://web.archive.org/web/2026/{fact_check}"},
-    }
-    assert (stats["claims"], stats["claims_with_review_url"], stats["shown_by_tools"], stats["only_by_model"]) == (6, 5, 3, 1)
-    assert stats["ways"]["linked"] == 1 and stats["ways"]["retrieved"] == 0
-
-
 def test_add_review_info():
     """The tools block the claims' reviews and their publishers' fact-checks; web_search searches
     before the first review."""

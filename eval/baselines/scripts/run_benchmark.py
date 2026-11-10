@@ -54,7 +54,6 @@ from baselines.common.reviews import database_configured, lookup_reviews, signat
 from baselines.common.tools import (MAX_FETCH_CHARS, MAX_SEARCH_PAGES, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES,
                                     temporary_media_store)
 from baselines.common.types import LABEL_SCHEME_7
-from baselines.scripts.fact_check_exposure import write_fact_check_exposure
 from baselines.scripts.run_statistics import write_run_statistics
 
 # Thread-safe CSV writing
@@ -1174,7 +1173,6 @@ def run_benchmark(
         integrity_summary=integrity_summary,
     )
     write_leaderboard_results(jsonl_path, output_dir, providers)
-    write_fact_check_exposure(jsonl_path, all_claims, output_dir)
 
 
 def main():
