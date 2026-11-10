@@ -57,6 +57,7 @@ api_secrets:
   google:
   anthropic:
   serper:
+  openrouter:
 
 database:
   database:
