@@ -1,261 +1,104 @@
 # Baselines
 
-Unified fact-checking baselines for the VeriTaS benchmark with support for OpenAI, Gemini, Perplexity, and Llama (self-hosted via vLLM).
+How to run the VeriTaS fact-checking baseline on a dataset export from the VeriTaS Website with OpenAI, Gemini, Anthropic,
+self-hosted (vLLM) or OpenRouter models.
 
-## Installation
+## What you need
+
+- A VeriTaS Release (Can be downloaded here https://veritas.mai.informatik.tu-darmstadt.de/releases)
+- The fact-check scopes file (`fact_checker_scopes.json`) (Can be downloaded here https://veritas.mai.informatik.tu-darmstadt.de/challenge/signatory-blocking). It lists the sites and
+  sections where fact-checkers publish their fact-checks, which the model's tools block so that it cannot look
+  up the answer.
+- Access to a scrapeMM server, which runs the model's web searches and page fetches.
+- An API key for the model provider you want to run.
+
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Run everything from the repository root, where the configuration is read from `config.yaml`:
+
+```yaml
+scrapemm:
+  url: http://<scrapemm-server>:<port>
+  api_key: <key>
+
+api_secrets:           # Only the providers you run
+  openai: "sk-..."
+  google: "AIza..."
+  anthropic: "sk-ant-..."
+  openrouter: "sk-or-..."
+
+selfhosted:            # Only for --provider selfhosted: vLLM's OpenAI-compatible endpoint
+  url: http://<vllm-host>:<port>/v1
+  key: <key>
+```
+
+Instead of `config.yaml`, the keys can come from the environment variables
+`OPENAI_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `VLLM_BASE_URL` / `VLLM_API_KEY`
+and `SCRAPEMM_API_URL` / `SCRAPEMM_API_KEY`.
+
 ## Dataset
-You need to run the export script in the VeriTaS repo to generate the claims dataset:
 
-## Configuration
-
-API keys can be configured in three ways (in order of priority):
-
-1. **Veritas config** (recommended): Add keys to `config/globals.yaml`:
-   ```yaml
-   openai: "sk-..."
-   google: "AIza..."
-   perplexity: "pplx-..."  # optional
-   ```
-
-2. **Environment variables**:
-   - `OPENAI_API_KEY` - for OpenAI provider
-   - `GOOGLE_API_KEY` - for Gemini provider
-   - `PERPLEXITY_API_KEY` - for Perplexity provider
-
-3. **Explicit parameters**: Pass `api_keys` dict when creating `UnifiedFactChecker`
-
-If you're using Veritas, the baselines will automatically use the API keys from `config/globals.yaml`.
-
-## Providers
-
-| Provider | Default Model | Native Video | Search Capability | Temporal Filtering |
-|----------|---------------|--------------|-------------------|-------------------|
-| OpenAI | gpt-5.2 | No (extracts frames) | Built-in + custom search | Built-in: prompt-only; custom: pre-date filtered |
-| Gemini | gemini-2.5-flash | Yes | Built-in + custom search | Built-in: prompt-only; custom: pre-date filtered |
-| Perplexity | sonar-pro | No (extracts frames) | Built-in (and used in custom mode too) | API-enforced (`search_before_date_filter`) |
-| Llama (vLLM) | meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8 | No (extracts frames) | Custom search only | Custom: pre-date filtered |
-
-### Recommended Search Mode
-
-Use `--custom-search` for benchmarking and serious evaluation. Native provider search tools do not offer sufficient filtering controls for strict temporal benchmarking. Custom search provides:
-- deterministic pre-date filtering
-- controllable retrieval pipeline
-- optional page-content scraping for richer evidence
-
-#### Cutoff semantics
-
-The claim's own day is **excluded**, not just capped. Search APIs filter at day
-granularity with an inclusive end date, so a cutoff of the claim day itself would
-admit content published hours *after* the claim — and fact-checks of a viral claim
-often appear the same day. `strict_cutoff_date` (`common/search.py`) therefore steps
-back one day: a claim dated `2024-02-05T12:22` searches with `cd_max:2/4/2024`.
-
-The tradeoff is that genuine same-day pre-claim evidence is also dropped. The APIs
-expose no intra-day resolution, so this is the only way to guarantee no leakage, and
-losing evidence is the safe direction for a benchmark. Results produced before this
-change used an inclusive same-day cutoff and are not comparable at the boundary.
-
-### ⚠️ Important: Temporal Data Leakage
-
-If you run OpenAI/Gemini with built-in native search (without `--custom-search`), date constraints are prompt-level only (soft constraint). For temporal integrity, prefer `--custom-search` (or Perplexity built-in filtering).
-
-### Model Options
-
-**OpenAI**: `gpt-5.2`, `gpt-4.1`
-
-**Gemini**: `gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-1.5-pro`
-
-**Perplexity**: `sonar`, `sonar-pro`, `sonar-reasoning-pro`
-
-**Llama (self-hosted via vLLM)**: any model name your endpoint serves (default: `meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8`)
-
-## Python API
-
-### Single Provider
-
-```python
-from eval.baselines import UnifiedFactChecker
-
-# Initialize with one provider (recommended: custom_search=True for strict filtering)
-fc = UnifiedFactChecker(provider="openai", custom_search=True)
-
-# Or with custom model
-fc = UnifiedFactChecker(provider="gemini", model="gemini-2.5-flash")
-
-# Fact-check a claim
-result = fc.check_claim(
-    claim="The Earth is flat",
-    image_paths=["photo.jpg"],  # optional
-    video_paths=["video.mp4"],  # optional (native for Gemini)
-    claim_date="2024-02-05T12:00:00",  # optional (prevents data leakage)
-)
-
-print(result.verdict)  # "Intact", "Compromised", or "Unknown"
-print(result.reasoning)  # Full explanation
-print(result.citations)  # List of source URLs
-```
-
-### Multiple Providers
-
-```python
-from eval.baselines import UnifiedFactChecker
-
-# Initialize all providers
-fc = UnifiedFactChecker()
-
-# Or specific providers
-fc = UnifiedFactChecker(providers=["openai", "gemini", "llama"], custom_search=True)
-
-# Check with all providers
-results = fc.check_claim_all_providers("The Earth is flat")
-for provider, result in results.items():
-    print(f"{provider}: {result.verdict}")
-
-# Check with consensus (requires min 2 providers to agree)
-consensus, all_results = fc.check_claim_with_consensus(
-    "The Earth is flat",
-    min_agreement=2,
-)
-if consensus:
-    print(f"Consensus: {consensus.verdict}")
-else:
-    print("No consensus reached")
-```
-
-### Direct Provider Access
-
-```python
-from eval.baselines import OpenAIFactChecker, GeminiFactChecker, PerplexityFactChecker
-
-# Use providers directly
-fc = GeminiFactChecker(model="gemini-2.5-flash")
-result = fc.check_claim("Some claim", video_paths=["video.mp4"])
-
-# Llama direct provider is available from baselines.providers
-from eval.baselines.providers import LlamaFactChecker
-
-llama_fc = LlamaFactChecker()
-```
-
-## CLI Usage
-
-Run the benchmark on the VeriTaS dataset:
+If you downloaded the dataset from the VeriTaS Website, you need to convert it once to the format `run_benchmark` uses.
 
 ```bash
-# Module invocation (recommended from repo root)
-python -m baselines.scripts.run_benchmark --dataset /path/to/claims.json --provider openai --custom-search --limit 10
-
-# Script invocation
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider openai --custom-search --limit 10
-
-# Single provider (recommended: custom search)
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider openai --custom-search --limit 10
-
-# Multiple providers
-python scripts/run_benchmark.py --dataset /path/to/claims.json --providers openai gemini perplexity --custom-search --limit 10
-
-# Custom model
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider gemini --model gemini-2.5-flash --limit 10
-
-# Parallel workers
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider openai --custom-search --workers 4 --limit 20
-
-# 7-class labels with two-step direction+certainty prediction
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider gemini --label-scheme 7 --seven-bin-prediction-mode two_step
-
-# Staged property-loop mode
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider gemini --mode staged --label-scheme 7
-
-# Disable web search (parametric knowledge only)
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider openai --no-search
-
-# Llama via self-hosted vLLM (custom search path)
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider llama --custom-search --limit 10
-
-# Resume previous run
-python scripts/run_benchmark.py --dataset /path/to/claims.json --provider openai --resume results/gpt-5.2_2024-12-22_14-30
+python eval/baselines/scripts/convert_export.py <export_dir>
 ```
 
-### CLI Options
+This writes `<export_dir>/claims_benchmark.json`, the file to pass as `--dataset`.
 
-| Option | Type / Values | Description |
-|--------|----------------|-------------|
-| `--dataset` | `PATH` (required) | Path to `claims.json`. |
-| `--output` | `PATH` | Output directory. If omitted, an auto-generated directory under `results/` is used. |
-| `--resume` | `PATH` | Resume from an existing run directory. |
-| `--provider` | `openai` / `gemini` / `perplexity` / `llama` | Run a single provider. |
-| `--providers` | one or more provider names | Run multiple providers in one invocation. |
-| `--model` | model name | Model override for single-provider runs (`--provider`). |
-| `--limit` | integer | Maximum number of claims to process. |
-| `--workers` | integer (default: `1`) | Number of parallel workers. |
-| `--custom-search` | flag | Use custom search pipeline with date filtering and content retrieval. |
-| `--no-search` | flag | Disable web search and use parametric model knowledge only. |
-| `--label-scheme` | `3` or `7` (default: `3`) | Label granularity: 3-class or 7-class with certainty levels. |
-| `--mode` | `integrity` or `staged` (default: `integrity`) | Integrity single-pass baseline vs staged property-loop benchmark. |
-| `--seven-bin-prediction-mode` | `direct` or `two_step` (default: `direct`) | For 7-class labels: direct combined verdict vs direction+certainty format. |
+## Run
 
-Notes:
-- If neither `--provider` nor `--providers` is specified, all providers are used.
-- `--model` is applied only when `--provider` is used (single-provider mode).
-- `--seven-bin-prediction-mode` is relevant only when `--label-scheme 7`.
-
-## Output
-
-Results are saved to `results/<model>_YYYY-MM-DD_HH-MM/`:
-
-```
-results/gpt-5.2_2024-12-22_14-30/
-├── results.csv              # Per-claim results
-├── results_detailed.jsonl   # Full details with reasoning
-├── summary.json             # Metrics (accuracy, F1, confusion matrix)
-├── confusion_matrix_*.png   # Visualization per provider
-└── run_config.json          # Run configuration
+```bash
+python -m eval.baselines.scripts.run_benchmark \
+    --dataset <export_dir>/claims_benchmark.json \
+    --blocked-scopes fact_checker_scopes.json \
+    --provider openai --model gpt-6-luna \
+    --workers 30 \
+    --resume eval/baselines/results/gpt-6-luna
 ```
 
-## FactCheckResult
+More examples:
 
-The `check_claim` methods return a `FactCheckResult` with:
+```bash
+# Try a few claims first
+python -m eval.baselines.scripts.run_benchmark --dataset <claims> --blocked-scopes <scopes> \
+    --provider gemini --model gemini-3.8-flash --limit 10
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `verdict` | str | "Intact", "Compromised", or "Unknown" |
-| `reasoning` | str | Full explanation from the model |
-| `citations` | list[str] | Source URLs used |
-| `model` | str | Model used |
-| `provider` | str | Provider name |
-| `usage` | dict | Token usage statistics |
+# OpenRouter: --openrouter-host is required
+python -m eval.baselines.scripts.run_benchmark --dataset <claims> --blocked-scopes <scopes> --provider openrouter \
+    --model deepseek/deepseek-v4.1-flash --openrouter-host inference-net/fp8 --workers 30 --resume <run_dir>
 
-## Architecture
-
+# Self-hosted model behind the vLLM endpoint in config.yaml
+python -m eval.baselines.scripts.run_benchmark --dataset <claims> --blocked-scopes <scopes> \
+    --provider selfhosted --model <served-model> --resume <run_dir>
 ```
-baselines/
-├── common/                # Shared utilities
-│   ├── claims.py          # Claim extraction/parsing
-│   ├── media.py           # Image/video handling
-│   ├── metrics.py         # Classification/regression metrics
-│   ├── prompts.py         # Prompt templates (3-class / 7-class / two-step)
-│   ├── search.py          # Custom retrieval + temporal filtering
-│   └── types.py           # Label schemes, FactCheckResult, constants
-├── providers/             # Provider implementations
-│   ├── base.py            # Abstract base class + verdict extraction
-│   ├── openai.py          # OpenAI with native search
-│   ├── openai_custom.py   # OpenAI + custom search tool
-│   ├── gemini.py          # Gemini with native search
-│   ├── gemini_custom.py   # Gemini + custom search tool
-│   ├── perplexity.py      # Perplexity integration
-│   └── llama.py           # Self-hosted Llama (vLLM) + custom search
-├── factchecker.py         # UnifiedFactChecker orchestration
-└── scripts/               # Benchmarking/analysis scripts
-    ├── run_benchmark.py
-    ├── analyze_rectification.py
-    ├── compare_experiments_3bin_vs_7bin.py
-    ├── compute_quarterly_metrics.py
-    ├── compare_quarterly.py
-    ├── compute_moving_average.py
-    └── ...
-```
+
+### Options
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--dataset` | required | The converted claims file |
+| `--blocked-scopes` | required | The fact-check scopes file |
+| `--provider` | | `openai`, `gemini`, `anthropic`, `selfhosted` or `openrouter` |
+| `--providers` | `openai gemini anthropic` | Several providers in one run, each with its default model |
+| `--model` | the provider's default | The model, with `--provider` only |
+| `--output` | `eval/baselines/results/<model>_<YYYY-MM-DD_HH-MM>/` | A new results folder |
+| `--resume` | | A results folder to continue: claims without a successful result run (again). The folder need not exist yet. Not together with `--output` |
+| `--limit` | all | Number of claims |
+| `--workers` | 1 | Claims run in parallel |
+| `--reasoning-effort` | `medium` | `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. A model that does not take the value fails every request with a 400 error |
+| `--openrouter-host` | | The one OpenRouter endpoint all requests go to, by its `tag` in `https://openrouter.ai/api/v1/models/<model>/endpoints` (e.g. `inference-net/fp8`). Pick a host whose `supports_tool_choice` has both `auto` and `none` |
+| `--scrapemm-methods` | `auto` | scrapeMM backends for `fetch_url`, in order: a subset of `integrations`, `browser`, `firecrawl`, `decodo` |
+
+### Resuming
+
+Pass the same `--resume` folder every time, e.g. in a Slurm script you resubmit after a timeout: the first run
+creates the folder, later runs retry only the claims that failed or are missing. The metrics, `summary.json` and
+the other files are rewritten at the end of every run.
+
+The results are in the run's folder: `results.csv` (one row per claim), `results_detailed.jsonl` (with the full
+traces), `summary.json` (metrics) and `run_config.json` (the run's settings).

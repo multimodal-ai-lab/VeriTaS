@@ -3,9 +3,10 @@
 Compute MSE and MAE metrics for existing baseline results.
 
 Converts verdicts to numerical values:
-- Compromised -> -1
+- Compromised (certain) -> -1, (rather certain) -> -2/3, (rather uncertain) -> -1/3
 - Unknown -> 0
-- Intact -> 1
+- Intact (rather uncertain) -> 1/3, (rather certain) -> 2/3, (certain) -> 1
+Results of older 3-class runs map Compromised -> -1 and Intact -> 1.
 
 Then computes MSE and MAE between gt_integrity and the converted verdict.
 
@@ -19,8 +20,15 @@ from pathlib import Path
 
 
 VERDICT_TO_NUMERIC = {
-    "Compromised": -1.0,
+    "Compromised (certain)": -1.0,
+    "Compromised (rather certain)": -2 / 3,
+    "Compromised (rather uncertain)": -1 / 3,
     "Unknown": 0.0,
+    "Intact (rather uncertain)": 1 / 3,
+    "Intact (rather certain)": 2 / 3,
+    "Intact (certain)": 1.0,
+    # Older 3-class runs
+    "Compromised": -1.0,
     "Intact": 1.0,
 }
 

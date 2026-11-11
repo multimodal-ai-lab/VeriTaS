@@ -1,70 +1,175 @@
-"""Abstract base class for fact-checking providers."""
+"""Abstract base class for fact-checking providers: the tool-calling loop every provider runs."""
 
+import json
+import os
 import random
-import re
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Literal
 
-from ..common.types import LabelScheme, DEFAULT_LABEL_SCHEME, MAX_RETRIES, BASE_DELAY, MAX_DELAY
-from ..common.prompts import build_prompts
+import ezmm
+
+from ..common.media import (Image, ItemSequence, MediaLimits, extract_video_frames, load_claim_image, load_image,
+                            render)
+from ..common.parsing import extract_justification, extract_urls, extract_verdict
+from ..common.prompts import build_prompt
+from ..common.tools import ToolSession, DEFAULT_MAX_SEARCHES, DEFAULT_MAX_FETCHES
+from ..common.types import FactCheckError, FactCheckResult, NoAnswerError, MAX_RETRIES, BASE_DELAY, MAX_DELAY
+
+try:
+    from veritas import api_secrets
+except ImportError:
+    api_secrets = None
+
+MAX_TURNS = 50
+LAST_TURN_MESSAGE = ("You have used up your whole quota of tool calls. You must provide an answer given the "
+                     "information you were able to gather so far.")
+
+# What a provider turns into its API's content: text, images, and videos if it has native_video
+Part = str | Image | ezmm.Video
 
 
-def extract_justification(response: str) -> str:
-    """Extract the JUSTIFICATION field from a response ("" when absent)."""
-    match = re.search(r"JUSTIFICATION\s*:\s*([^\n\r]+)", response or "", re.IGNORECASE)
-    if not match:
-        return ""
+def only_text(parts: list[Part]) -> str | None:
+    return parts[0] if len(parts) == 1 and isinstance(parts[0], str) else None
 
-    # Only leading/trailing wrappers: stripping punctuation like the verdict
-    # fields do would break URLs and markdown links inside the justification.
-    return match.group(1).strip().strip("[]<>`*_ ").strip()
+
+DEFAULT_REASONING_EFFORT = "medium"
+
+# 529: Anthropic's API is overloaded
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 529}
+
+
+def is_retryable(error: Exception) -> bool:
+    """The HTTP status is `status_code` in the OpenAI and Anthropic SDKs, `code` in Google's."""
+    status = getattr(error, "status_code", None) or getattr(error, "code", None)
+    return status in RETRYABLE_STATUS_CODES
+
+
+def resolve_api_key(api_key: str | None, secret_name: str, env_var: str) -> str:
+    key = api_key or (api_secrets or {}).get(secret_name) or os.environ.get(env_var)
+    if not key:
+        raise ValueError(
+            f"{secret_name} API key required. Either:\n"
+            f"  1. Add it to config.yaml (api_secrets.{secret_name})\n"
+            f"  2. Set {env_var} environment variable\n"
+            f"  3. Pass api_key parameter"
+        )
+    return key
+
+
+@dataclass
+class ToolCall:
+    id: str | None
+    name: str
+    args: dict | None  # None if the model's arguments were not a JSON object
+
+    @classmethod
+    def from_json(cls, id: str | None, name: str, arguments: str | None) -> "ToolCall":
+        try:
+            args = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            args = None
+        return cls(id, name, args)
+
+
+@dataclass
+class Reasoning:
+    """The model's reasoning, as far as its API returns it: usually a summary."""
+
+    text: str
+
+
+@dataclass
+class Text:
+    text: str
+
+
+@dataclass
+class Step:
+    """One model call. stop_reason is the API's own ("end_turn", "max_tokens", "SAFETY", ...).
+    input_tokens counts the whole prompt, the tokens read from and written to the API's prompt
+    cache included."""
+
+    output: list[Reasoning | Text | ToolCall]
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    # Reported by Anthropic, and by OpenRouter for models whose cache writes are billed
+    cache_write_tokens: int = 0
+    stop_reason: str | None = None
+    cost: float | None = None  # What the call was billed, in USD, if the API says (OpenRouter)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(item.text for item in self.output if isinstance(item, Text))
+
+    @property
+    def tool_calls(self) -> list[ToolCall]:
+        return [item for item in self.output if isinstance(item, ToolCall)]
+
+
+TRACE_TYPES = {Reasoning: "reasoning", Text: "text", ToolCall: "tool_call"}
 
 
 class BaseFactChecker(ABC):
-    """Abstract base class for fact-checking providers."""
+    """Abstract base class for fact-checking providers.
+
+    Every provider runs the same baseline: the model verifies the claim with the
+    web_search and fetch_url tools and answers with the claim's integrity, its certainty
+    and a justification in JSON, which make a label of the 7-class scheme. The loop lives in
+    `check_claim`; a provider only implements its API's message format in the abstract methods.
+    """
 
     provider_name: str = "base"
+    default_model: str = ""
+    native_video: bool = False  # Whether videos reach the model as is, else as frames
 
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "",
-        use_search: bool = True,
-        label_scheme: LabelScheme | None = None,
-        seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
+        model: str | None = None,
+        scrape_methods: list[str] | str | None = "auto",
+        max_searches: int = DEFAULT_MAX_SEARCHES,
+        max_fetches: int = DEFAULT_MAX_FETCHES,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        media_limits: MediaLimits = MediaLimits(),
     ):
         """
         Initialize the fact-checker.
 
         Args:
-            api_key: API key for the provider.
-            model: Model identifier to use.
-            use_search: If True (default), use web search. If False, use only
-                       parametric knowledge (no search tools).
-            label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
-            seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
-                                      single combined label, while "two_step"
-                                      asks for direction + certainty.
+            api_key: API key for the provider. If None, uses config/env var.
+            model: Model identifier to use (must support tool use). Defaults to `default_model`.
+            scrape_methods: Which scrapeMM backends fetch_url uses (subset of
+                            integrations/browser/firecrawl/decodo, or "auto").
+            max_searches: Maximum number of web_search calls per claim.
+            max_fetches: Maximum number of fetch_url calls per claim.
+            reasoning_effort: How much the model reasons, e.g. "low", "medium" or "high", passed
+                              as is to the API's effort setting. Which values a model takes
+                              depends on its vendor.
+            media_limits: Which images and videos the model gets, and in what form.
         """
-        self.api_key = api_key
-        self.model = model
-        self.use_search = use_search
-        self.label_scheme = label_scheme or DEFAULT_LABEL_SCHEME
-        if seven_bin_prediction_mode not in {"direct", "two_step"}:
-            raise ValueError("seven_bin_prediction_mode must be 'direct' or 'two_step'")
-        self.seven_bin_prediction_mode = seven_bin_prediction_mode
-        self._prompts = build_prompts(self.label_scheme)
+        self.model = model or self.default_model
+        self.scrape_methods = scrape_methods
+        self.max_searches = max_searches
+        self.max_fetches = max_fetches
+        self.reasoning_effort = reasoning_effort
+        self.media_limits = media_limits
+        self.client = self._create_client(api_key)
 
-    @abstractmethod
     def check_claim(
         self,
         claim: str,
         image_paths: list[str] | None = None,
         video_paths: list[str] | None = None,
         claim_date: str | datetime | None = None,
-    ):
+        claim_id: int | str | None = None,
+        blocked_urls: list[str] | None = None,
+        cutoff_date: str | datetime | None = None,
+        blocked_scopes: list[str] | None = None,
+    ) -> FactCheckResult:
         """
         Fact-check a claim.
 
@@ -75,67 +180,167 @@ class BaseFactChecker(ABC):
                          Note: Only Gemini supports native video. Other providers
                          will extract frames from videos and treat as images.
             claim_date: Date of the claim (ISO format string or datetime).
+                        web_search only returns content published before this day, unless
+                        cutoff_date is given.
+            claim_id: ID of the claim, which tags the log lines of its tool calls and retries.
+            blocked_urls: URLs the tools never show or fetch, e.g. the claim's own fact-check,
+                          which would give the answer away.
+            cutoff_date: web_search only returns content published before this day, e.g. the
+                         day the claim's fact-check was published.
+            blocked_scopes: Hosts, or hosts and paths, whose URLs the tools never show or fetch,
+                            e.g. those under which the fact-check's publisher publishes
+                            fact-checks ("leadstories.com/hoax-alert").
 
         Returns:
             FactCheckResult with verdict, reasoning, citations, etc.
+
+        Raises:
+            NoAnswerError: The model's final response holds no valid answer.
+            FactCheckError: The fact-check failed, e.g. on an API error. Both hold the result
+                            so far: its trace, URLs and usage.
         """
-        pass
+        session = ToolSession(
+            claim_date=claim_date,
+            scrape_methods=self.scrape_methods,
+            max_searches=self.max_searches,
+            max_fetches=self.max_fetches,
+            media_limits=self.media_limits,
+            blocked_urls=blocked_urls or (),
+            claim_id=claim_id,
+            cutoff_date=cutoff_date,
+            blocked_scopes=blocked_scopes or (),
+            claim_images=len(image_paths or [])
+                         + (0 if self.native_video else self.media_limits.video_frames * len(video_paths or [])),
+        )
 
-    def _get_system_prompt(self) -> str:
-        """Get the appropriate system prompt based on search mode."""
-        if self.use_search:
-            return self._prompts["system_prompt"] + self._get_two_step_prompt_suffix()
-        if self._is_two_step_7bin_mode():
-            return self._prompts["system_prompt_no_search_two_step"]
-        return self._prompts["system_prompt_no_search"]
+        media = ([ezmm.Image(file_path=path) for path in image_paths or []]
+                 + [ezmm.Video(file_path=path) for path in video_paths or []])
+        prompt = build_prompt(claim, session.claim_day, media)
+        conversation = self._start_conversation(self._parts(prompt, claim=True))
 
-    def _get_user_prompt(self, claim: str, claim_date: str | datetime | None = None) -> str:
-        """Get the formatted user prompt based on search mode and claim date."""
-        if self.use_search:
-            if claim_date:
-                formatted_date = self._format_date_for_prompt(claim_date)
-                return self._prompts["user_prompt_with_date"].format(
-                    claim=claim, claim_date=formatted_date
-                )
-            return self._prompts["user_prompt"].format(claim=claim)
+        tokens = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        usage = dict.fromkeys(tokens, 0)
+        trace = [{"type": "prompt", "text": render(prompt)}]
+        step = Step([])
+        try:
+            for turn in range(MAX_TURNS):
+                last_turn = turn == MAX_TURNS - 1
+                if last_turn:
+                    self._add_text(conversation, LAST_TURN_MESSAGE)
+                    trace.append({"turn": turn, "type": "message", "text": LAST_TURN_MESSAGE})
+                step = self._call_with_retry(self._step, conversation, allow_tools=not last_turn, log=session.log)
+                for key in tokens:
+                    usage[key] += getattr(step, key)
+                if step.cost is not None:
+                    usage["cost"] = usage.get("cost", 0) + step.cost
+                trace += [{"turn": turn, "type": TRACE_TYPES[type(item)], **asdict(item)} for item in step.output]
+                trace.append({"turn": turn, "type": "stop", "reason": step.stop_reason})
 
-        two_step = self._is_two_step_7bin_mode()
-        if claim_date:
-            key = "user_prompt_with_date_no_search_two_step" if two_step else "user_prompt_with_date_no_search"
-            formatted_date = self._format_date_for_prompt(claim_date)
-            return self._prompts[key].format(claim=claim, claim_date=formatted_date)
-        key = "user_prompt_no_search_two_step" if two_step else "user_prompt_no_search"
-        return self._prompts[key].format(claim=claim)
+                if not step.tool_calls:
+                    break
+                results = [session.call(call.name, call.args) for call in step.tool_calls]
+                trace += [
+                    {"turn": turn, "type": "tool_result", "id": call.id, "name": call.name, "text": result.text,
+                     "media": result.media}
+                    for call, result in zip(step.tool_calls, results)
+                ]
+                self._add_tool_results(conversation, step.tool_calls, [self._parts(result.content) for result in results])
+        except Exception as e:
+            raise FactCheckError(f"{type(e).__name__}: {e}", self._make_result("", session, usage, trace)) from e
+        finally:
+            self._end_conversation(conversation)
+            session.close()
 
-    def _get_custom_search_system_prompt(self) -> str:
-        """Get the custom search system prompt."""
-        if self._is_two_step_7bin_mode():
-            return self._prompts["system_prompt_custom_search_two_step"]
-        return self._prompts["system_prompt_custom_search"]
+        result = self._make_result(step.text, session, usage, trace)
+        if result.verdict is None:
+            raise NoAnswerError(f"No valid answer in the final response (stop reason: {step.stop_reason})", result)
+        return result
 
-    def _get_custom_search_user_prompt(self, claim: str, claim_date: str | datetime | None = None) -> str:
-        """Get the formatted custom search user prompt."""
-        if self._is_two_step_7bin_mode():
-            if claim_date:
-                formatted_date = self._format_date_for_prompt(claim_date)
-                return self._prompts["user_prompt_custom_search_with_date_two_step"].format(
-                    claim=claim, claim_date=formatted_date
-                )
-            return self._prompts["user_prompt_custom_search_two_step"].format(claim=claim)
-        if claim_date:
-            formatted_date = self._format_date_for_prompt(claim_date)
-            return self._prompts["user_prompt_custom_search_with_date"].format(
-                claim=claim, claim_date=formatted_date
-            )
-        return self._prompts["user_prompt_custom_search"].format(claim=claim)
+    def _parts(self, sequence: ItemSequence, claim: bool = False) -> list[Part]:
+        """An ezMM sequence as the model gets it: its text, with each image and video right after
+        its reference, so that the model can name it. Adjacent text is joined, as by ezMM."""
+        limits = self.media_limits
+        max_side = limits.claim_image_side if claim else limits.page_image_side
+        parts = []
+        for element in sequence:
+            if isinstance(element, str):
+                new = [element]
+            elif isinstance(element, ezmm.Image):
+                load = load_claim_image if claim else load_image
+                new = [element.reference, load(element.file_path, max_side)]
+            elif isinstance(element, ezmm.Video) and self.native_video and (claim or self._is_short(element)):
+                new = [element.reference, element]
+            elif isinstance(element, ezmm.Video):
+                frames = extract_video_frames(str(element.file_path), limits.video_frames, max_side=max_side)
+                new = [f"{element.reference} ({len(frames)} frames of the video)", *frames]
+            else:  # Audio, files: no API here takes them
+                new = [element.reference]
+            for part in new:
+                if isinstance(part, str) and parts and isinstance(parts[-1], str):
+                    parts[-1] += " " + part
+                else:
+                    parts.append(part)
+        return parts
 
-    def _call_with_retry(self, api_call_fn, *args, **kwargs):
+    def _is_short(self, video: ezmm.Video) -> bool:
+        """False if the length can't be read: ezMM raises for a file it can't open."""
+        try:
+            return video.duration <= self.media_limits.native_video_seconds
+        except Exception:
+            return False
+
+    def _end_conversation(self, conversation: list):
+        """Clean up after a fact-check, e.g. delete files uploaded for it."""
+
+    @abstractmethod
+    def _create_client(self, api_key: str | None):
+        """Create the API client."""
+
+    @abstractmethod
+    def _start_conversation(self, prompt: list[Part]) -> list:
+        """The conversation: the user turn with the prompt, the claim's media in their places."""
+
+    @abstractmethod
+    def _step(self, conversation: list, allow_tools: bool) -> Step:
+        """Call the model on the conversation and append the model's turn to it."""
+
+    @abstractmethod
+    def _add_tool_results(self, conversation: list, tool_calls: list[ToolCall], results: list[list[Part]]):
+        """Append the results of the model's tool calls to the conversation."""
+
+    @abstractmethod
+    def _add_text(self, conversation: list, text: str):
+        """Add text to the conversation as the user's, after the last tool results."""
+
+    def _make_result(self, final_text: str, session: ToolSession, usage: dict, trace: list[dict]) -> FactCheckResult:
+        justification = extract_justification(final_text)
+        citations = list(dict.fromkeys(
+            session.encountered_urls + session.retrieved_urls + extract_urls(final_text)
+        ))
+        return FactCheckResult(
+            verdict=extract_verdict(final_text),
+            reasoning=final_text,
+            citations=citations,
+            model=self.model,
+            provider=self.provider_name,
+            usage=usage,
+            justification=justification,
+            encountered_urls=list(session.encountered_urls),
+            retrieved_urls=list(session.retrieved_urls),
+            linked_urls=list(session.linked_urls),
+            quoted_urls=extract_urls(justification),
+            blocked=list(session.blocked),
+            trace=trace,
+        )
+
+    def _call_with_retry(self, api_call_fn, *args, log: Callable[[str], None], **kwargs):
         """
         Call an API function with exponential backoff retry for rate limits.
 
         Args:
             api_call_fn: The API function to call.
             *args, **kwargs: Arguments to pass to the function.
+            log: Prints a log line (of the claim's tool session).
 
         Returns:
             The result from the API call.
@@ -149,18 +354,11 @@ class BaseFactChecker(ABC):
             try:
                 return api_call_fn(*args, **kwargs)
             except Exception as e:
-                error_str = str(e).lower()
-                # Retry on rate limits and transient server errors
-                is_retryable = (
-                    "429" in str(e) or "rate limit" in error_str or "resource exhausted" in error_str
-                    or "503" in str(e) or "unavailable" in error_str
-                    or "500" in str(e) or "internal error" in error_str
-                )
-                if is_retryable:
+                if is_retryable(e):
                     last_exception = e
                     # Exponential backoff with jitter
                     delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_DELAY)
-                    print(f"    Transient error ({e}), retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    log(f"Transient error ({e}), retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     time.sleep(delay)
                 else:
                     # Not a retryable error, re-raise immediately
@@ -169,179 +367,3 @@ class BaseFactChecker(ABC):
         # All retries exhausted
         if last_exception:
             raise last_exception
-
-    def _format_date_for_prompt(self, claim_date: str | datetime) -> str:
-        """
-        Format claim date for inclusion in the prompt.
-
-        Args:
-            claim_date: ISO format datetime string or datetime object.
-
-        Returns:
-            Human-readable date string (e.g., "February 5, 2024").
-        """
-        try:
-            if isinstance(claim_date, str):
-                # Parse ISO format datetime string (e.g., "2024-02-05T12:22:02")
-                dt = datetime.fromisoformat(claim_date.replace("Z", "+00:00"))
-            else:
-                dt = claim_date
-
-            # Format as human-readable date
-            return dt.strftime("%B %d, %Y")  # e.g., "February 5, 2024"
-        except (ValueError, AttributeError):
-            return str(claim_date)
-
-    def _extract_verdict(self, response: str) -> str:
-        """
-        Extract verdict from response text using the active label scheme.
-
-        Args:
-            response: The response text from the model.
-
-        Returns:
-            A verdict string from the active label scheme.
-        """
-        two_step_verdict = self._extract_two_step_verdict(response)
-        if two_step_verdict:
-            return two_step_verdict
-
-        pattern = self.label_scheme.verdict_regex_pattern
-
-        # Look for explicit VERDICT: pattern
-        match = re.search(
-            rf"VERDICT:\s*({pattern})",
-            response,
-            re.IGNORECASE
-        )
-        if match:
-            return self.label_scheme.normalize_verdict(match.group(1))
-
-        # Fallback: look for verdict words at end of response. Drop the
-        # JUSTIFICATION line first — it sits inside this window and routinely
-        # contains label words ("compromised", "intact") that would win here.
-        scan_text = re.sub(r"^.*JUSTIFICATION\s*:.*$", "", response, flags=re.IGNORECASE | re.MULTILINE)
-        last_lines = scan_text.strip().split("\n")[-3:]
-        last_text = " ".join(last_lines).upper()
-
-        # Try to match any label in the last lines (longest match first)
-        best_match = None
-        best_len = 0
-        for label in self.label_scheme.labels:
-            if label.upper() in last_text and len(label) > best_len:
-                best_match = label
-                best_len = len(label)
-
-        if best_match:
-            return best_match
-
-        # If no clear verdict found, default to Unknown
-        return "Unknown"
-
-    def _is_two_step_7bin_mode(self) -> bool:
-        """Whether two-step extraction/prompting should be active."""
-        return self.seven_bin_prediction_mode == "two_step" and len(self.label_scheme.labels) == 7
-
-    def _get_direction_triplet(self) -> tuple[str, str, str] | None:
-        """
-        Return (positive_direction, unknown_label, negative_direction) for 7-bin schemes.
-
-        For integrity this is typically ("Intact", "Unknown", "Compromised").
-        """
-        if len(self.label_scheme.labels) != 7:
-            return None
-
-        unknown = None
-        for label in self.label_scheme.labels:
-            if label.strip().lower() == "unknown":
-                unknown = label
-                break
-        if unknown is None:
-            return None
-
-        positive = self.label_scheme.labels[0].split(" (", 1)[0].strip()
-        negative = self.label_scheme.labels[-1].split(" (", 1)[0].strip()
-        return positive, unknown, negative
-
-    def _get_two_step_prompt_suffix(self) -> str:
-        """Additional prompt instructions for 7-bin two-step mode."""
-        if not self._is_two_step_7bin_mode():
-            return ""
-
-        triplet = self._get_direction_triplet()
-        if not triplet:
-            return ""
-        positive, unknown, negative = triplet
-
-        return (
-            "\n\nFor this run, produce the final 7-bin decision in two steps:\n"
-            f"1. DIRECTION: exactly one of [{positive}/{unknown}/{negative}]\n"
-            f"   - Use {unknown} only as a last resort when evidence is genuinely insufficient\n"
-            "     or strongly contradictory after reasonable analysis.\n"
-            f"   - If evidence weakly leans {positive} or {negative}, choose that direction\n"
-            "     and express uncertainty in CERTAINTY (do not choose UNKNOWN).\n"
-            "2. CERTAINTY: exactly one of [certain/rather certain/rather uncertain]\n"
-            f"   - If DIRECTION is {unknown}, use CERTAINTY: [N/A]\n\n"
-            "Always end your response with these exact final lines:\n"
-            "DIRECTION: <chosen direction>\n"
-            "CERTAINTY: <chosen certainty or N/A>"
-        )
-
-    def _extract_two_step_verdict(self, response: str) -> str | None:
-        """Extract 7-bin verdict from DIRECTION/CERTAINTY fields when enabled."""
-        if not self._is_two_step_7bin_mode():
-            return None
-
-        triplet = self._get_direction_triplet()
-        if not triplet:
-            return None
-        positive, unknown, negative = triplet
-
-        direction_match = re.search(r"DIRECTION\s*:\s*([^\n\r]+)", response, re.IGNORECASE)
-        if not direction_match:
-            return None
-
-        direction_raw = direction_match.group(1).strip().strip("[](){}<>`_.,;: ").lower()
-        direction_map = {
-            positive.lower(): positive,
-            unknown.lower(): unknown,
-            negative.lower(): negative,
-        }
-        direction = direction_map.get(direction_raw)
-        if not direction:
-            return None
-
-        if direction.lower() == unknown.lower():
-            return unknown
-
-        certainty_match = re.search(r"(?:CERTAINTY|CONFIDENCE)\s*:\s*([^\n\r]+)", response, re.IGNORECASE)
-        if not certainty_match:
-            return None
-
-        certainty_raw = certainty_match.group(1).strip().strip("[](){}<>`_.,;: ").lower()
-        certainty_map = {
-            "certain": "certain",
-            "rather certain": "rather certain",
-            "rather uncertain": "rather uncertain",
-        }
-        certainty = certainty_map.get(certainty_raw)
-        if not certainty:
-            return None
-
-        combined = f"{direction} ({certainty})"
-        if combined in self.label_scheme.labels:
-            return combined
-        return None
-
-    def _extract_urls_from_text(self, text: str) -> list[str]:
-        """
-        Extract URLs from text.
-
-        Args:
-            text: Text to search for URLs.
-
-        Returns:
-            List of unique URLs found.
-        """
-        url_pattern = r'https?://[^\s\)\"\'>\]]+'
-        return list(dict.fromkeys(re.findall(url_pattern, text)))

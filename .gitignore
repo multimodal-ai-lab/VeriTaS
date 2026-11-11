@@ -3,6 +3,9 @@ dumps/
 data/
 dev/
 eval/baselines/results/
+eval/baselines/results\ copy/
+ratings_lookup
+config.yaml
 
 
 # Byte-compiled / optimized / DLL files
@@ -203,3 +206,6 @@ temp_old/
 
 my_exports/
 claim_reports/
+
+CLAUDE.md
+AGENTS.md
