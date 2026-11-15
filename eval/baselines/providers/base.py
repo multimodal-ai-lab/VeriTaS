@@ -11,6 +11,7 @@ from datetime import datetime
 
 import ezmm
 
+from ..common.google_links import GoogleLinkResolver
 from ..common.media import (Image, ItemSequence, MediaLimits, extract_video_frames, load_claim_image, load_image,
                             render)
 from ..common.parsing import extract_justification, extract_urls, extract_verdict
@@ -135,6 +136,7 @@ class BaseFactChecker(ABC):
         max_fetches: int = DEFAULT_MAX_FETCHES,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         media_limits: MediaLimits = MediaLimits(),
+        resolve_redirects: bool = False,
     ):
         """
         Initialize the fact-checker.
@@ -150,6 +152,9 @@ class BaseFactChecker(ABC):
                               as is to the API's effort setting. Which values a model takes
                               depends on its vendor.
             media_limits: Which images and videos the model gets, and in what form.
+            resolve_redirects: Whether Google's redirect links in search results are resolved to
+                               their targets, through Serper, and dropped where they stay hidden
+                               (see ToolSession). If not, they are shown and fetched as they are.
         """
         self.model = model or self.default_model
         self.scrape_methods = scrape_methods
@@ -157,6 +162,7 @@ class BaseFactChecker(ABC):
         self.max_fetches = max_fetches
         self.reasoning_effort = reasoning_effort
         self.media_limits = media_limits
+        self.resolve_redirects = resolve_redirects
         self.client = self._create_client(api_key)
 
     def check_claim(
@@ -211,6 +217,7 @@ class BaseFactChecker(ABC):
             blocked_scopes=blocked_scopes or (),
             claim_images=len(image_paths or [])
                          + (0 if self.native_video else self.media_limits.video_frames * len(video_paths or [])),
+            link_resolver=GoogleLinkResolver() if self.resolve_redirects else None,
         )
 
         media = ([ezmm.Image(file_path=path) for path in image_paths or []]

@@ -958,6 +958,7 @@ def run_benchmark(
     media_limits: MediaLimits = MediaLimits(),
     openrouter_host: str | None = None,
     blocked_scopes_path: str | None = None,
+    resolve_redirects: bool = False,
 ):
     """
     Run the fact-checking baseline on VeriTaS claims.
@@ -984,6 +985,9 @@ def run_benchmark(
                              Required if config.yaml has no database section: the run then takes
                              the review dates from the dataset alone and blocks no claim's
                              fact-checker scopes beyond these.
+        resolve_redirects: Whether Google's redirect links in search results are resolved to their
+                           targets, through Serper, and dropped where they stay hidden. If not, they
+                           are shown and fetched as they are.
     """
     if providers is None:
         providers = list(DEFAULT_PROVIDERS)
@@ -1051,6 +1055,7 @@ def run_benchmark(
         "search_cutoff": "review_date",
         "signatory_scopes": blocked_scopes,
         "blocked_scopes_file": str(blocked_scopes_path) if blocked_scopes_path else None,
+        "resolve_redirects": resolve_redirects,
         "database": use_database,
         "resumed_from": str(resume_dir) if resume_dir else None,
         "started_at": started_at,
@@ -1077,6 +1082,7 @@ def run_benchmark(
     print(f"Reasoning effort: {reasoning_effort}")
     if openrouter_host:
         print(f"OpenRouter host: {openrouter_host}")
+    print(f"Google redirects in search results: {'resolved, or dropped' if resolve_redirects else 'left as they are'}")
     fc = UnifiedFactChecker(
         providers=providers,
         models=models,
@@ -1086,6 +1092,7 @@ def run_benchmark(
         reasoning_effort=reasoning_effort,
         media_limits=media_limits,
         openrouter_host=openrouter_host,
+        resolve_redirects=resolve_redirects,
     )
 
     with temporary_media_store() as media_store:
@@ -1250,6 +1257,13 @@ Examples:
              "scopes of each claim's own fact-checkers are read from the database if config.yaml has a "
              "database section. Required without one.",
     )
+    parser.add_argument(
+        "--resolve-redirects",
+        action="store_true",
+        help="Resolve Google's redirect links in search results to their targets, through Serper's /resolve (with "
+             "the key in config.yaml, api_secrets.serper, or SERPER_API_KEY), and drop those that stay hidden. "
+             "Default: they are shown and fetched as they are, with their targets hidden from the block rules.",
+    )
     media_group = parser.add_argument_group("media limits", "Which images and videos the models get, and in what form")
     for limit in fields(MediaLimits):
         media_group.add_argument(f"--{limit.name.replace('_', '-')}", default=limit.default,
@@ -1283,6 +1297,7 @@ Examples:
         media_limits=MediaLimits(**{limit.name: getattr(args, limit.name) for limit in fields(MediaLimits)}),
         openrouter_host=args.openrouter_host,
         blocked_scopes_path=args.blocked_scopes,
+        resolve_redirects=args.resolve_redirects,
     )
 
 

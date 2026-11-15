@@ -64,6 +64,7 @@ class UnifiedFactChecker:
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         media_limits: MediaLimits = MediaLimits(),
         openrouter_host: str | None = None,
+        resolve_redirects: bool = False,
     ):
         """
         Initialize the unified fact-checker.
@@ -84,6 +85,9 @@ class UnifiedFactChecker:
             media_limits: Which images and videos the models get, and in what form.
             openrouter_host: The endpoint OpenRouter sends every request to, e.g. "deepinfra/fp8".
                              Required for openrouter.
+            resolve_redirects: Whether Google's redirect links in search results are resolved to
+                               their targets, through Serper, and dropped where they stay hidden.
+                               If not, they are shown and fetched as they are.
 
         Note: Specify either `provider` or `providers`, not both.
         """
@@ -95,6 +99,7 @@ class UnifiedFactChecker:
         self.reasoning_effort = reasoning_effort
         self.media_limits = media_limits
         self.openrouter_host = openrouter_host
+        self.resolve_redirects = resolve_redirects
         self._checkers: dict[Provider, BaseFactChecker] = {}
 
         # Determine which providers to initialize
@@ -134,6 +139,7 @@ class UnifiedFactChecker:
             max_fetches=self.max_fetches,
             reasoning_effort=self.reasoning_effort,
             media_limits=self.media_limits,
+            resolve_redirects=self.resolve_redirects,
         )
 
     def get_provider(self, provider: Provider | None = None) -> BaseFactChecker:

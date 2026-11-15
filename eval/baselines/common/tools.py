@@ -393,7 +393,10 @@ class ToolSession:
             claim_images: The images the claim's media take in every request (video frames for
                           models without native video), which count toward
                           media_limits.request_images.
-            link_resolver: One with the Serper API key of config.yaml or the environment if not given.
+            link_resolver: Resolves Google's redirect links (see google_links): web_search shows
+                           their targets and drops those that stay hidden, fetch_url fetches a
+                           redirect's target, and a redirect is blocked as its target. None leaves
+                           them as they are: shown and fetched like any other link.
         """
         self.log_prefix = f"[{claim_id}] " if claim_id is not None else ""
         self.claim_day = parse_claim_day(claim_date)
@@ -414,7 +417,7 @@ class ToolSession:
             if host:
                 self.blocked_scopes.setdefault(host, {}).setdefault(path, rule)
         self.blocked_slugs = {_slug_of(url) for url in blocked_urls} - {None}
-        self.link_resolver = link_resolver or GoogleLinkResolver()
+        self.link_resolver = link_resolver
 
         self.n_searches = 0
         self.n_fetches = 0
@@ -473,7 +476,9 @@ class ToolSession:
         for page in range(1, max_pages + 1):
             # Only organic results: the knowledge graph, answer box, top stories etc. are not
             # date-filtered by Google and would leak information from after the claim date.
-            organic = self._resolve_redirects(self._search_page(query, page).organic, query)
+            organic = self._search_page(query, page).organic
+            if self.link_resolver:
+                organic = self._resolve_redirects(organic, query)
             new = [r for r in organic if r.link and r.link not in seen]
             if not new:
                 return results, n_blocked, page
@@ -482,7 +487,7 @@ class ToolSession:
             # gives the fact-check's headline with its URL
             allowed = []
             for r in new:
-                if is_hidden_redirect(r.link):
+                if self.link_resolver and is_hidden_redirect(r.link):
                     rule = f"a URL {UNRESOLVED_REDIRECT}"
                 elif reason := self.blocked_by(r.link):
                     rule = f"a URL {reason}"
@@ -558,8 +563,9 @@ class ToolSession:
         """Why `url` is blocked, as the log gives it, or None: on a blocked host (subdomains have
         scopes of their own) at or under a blocked path, in any case; or with a blocked slug in
         its path on any site (sites serve an article under several paths, archives and other
-        sites copy it). A Google redirect with its target in the clear is blocked as its target."""
-        if target := plain_target(url):
+        sites copy it). With a link_resolver, a Google redirect with its target in the clear is
+        blocked as its target."""
+        if self.link_resolver and (target := plain_target(url)):
             reason = self.blocked_by(target)
             return f"{reason}, behind a Google redirect" if reason else None
         host, _, path = _page_of(url).partition("/")
@@ -592,9 +598,9 @@ class ToolSession:
         if not url.startswith(("http://", "https://")):
             return ToolResult(f"Error: '{url}' is not a valid URL. Provide a full URL starting with http:// or https://.")
         reason = self.blocked_by(url)
-        target = plain_target(url) or url
+        target = (plain_target(url) or url) if self.link_resolver else url
         # Search results come resolved, so the model can only have seen such a link in a fetched page
-        if not reason and is_hidden_redirect(url) and normalize_url(url) in self.seen_urls():
+        if self.link_resolver and not reason and is_hidden_redirect(url) and normalize_url(url) in self.seen_urls():
             (target,) = _run_async(self.link_resolver.resolve([url], log=self.log))
             if is_hidden_redirect(target):
                 reason = UNRESOLVED_REDIRECT

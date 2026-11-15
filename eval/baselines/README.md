@@ -92,6 +92,7 @@ python -m eval.baselines.scripts.run_benchmark --dataset <claims> --blocked-scop
 | `--workers` | 1 | Claims run in parallel |
 | `--reasoning-effort` | `medium` | `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. A model that does not take the value fails every request with a 400 error |
 | `--openrouter-host` | | The one OpenRouter endpoint all requests go to, by its `tag` in `https://openrouter.ai/api/v1/models/<model>/endpoints` (e.g. `inference-net/fp8`). Pick a host whose `supports_tool_choice` has both `auto` and `none` |
+| `--resolve-redirects` | off | Resolve Google's redirect links in search results (`https://www.google.com/url?...&q=CAES...`, `.../goto?url=CAES...`) to their targets through Serper's `/resolve`, with the key in `config.yaml` (`api_secrets.serper`) or `SERPER_API_KEY`, and drop those that stay hidden. Without it they are shown and fetched as they are, with their targets hidden from the block rules |
 | `--scrapemm-methods` | `auto` | scrapeMM backends for `fetch_url`, in order: a subset of `integrations`, `browser`, `firecrawl`, `decodo` |
 
 ### Resuming

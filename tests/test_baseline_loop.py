@@ -238,6 +238,15 @@ def test_the_claim_media_follow_its_text_frames_without_native_video(monkeypatch
     assert before.endswith('"claim <video:1>') and isinstance(video, ezmm.Video)
 
 
+def test_the_tools_resolve_google_redirects_only_on_request(monkeypatch):
+    sessions = []
+    monkeypatch.setattr(base.ToolSession, "close", lambda session: sessions.append(session))
+
+    for resolve_redirects in (False, True):
+        ScriptedFactChecker([FINAL], resolve_redirects=resolve_redirects).check_claim("claim", claim_date="2024-02-05")
+    assert [type(session.link_resolver) for session in sessions] == [type(None), base.GoogleLinkResolver]
+
+
 def test_the_tools_know_the_images_the_claim_takes_in_every_request(monkeypatch, tmp_path, ezmm_registry):
     """They count toward the cap on images per request: its images, and its videos' frames
     for models without native video."""
