@@ -17,9 +17,6 @@ Usage:
 
     # Using the database as fallback:
     python analyze_rectification.py --results-csv results.csv
-
-    # With 7-class label scheme:
-    python analyze_rectification.py --results-csv results.csv --dataset /path/to/claims.json --label-scheme 7
 """
 
 import argparse
@@ -32,7 +29,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from eval.baselines.common import compute_metrics, compute_coarsened_metrics, compute_regression_metrics
-from eval.baselines.common.types import get_label_scheme, LabelScheme
 
 INTACT_THRESHOLD = 1 / 3
 
@@ -103,7 +99,7 @@ def classify_row(row: dict, rectification_map: dict[int, bool]) -> str | None:
     return None
 
 
-def compute_group_metrics(rows: list[dict], label_scheme: LabelScheme) -> dict:
+def compute_group_metrics(rows: list[dict]) -> dict:
     """Compute classification and regression metrics for a group of result rows."""
     y_true, y_pred = [], []
     gt_integrity_values, verdict_values = [], []
@@ -126,13 +122,13 @@ def compute_group_metrics(rows: list[dict], label_scheme: LabelScheme) -> dict:
             except (ValueError, TypeError):
                 pass
 
-    metrics = compute_metrics(y_true, y_pred, labels=label_scheme.labels)
+    metrics = compute_metrics(y_true, y_pred)
 
     coarsened = compute_coarsened_metrics(y_true, y_pred)
     if coarsened:
         metrics["coarsened_3class"] = coarsened
 
-    regression = compute_regression_metrics(gt_integrity_values, verdict_values, scheme=label_scheme)
+    regression = compute_regression_metrics(gt_integrity_values, verdict_values)
     if regression:
         metrics["mse"] = regression["mse"]
         metrics["mae"] = regression["mae"]
@@ -216,12 +212,9 @@ def main():
     parser.add_argument("--dataset", default=None,
                         help="Path to claims.json containing is_rectified field "
                              "(if omitted, falls back to database query)")
-    parser.add_argument("--label-scheme", type=int, choices=[3, 7], default=3,
-                        help="Label scheme (3 or 7 classes, default: 3)")
     args = parser.parse_args()
 
     csv_path = Path(args.results_csv)
-    label_scheme = get_label_scheme(args.label_scheme)
 
     if not csv_path.exists():
         print(f"Error: CSV file not found: {csv_path}", file=sys.stderr)
@@ -283,7 +276,7 @@ def main():
         group_metrics = {}
         for gk, _ in GROUPS:
             provider_rows = [r for r in grouped[gk] if r.get("provider") == provider]
-            group_metrics[gk] = compute_group_metrics(provider_rows, label_scheme) if provider_rows else {}
+            group_metrics[gk] = compute_group_metrics(provider_rows) if provider_rows else {}
         print_provider_table(provider, group_metrics)
 
     return 0

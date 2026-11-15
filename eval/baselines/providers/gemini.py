@@ -1,24 +1,18 @@
-"""Gemini fact-checker provider."""
+"""Gemini fact-checker provider.
 
-import os
-import re
-from datetime import datetime
+The model verifies the claim with the web_search and fetch_url tools via Gemini's
+function calling. Videos, the claim's and the fetched pages', are passed natively.
+"""
+
+import time
 from pathlib import Path
-from typing import Literal
 
 from google import genai
 from google.genai import types
 
-# Import API key from Veritas config
-try:
-    from veritas import api_secrets
-    VERITAS_GOOGLE_KEY = api_secrets.get("google") if api_secrets else None
-except ImportError:
-    VERITAS_GOOGLE_KEY = None
-
-from ..common.types import FactCheckResult, LabelScheme
-from ..common.media import get_mime_type
-from .base import BaseFactChecker
+from ..common.media import Image
+from ..common.tools import TOOL_DEFINITIONS
+from .base import BaseFactChecker, Part, Reasoning, Step, Text, ToolCall, only_text, resolve_api_key
 
 
 # Video MIME types supported by Gemini
@@ -36,246 +30,150 @@ VIDEO_MIME_TYPES = {
     ".m4v": "video/mp4",
 }
 
+NO_FUNCTION_CALLING = types.ToolConfig(
+    function_calling_config=types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.NONE)
+)
+
+
+def gemini_tool() -> types.Tool:
+    return types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name=tool["name"],
+            description=tool["description"],
+            parameters_json_schema=tool["parameters"],
+        )
+        for tool in TOOL_DEFINITIONS
+    ])
+
 
 class GeminiFactChecker(BaseFactChecker):
-    """Fact-checker using Google Gemini with Google Search grounding and native video support."""
+    """Fact-checker using Gemini with the web_search and fetch_url tools."""
 
     provider_name = "gemini"
-
-    def __init__(
-        self,
-        api_key: str | None = None,
-        model: str = "gemini-2.5-flash",
-        use_search: bool = True,
-        label_scheme: LabelScheme | None = None,
-        seven_bin_prediction_mode: Literal["direct", "two_step"] = "direct",
-    ):
-        """
-        Initialize the Gemini fact-checker.
-
-        Args:
-            api_key: Google API key. If None, uses GOOGLE_API_KEY env var.
-            model: Model to use. Options include:
-                - "gemini-2.5-flash": Latest, with native video support
-                - "gemini-2.0-flash": Fast and capable
-                - "gemini-1.5-pro": More capable for complex tasks
-            use_search: If True (default), use Google Search grounding. If False,
-                       use only parametric knowledge.
-            label_scheme: Label scheme to use (3-class or 7-class). Defaults to 3-class.
-            seven_bin_prediction_mode: For 7-class schemes, "direct" asks for a
-                                      combined label; "two_step" asks for
-                                      direction + certainty.
-        """
-        super().__init__(
-            api_key=api_key,
-            model=model,
-            use_search=use_search,
-            label_scheme=label_scheme,
-            seven_bin_prediction_mode=seven_bin_prediction_mode,
-        )
-        self.client = self._create_client(api_key)
+    default_model = "gemini-2.5-flash"
+    native_video = True
 
     def _create_client(self, api_key: str | None) -> genai.Client:
-        """Create Gemini client."""
-        if api_key:
-            return genai.Client(api_key=api_key)
+        return genai.Client(api_key=resolve_api_key(api_key, "google", "GOOGLE_API_KEY"))
 
-        # Try Veritas config first, then environment variable
-        key_to_use = VERITAS_GOOGLE_KEY or os.environ.get("GOOGLE_API_KEY")
+    def _start_conversation(self, prompt: list[Part]) -> list:
+        return [types.Content(role="user", parts=self._gemini_parts(prompt))]
 
-        if not key_to_use:
-            raise ValueError(
-                "Google API key required. Either:\n"
-                "  1. Add it to config/globals.yaml (google: <key>)\n"
-                "  2. Set GOOGLE_API_KEY environment variable\n"
-                "  3. Pass api_key parameter"
-            )
-        return genai.Client(api_key=key_to_use)
+    def _gemini_parts(self, parts: list[Part]) -> list[types.Part]:
+        """Videos are uploaded with the File API: inline, each later request, which repeats the
+        conversation, would repeat them."""
+        gemini_parts = []
+        for part in parts:
+            if isinstance(part, str):
+                gemini_parts.append(types.Part.from_text(text=part))
+            elif isinstance(part, Image):
+                gemini_parts.append(types.Part.from_bytes(data=part.data, mime_type=part.mime_type))
+            else:
+                gemini_parts.append(self._upload_video(str(part.file_path))
+                                    or types.Part.from_text(text="[The video could not be uploaded.]"))
+        return gemini_parts
 
-    def check_claim(
-        self,
-        claim: str,
-        image_paths: list[str] | None = None,
-        video_paths: list[str] | None = None,
-        claim_date: str | datetime | None = None,
-    ) -> FactCheckResult:
-        """
-        Fact-check a claim using Gemini with Google Search grounding and native video support.
-
-        Args:
-            claim: The claim text to verify.
-            image_paths: Optional list of image file paths to include.
-            video_paths: Optional list of video file paths to include (native support).
-            claim_date: Date of the claim (ISO format string or datetime).
-
-        Returns:
-            FactCheckResult with verdict, reasoning, citations, etc.
-        """
-        # Build message content parts
-        contents = []
-
-        # Add images first if provided
-        if image_paths:
-            for img_path in image_paths:
-                img_part = self._load_image(img_path)
-                if img_part:
-                    contents.append(img_part)
-
-        # Add videos natively (Gemini 2.5+ supports native video)
-        if video_paths:
-            for video_path in video_paths:
-                video_part = self._load_video(video_path)
-                if video_part:
-                    contents.append(video_part)
-
-        # Format the prompt using label-scheme-aware helpers
-        prompt_text = self._get_user_prompt(claim, claim_date)
-        system_prompt = self._get_system_prompt()
-
-        # Add the text prompt
-        contents.append(prompt_text)
-
-        # Configure generation with Google Search grounding (if search enabled)
-        # WARNING: Google Search grounding does NOT support API-level date filtering.
-        # Temporal constraints are enforced via prompt instruction only (soft constraint).
-        # For hard temporal filtering, use Perplexity provider instead.
-        config_kwargs = {
-            "system_instruction": system_prompt,
-        }
-        if self.use_search:
-            config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-
-        config = types.GenerateContentConfig(**config_kwargs)
-
-        # Call API with retry logic
-        response = self._call_with_retry(
-            self.client.models.generate_content,
+    def _step(self, history: list, allow_tools: bool) -> Step:
+        response = self.client.models.generate_content(
             model=self.model,
-            contents=contents,
-            config=config,
+            contents=history,
+            config=types.GenerateContentConfig(
+                tools=[gemini_tool()],
+                tool_config=None if allow_tools else NO_FUNCTION_CALLING,
+                thinking_config=self._thinking_config(),
+            ),
+        )
+        content = response.candidates[0].content if response.candidates else None
+        parts = (content.parts or []) if content else []
+        if content:
+            # Keep the model's whole turn, incl. thought signatures
+            history.append(content)
+
+        # Don't use response.text: it warns when there are non-text parts
+        output = []
+        for part in parts:
+            if part.thought and part.text:
+                output.append(Reasoning(part.text))
+            elif part.text:
+                output.append(Text(part.text))
+            elif part.function_call:
+                call = part.function_call
+                output.append(ToolCall(call.id, call.name, dict(call.args or {})))
+
+        usage = response.usage_metadata
+        return Step(
+            output,
+            input_tokens=(usage.prompt_token_count or 0) if usage else 0,
+            output_tokens=((usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)) if usage else 0,
+            cache_read_tokens=(usage.cached_content_token_count or 0) if usage else 0,
+            stop_reason=self._stop_reason(response),
         )
 
-        assert response is not None, "Gemini API call failed after retries."
-
-        # Extract response content and citations
-        response_content = self._extract_response_content(response)
-        citations = self._extract_citations(response)
-        verdict = self._extract_verdict(response_content)
-
-        # Extract usage info
-        usage_info = {}
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage_info = {
-                "prompt_tokens": getattr(response.usage_metadata, "prompt_token_count", 0) or 0,
-                "completion_tokens": getattr(response.usage_metadata, "candidates_token_count", 0) or 0,
-                "total_tokens": getattr(response.usage_metadata, "total_token_count", 0) or 0,
-            }
-
-        return FactCheckResult(
-            verdict=verdict,
-            reasoning=response_content,
-            citations=citations,
-            model=self.model,
-            provider=self.provider_name,
-            usage=usage_info,
-        )
-
-    def _load_image(self, image_path: str) -> types.Part | None:
-        """Load an image file and return as Gemini Part."""
-        path = Path(image_path)
-        if not path.exists():
-            return None
-
-        mime_type = get_mime_type(path)
-
-        with open(path, "rb") as f:
-            image_data = f.read()
-
-        return types.Part.from_bytes(data=image_data, mime_type=mime_type)
-
-    def _load_video(self, video_path: str) -> types.Part | None:
-        """
-        Load a video file and return as Gemini Part for native video processing.
-
-        For videos > 20MB, uses the File API for upload.
-        For smaller videos, uses inline data.
-        """
-        path = Path(video_path)
-        if not path.exists():
-            return None
-
-        suffix = path.suffix.lower()
-        mime_type = VIDEO_MIME_TYPES.get(suffix, "video/mp4")
-
-        file_size = path.stat().st_size
-        size_mb = file_size / (1024 * 1024)
-
-        if size_mb > 20:
-            # Use File API for large videos
-            try:
-                uploaded_file = self.client.files.upload(file=str(path))
-                return uploaded_file
-            except Exception as e:
-                print(f"    Warning: Failed to upload video via File API: {e}")
-                return None
+    @staticmethod
+    def _stop_reason(response: types.GenerateContentResponse) -> str | None:
+        """The candidate's finish reason ("STOP", "MAX_TOKENS", "SAFETY", "MALFORMED_FUNCTION_CALL",
+        ...), or the prompt's block reason if there is no candidate."""
+        if response.candidates:
+            reason = response.candidates[0].finish_reason
         else:
-            # Use inline data for smaller videos
-            with open(path, "rb") as f:
-                video_data = f.read()
+            feedback = response.prompt_feedback
+            reason = feedback.block_reason if feedback and feedback.block_reason else "NO_CANDIDATES"
+        return getattr(reason, "name", reason)
 
-            return types.Part(
-                inline_data=types.Blob(data=video_data, mime_type=mime_type)
-            )
+    def _thinking_config(self) -> types.ThinkingConfig:
+        """Gemini 2 models have no thinking levels (the API rejects them), only a token budget:
+        they think as much as they decide to."""
+        if self.model.startswith(("gemini-2.", "models/gemini-2.")):
+            return types.ThinkingConfig(include_thoughts=True)
+        # The API's thinking levels are upper case; the SDK passes those it doesn't know (yet) on as they are
+        return types.ThinkingConfig(include_thoughts=True, thinking_level=self.reasoning_effort.upper())
 
-    def _extract_response_content(self, response) -> str:
-        """Extract text content from Gemini response, ignoring non-text parts."""
-        # Don't use response.text as it warns when there are non-text parts
-        # Instead, directly extract text from parts
-        if hasattr(response, "candidates") and response.candidates:
-            candidate = response.candidates[0]
-            if hasattr(candidate, "content") and candidate.content:
-                parts = candidate.content.parts
-                if parts:
-                    text_parts = []
-                    for part in parts:
-                        # Only extract text parts, skip other part types
-                        if hasattr(part, "text") and part.text:
-                            text_parts.append(part.text)
-                    if text_parts:
-                        return "\n".join(text_parts)
+    def _add_tool_results(self, history: list, tool_calls: list[ToolCall], results: list[list[Part]]):
+        # A function response holds JSON, and the model ignores uploaded videos in its own parts:
+        # a result with images or videos follows the responses in the same turn, in order
+        responses, with_media = [], []
+        for call, result in zip(tool_calls, results):
+            text = only_text(result)
+            if text is None:
+                with_media += result
+                text = "The content, with its images and videos, follows the function responses."
+            responses.append(types.Part.from_function_response(name=call.name, response={"result": text}))
+        history.append(types.Content(role="user", parts=responses + self._gemini_parts(with_media)))
 
-        return ""
+    def _add_text(self, history: list, text: str):
+        history[-1].parts.append(types.Part.from_text(text=text))
 
-    def _extract_citations(self, response) -> list[str]:
-        """Extract citations/URLs from Gemini response with grounding."""
-        citations = []
+    def _end_conversation(self, history: list):
+        """Delete the files uploaded for the fact-check: until they expire after 48 hours,
+        they count against the project's storage quota."""
+        for content in history:
+            for part in content.parts or []:
+                if part.file_data and part.file_data.file_uri:
+                    name = "files/" + part.file_data.file_uri.rsplit("/", 1)[-1]
+                    try:
+                        self.client.files.delete(name=name)
+                    except Exception as e:
+                        print(f"    Warning: Could not delete uploaded file {name}: {e}")
 
-        if hasattr(response, "candidates") and response.candidates:
-            candidate = response.candidates[0]
-            if hasattr(candidate, "grounding_metadata") and candidate.grounding_metadata:
-                grounding = candidate.grounding_metadata
-
-                # Get grounding chunks (sources)
-                if hasattr(grounding, "grounding_chunks") and grounding.grounding_chunks:
-                    for chunk in grounding.grounding_chunks:
-                        if hasattr(chunk, "web") and chunk.web:
-                            if hasattr(chunk.web, "uri"):
-                                citations.append(chunk.web.uri)
-
-                # Try search_entry_point for web search results
-                if hasattr(grounding, "search_entry_point") and grounding.search_entry_point:
-                    if hasattr(grounding.search_entry_point, "rendered_content"):
-                        html_content = grounding.search_entry_point.rendered_content
-                        url_pattern = r'href=["\']([^"\']+)["\']'
-                        found_urls = re.findall(url_pattern, html_content)
-                        for url in found_urls:
-                            if url.startswith("http") and url not in citations:
-                                citations.append(url)
-
-        # Also extract URLs from response text
-        text = self._extract_response_content(response)
-        for url in self._extract_urls_from_text(text):
-            if url not in citations:
-                citations.append(url)
-
-        return citations
+    def _upload_video(self, video_path: str) -> types.Part | None:
+        try:
+            uploaded_file = self.client.files.upload(file=video_path)
+            # The file can't be used until ACTIVE
+            max_wait = 60  # seconds
+            wait_interval = 2
+            waited = 0
+            while waited < max_wait:
+                file_info = self.client.files.get(name=uploaded_file.name)
+                if file_info.state.name == "ACTIVE":
+                    mime_type = VIDEO_MIME_TYPES.get(Path(video_path).suffix.lower(), "video/mp4")
+                    return types.Part.from_uri(file_uri=file_info.uri, mime_type=file_info.mime_type or mime_type)
+                elif file_info.state.name == "FAILED":
+                    print("    Warning: Video file processing failed")
+                    return None
+                time.sleep(wait_interval)
+                waited += wait_interval
+            print(f"    Warning: Video file not ready after {max_wait}s, skipping")
+            return None
+        except Exception as e:
+            print(f"    Warning: Failed to upload video via File API: {e}")
+            return None

@@ -1,3 +1,5 @@
+# Template for `config.yaml`. Copy this file to `config.yaml` and fill in the values.
+# --------------------------------
 # Pipeline stage configuration. Each stage can be enabled/disabled and
 # receives its parameters as keyword arguments to its `run_loop`.
 pipeline:
@@ -55,17 +57,22 @@ api_secrets:
   google:
   anthropic:
   serper:
+  openrouter:
 
 database:
   database:
   user:
   password:
   host:
-  port: 5432
+  port: 
 
 selfhosted:
   url:
   key:
+
+scrapemm:
+  url:
+  api_key:
 
 proxy:
 

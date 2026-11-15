@@ -1,9 +1,13 @@
 """Media handling utilities for fact-checking baselines."""
 
 import base64
+import io
 import re
-import tempfile
+import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from ezmm import Item
 
 
 # MIME type mapping for images
@@ -16,32 +20,110 @@ MIME_TYPES = {
 }
 
 
+@dataclass(frozen=True)
+class MediaLimits:
+    """Which images and videos the model gets in a fact-check, and in what form.
+
+    Every model call sends the whole conversation again, with the media of all pages fetched so
+    far: the totals keep it within the APIs' request limits (Anthropic: 100 images per request,
+    and at most 2000 px per side once there are more than 20) and the context window. Each
+    field is a command line option of run_benchmark.py; its help is the field's metadata.
+    """
+
+    page_images: int = field(default=10, metadata={
+        "help": "Images shown per fetched page, the first ones in page order"})
+    page_videos: int = field(default=2, metadata={
+        "help": "Videos shown per fetched page, the first ones in page order"})
+    total_images: int = field(default=40, metadata={
+        "help": "Images of fetched pages shown in a whole fact-check"})
+    total_videos: int = field(default=4, metadata={
+        "help": "Videos of fetched pages shown in a whole fact-check"})
+    request_images: int | None = field(default=None, metadata={
+        "help": "Images in one request at most, the claim's included and a video counting as "
+                "video_frames images: page images and videos beyond them are not shown. For hosts "
+                "that take fewer than the limits above add up to, e.g. 64 on OpenRouter's Near AI "
+                "(None: no cap)"})
+    video_frames: int = field(default=10, metadata={
+        "help": "Frames per video for models without native video (all but Gemini)"})
+    native_video_seconds: float = field(default=120.0, metadata={
+        "help": "Page videos longer than this reach models with native video as frames too: native "
+                "video costs tokens by the second. The claim's videos are always native"})
+    page_image_side: int = field(default=1024, metadata={
+        "help": "Longest side, in pixels, of the page images and of the frames of page videos"})
+    claim_image_side: int = field(default=2000, metadata={
+        "help": "Longest side, in pixels, of the claim's images and frames: larger ones are scaled "
+                "down, the others stay as they are"})
+
+
 def get_mime_type(path: str | Path) -> str:
     """Get MIME type for an image file."""
     suffix = Path(path).suffix.lower()
     return MIME_TYPES.get(suffix, "image/jpeg")
 
 
-def encode_image_base64(image_path: str | Path) -> str | None:
-    """
-    Encode an image file to base64 data URI.
+@dataclass
+class Image:
+    """An image to pass to the model."""
 
-    Args:
-        image_path: Path to image file.
+    mime_type: str
+    data: bytes
 
-    Returns:
-        Base64 data URI string, or None if file doesn't exist.
-    """
-    path = Path(image_path)
-    if not path.exists():
-        return None
+    @property
+    def base64(self) -> str:
+        return base64.b64encode(self.data).decode("ascii")
 
-    mime_type = get_mime_type(path)
 
-    with open(path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
+# An ezMM sequence's parts: text, and ezMM items (images, videos) in their places. A list, not
+# a MultimodalSequence, which takes any "<image:7>" in its text (a page's, an error message's)
+# for a reference to an item, and fails if there is no such item.
+ItemSequence = list[str | Item]
 
-    return f"data:{mime_type};base64,{encoded}"
+
+def render(sequence: ItemSequence) -> str:
+    """A sequence as text, each item replaced by its reference ("<image:40>"), as ezMM renders a
+    MultimodalSequence."""
+    return " ".join(part if isinstance(part, str) else part.reference for part in sequence)
+
+
+def load_image(path: str | Path, max_side: int) -> Image:
+    """Read an image file as JPEG, scaled down to `max_side` pixels on its longest side: the
+    APIs take a few formats of limited size. Raises if the image library can't decode it (SVG,
+    a truncated file). Read from the file, not via ezMM, which keeps every image it decodes
+    in memory."""
+    from PIL import Image as PILImage
+
+    with PILImage.open(path) as image:
+        return _jpeg(image, max_side)
+
+
+def _jpeg(image, max_side: int | None) -> Image:
+    image = image.convert("RGB")
+    if max_side:
+        image.thumbnail((max_side, max_side))
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=85)
+    return Image("image/jpeg", buffer.getvalue())
+
+
+def is_readable_image(path: str | Path, max_side: int) -> bool:
+    """Whether load_image can read the image file, by reading it: the image library opens some
+    files it can't decode, such as truncated ones."""
+    try:
+        load_image(path, max_side)
+        return True
+    except Exception:
+        return False
+
+
+def load_claim_image(path: str | Path, max_side: int) -> Image:
+    """As load_image, but an image within `max_side` is read as it is: re-encoding would blur
+    the traces of editing a fact-checker looks for."""
+    from PIL import Image as PILImage
+
+    with PILImage.open(path) as image:
+        if max(image.size) <= max_side:
+            return Image(get_mime_type(path), Path(path).read_bytes())
+    return load_image(path, max_side)
 
 
 def parse_media_references(claim_text: str) -> tuple[str, list[dict]]:
@@ -142,16 +224,18 @@ def resolve_media_files(
     return image_paths, video_paths
 
 
-def extract_video_frames(video_path: str, max_frames: int = 5) -> list[str]:
+def extract_video_frames(video_path: str, max_frames: int = MediaLimits.video_frames,
+                         max_side: int | None = None) -> list[Image]:
     """
-    Extract frames from a video and save as temporary images.
+    Extract frames from a video as JPEG images.
 
     Args:
         video_path: Path to video file.
         max_frames: Maximum number of frames to extract.
+        max_side: If given, frames are scaled down to this many pixels on their longest side.
 
     Returns:
-        List of paths to extracted frame images.
+        The frames, sampled evenly across the video.
     """
     try:
         import cv2
@@ -159,25 +243,52 @@ def extract_video_frames(video_path: str, max_frames: int = 5) -> list[str]:
         print("    Warning: opencv-python not installed, skipping video frame extraction")
         return []
 
-    video = cv2.VideoCapture(video_path)
-    frame_paths = []
+    video = cv2.VideoCapture(str(video_path))
+    try:
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return []
 
-    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
+        frames = []
+        for i in range(max_frames):
+            video.set(cv2.CAP_PROP_POS_FRAMES, int(i * total_frames / max_frames))
+            success, frame = video.read()
+            if not success and not frames:
+                # OpenCV's FFmpeg build lacks some decoders, AV1's among them: FFmpeg itself has them
+                fps = video.get(cv2.CAP_PROP_FPS)
+                if fps <= 0:  # Unknown length: the first frame only
+                    return _frames_with_ffmpeg(video_path, [0.0], max_side)
+                seconds = total_frames / fps
+                return _frames_with_ffmpeg(video_path, [i * seconds / max_frames for i in range(max_frames)],
+                                           max_side)
+            if success:
+                height, width = frame.shape[:2]
+                if max_side and max(height, width) > max_side:
+                    scale = max_side / max(height, width)
+                    frame = cv2.resize(frame, (round(width * scale), round(height * scale)),
+                                       interpolation=cv2.INTER_AREA)
+                encoded, jpeg = cv2.imencode(".jpg", frame)
+                if encoded:
+                    frames.append(Image("image/jpeg", jpeg.tobytes()))
+        return frames
+    finally:
         video.release()
-        return []
 
-    # Sample frames evenly across the video
-    frame_indices = [int(i * total_frames / max_frames) for i in range(max_frames)]
 
-    for idx in frame_indices:
-        video.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        success, frame = video.read()
-        if success:
-            # Save frame to temp file
-            fd, temp_path = tempfile.mkstemp(suffix=".jpg")
-            cv2.imwrite(temp_path, frame)
-            frame_paths.append(temp_path)
+def _frames_with_ffmpeg(video_path: str, seconds: list[float], max_side: int | None) -> list[Image]:
+    """The frames at the given seconds of a video, as JPEG images, decoded by FFmpeg (the
+    build imageio-ffmpeg ships, which ezMM needs too). Frames it can't decode are left out."""
+    from imageio_ffmpeg import get_ffmpeg_exe
+    from PIL import Image as PILImage
 
-    video.release()
-    return frame_paths
+    frames = []
+    for second in seconds:
+        result = subprocess.run(
+            [get_ffmpeg_exe(), "-loglevel", "error", "-ss", f"{second:.3f}", "-i", str(video_path),
+             "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode == 0 and result.stdout:
+            with PILImage.open(io.BytesIO(result.stdout)) as frame:
+                frames.append(_jpeg(frame, max_side))
+    return frames

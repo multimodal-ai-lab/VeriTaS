@@ -1,9 +1,6 @@
 """Evaluation metrics for fact-checking baselines."""
 
-from .types import LabelScheme, DEFAULT_LABEL_SCHEME, LABEL_SCHEME_3, LABEL_SCHEME_7, LABELS, LABELS_3
-
-# Backwards-compatible mapping (3-class)
-VERDICT_TO_NUMERIC = LABEL_SCHEME_3.verdict_to_numeric
+from .types import LabelScheme, LABEL_SCHEME_7, LABELS_3, LABELS_7
 
 # Mapping from 7-class labels to coarsened 3-class labels.
 # Only the "certain" and "rather certain" levels map to their respective bin;
@@ -32,58 +29,37 @@ def coarsen_label(label: str) -> str:
     return COARSEN_7_TO_3.get(label, label)
 
 
-def classify_integrity(score: float, scheme: LabelScheme | None = None) -> str:
-    """
-    Classify integrity score into categories.
-
-    Args:
-        score: Integrity score from -1.0 to 1.0.
-        scheme: Label scheme to use. Defaults to 3-class.
-
-    Returns:
-        Classification label string.
-    """
-    if scheme is None or scheme.name == "3-class":
-        # 3-class: thresholds at +/- 0.33
-        if score >= 0.33:
-            return "Intact"
-        elif score > -0.33:
-            return "Unknown"
-        else:
-            return "Compromised"
+def classify_integrity(score: float) -> str:
+    """Classify an integrity score (-1.0 to 1.0) into a 7-class label, with the
+    thresholds of discretize_7_bins from veritas. Coarsen the label for 3 classes."""
+    if score < -5 / 6:
+        return "Compromised (certain)"
+    elif score < -3 / 6:
+        return "Compromised (rather certain)"
+    elif score < -1 / 6:
+        return "Compromised (rather uncertain)"
+    elif score > 5 / 6:
+        return "Intact (certain)"
+    elif score > 3 / 6:
+        return "Intact (rather certain)"
+    elif score > 1 / 6:
+        return "Intact (rather uncertain)"
     else:
-        # 7-class: thresholds matching discretize_7_bins from veritas
-        if score < -5 / 6:
-            return "Compromised (certain)"
-        elif score < -3 / 6:
-            return "Compromised (rather certain)"
-        elif score < -1 / 6:
-            return "Compromised (rather uncertain)"
-        elif score > 5 / 6:
-            return "Intact (certain)"
-        elif score > 3 / 6:
-            return "Intact (rather certain)"
-        elif score > 1 / 6:
-            return "Intact (rather uncertain)"
-        else:
-            return "Unknown"
+        return "Unknown"
 
 
-def compute_metrics(y_true: list, y_pred: list, labels: list | None = None) -> dict:
+def compute_metrics(y_true: list, y_pred: list, labels: list = LABELS_7) -> dict:
     """
     Compute classification metrics.
 
     Args:
         y_true: Ground truth labels.
         y_pred: Predicted labels.
-        labels: List of label names. Defaults to 3-class LABELS.
+        labels: List of label names. Defaults to the 7-class labels.
 
     Returns:
         Dictionary containing accuracy, precision, recall, F1, and confusion matrix.
     """
-    if labels is None:
-        labels = LABELS
-
     if not y_true:
         return {}
 
@@ -139,20 +115,7 @@ def compute_metrics(y_true: list, y_pred: list, labels: list | None = None) -> d
     }
 
 
-def compute_coarsened_metrics(y_true: list[str], y_pred: list[str]) -> dict | None:
-    """Coarsen 7-class labels to 3-class and compute accuracy + confusion matrix.
-
-    Returns None when the input labels are already 3-class (nothing to coarsen).
-    """
-    # Only meaningful when we are in 7-class mode
-    if not y_true:
-        return None
-
-    # Check if any label is actually 7-class
-    all_labels = set(y_true) | set(y_pred)
-    if all_labels <= set(LABELS_3):
-        return None
-
+def compute_coarsened_metrics(y_true: list[str], y_pred: list[str]) -> dict:
     y_true_c = [coarsen_label(l) for l in y_true]
     y_pred_c = [coarsen_label(l) for l in y_pred]
 
@@ -162,7 +125,7 @@ def compute_coarsened_metrics(y_true: list[str], y_pred: list[str]) -> dict | No
 def compute_regression_metrics(
     gt_integrity: list[float],
     verdicts: list[str],
-    scheme: LabelScheme | None = None,
+    scheme: LabelScheme = LABEL_SCHEME_7,
 ) -> dict:
     """
     Compute regression metrics (MSE, MAE) between ground truth integrity scores and verdicts.
@@ -170,14 +133,11 @@ def compute_regression_metrics(
     Args:
         gt_integrity: List of ground truth integrity scores (-1.0 to 1.0).
         verdicts: List of predicted verdict labels.
-        scheme: Label scheme for verdict-to-numeric mapping. Defaults to 3-class.
+        scheme: Label scheme for verdict-to-numeric mapping. Defaults to 7-class.
 
     Returns:
         Dictionary with MSE and MAE metrics.
     """
-    if scheme is None:
-        scheme = DEFAULT_LABEL_SCHEME
-
     verdict_to_num = scheme.verdict_to_numeric
 
     if not gt_integrity or not verdicts:
@@ -230,7 +190,6 @@ def print_metrics(metrics: dict):
     print(f"\n  === Classification Metrics ===")
     print(f"  Accuracy:         {metrics['accuracy']:.2%}")
 
-    # Show coarsened 3-bin accuracy when running in 7-class mode
     coarsened = metrics.get("coarsened_3class")
     if coarsened:
         print(f"  Accuracy (3-bin): {coarsened['accuracy']:.2%}")
@@ -250,6 +209,5 @@ def print_metrics(metrics: dict):
 
     _print_confusion_matrix(metrics["confusion_matrix"])
 
-    # Show coarsened 3-bin confusion matrix when running in 7-class mode
     if coarsened:
         _print_confusion_matrix(coarsened["confusion_matrix"], title="Confusion Matrix (coarsened 3-bin)")
