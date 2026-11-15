@@ -203,6 +203,20 @@ def test_search_results_show_the_redirects_targets_and_drop_the_blocked_and_unre
     assert fetched == ["https://news.example.com/story"]
 
 
+def test_without_a_resolver_redirects_are_shown_and_fetched_as_they_are(monkeypatch):
+    to_fact_check = f"https://www.google.com/url?q={FACT_CHECK}&sa=U"
+    _search_returns(monkeypatch, ("Plain", PLAIN), ("Hidden", URL_A), ("Redirect", to_fact_check))
+    fetched = _fake_retrieve(monkeypatch, lambda url: "story")
+    session = ToolSession(claim_date="2026-07-10", blocked_urls=[FACT_CHECK])
+
+    text = session.web_search("the claim")
+
+    assert f"URL: {URL_A}" in text and f"URL: {to_fact_check}" in text
+    assert session.encountered_urls == [PLAIN, URL_A, to_fact_check] and session.blocked == []
+    assert f"Content of {URL_A}" in session.fetch_url(URL_A).text
+    assert fetched == [URL_A] and session.retrieved_urls == [URL_A]
+
+
 def test_a_redirect_with_its_target_in_the_clear_is_blocked_as_its_target():
     session = ToolSession(claim_date="2026-07-10", blocked_urls=[FACT_CHECK], link_resolver=MapResolver({}))
 

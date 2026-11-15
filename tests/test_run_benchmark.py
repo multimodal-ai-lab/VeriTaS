@@ -260,6 +260,22 @@ def test_media_limits_are_command_line_options(monkeypatch, dataset):
     assert runs[0]["media_limits"] == MediaLimits(total_images=12, native_video_seconds=30.5)
 
 
+@pytest.mark.parametrize("argv, resolve_redirects", [(["--resolve-redirects"], True), ([], False)])
+def test_google_redirects_are_resolved_only_on_request(monkeypatch, dataset, argv, resolve_redirects):
+    runs = []
+    monkeypatch.setattr(rb, "run_benchmark", lambda **kwargs: runs.append(kwargs))
+    monkeypatch.setattr("sys.argv", ["run_benchmark.py", "--dataset", str(dataset), *argv])
+    rb.main()
+    assert runs[0]["resolve_redirects"] is resolve_redirects
+
+
+def test_the_run_config_records_whether_redirects_are_resolved(dataset, tmp_path):
+    rb.run_benchmark(dataset_path=str(dataset), output_dir=str(tmp_path / "run"), providers=["openai"],
+                     resolve_redirects=True)
+    run_config = json.loads((tmp_path / "run" / "run_config.json").read_text())
+    assert run_config["resolve_redirects"] is True
+
+
 def test_prepare_resume_keeps_successes_and_other_providers(tmp_path):
     csv_path, jsonl_path = tmp_path / "results.csv", tmp_path / "results_detailed.jsonl"
     rb.init_csv(csv_path)
